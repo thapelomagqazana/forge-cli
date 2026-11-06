@@ -127,3 +127,19 @@ repos:
         name: conventional commit message
         stages: [commit-msg]
         args: [feat, fix, docs, test, refactor, perf, chore, ci, build, style, revert]
+
+  # ---------------------------------------------------------------------------
+  # ADR index — keep docs/adr/README.md in sync with the ADR files
+  # ---------------------------------------------------------------------------
+  # This hook runs the index generator on every commit that touches
+  # docs/adr/. If the index is stale, the hook updates it and exits 1,
+  # so you must re-stage and commit again. This is the same "fix and
+  # re-stage" pattern used by Ruff.
+  - repo: local
+    hooks:
+      - id: adr-index
+        name: ADR index (rebuild)
+        entry: python3 scripts/adr/index.py
+        language: system
+        files: ^docs/adr/.*\.md$
+        pass_filenames: false

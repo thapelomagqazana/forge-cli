@@ -1,0 +1,44 @@
+# Architecture Decision Records
+
+This directory contains the Architecture Decision Records (ADRs) for Forge CLI.
+
+An ADR is a short document that captures a significant architectural decision
+and its consequences. ADRs are immutable: once accepted, they are not edited.
+If a decision changes, a new ADR supersedes the old one.
+
+## Index
+
+| Number | Title | Status | Date |
+| :--- | :--- | :--- | :--- |
+| [0001](0001-use-typer-for-the-cli-layer.md) | Use Typer for the CLI layer | Accepted | 2026-11-06 |
+
+## Creating a new ADR
+
+```bash
+make adr title="Your decision title"
+```
+
+Or, if you do not have `make`:
+
+```bash
+bash scripts/adr/new.sh "Your decision title"
+```
+
+The script creates `docs/adr/NNNN-your-decision-title.md` from
+[`template.md`](template.md), pre-filling the number, date, and status.
+
+## Status values
+
+| Status | Meaning |
+| :--- | :--- |
+| **Proposed** | Under discussion. Not yet binding. |
+| **Accepted** | Approved and in effect. |
+| **Deprecated** | No longer relevant, but not replaced. |
+| **Superseded** | Replaced by a newer decision. Link to the new ADR. |
+| **Rejected** | Considered and declined. Kept for historical record. |
+
+## Template
+
+The ADR template lives in [`template.md`](template.md). It follows
+Michael Nygard's format, the de facto standard used by AWS, Google,
+Microsoft, and the Rust project.
