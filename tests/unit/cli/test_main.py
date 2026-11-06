@@ -51,7 +51,6 @@ Design principles
 
 from __future__ import annotations
 
-import importlib
 import subprocess
 
 import pytest
@@ -286,34 +285,45 @@ def test_debug_flag_is_stored_on_context(cli_runner: CliRunner, app: typer.Typer
 # -----------------------------------------------------------------------------
 # Coverage: version fallback when the package is not installed
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Coverage: version fallback is printed without modification
+# -----------------------------------------------------------------------------
 @pytest.mark.unit()
-def test_version_fallback_when_package_missing(
+def test_version_callback_prints_fallback_verbatim(
     cli_runner: CliRunner,
     forge_app: typer.Typer,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_resolve_version`` returns a dev fallback when metadata is missing.
+    """``forge --version`` prints whatever ``get_version()`` returns.
 
-    This path is hit when Forge is run from a source checkout without an
-    editable install. ``importlib.metadata`` cannot find the package,
-    and the CLI must not crash — it must show a clearly-marked dev
-    version so the user knows they are not on a released build.
+    The CLI does not implement the version fallback — it delegates to
+    ``forge.core.version.get_version``. That module is responsible for
+    the four-step fallback chain (metadata → ``_version.py`` →
+    ``FORGE_VERSION`` → ``"0.0.0.dev0"``), and it is tested exhaustively
+    in ``tests/unit/core/test_version.py::TestFallbackChain``.
+
+    This test verifies the *delegation*: when the resolver returns the
+    dev fallback, the CLI prints it verbatim — no prefix stripping, no
+    reformatting, no swallowing. If a future refactor changed the
+    print format or short-circuited the resolver, this test would
+    catch it.
+
+    The ``get_version`` symbol is patched *in the CLI module*, where it
+    is imported by name. Patching ``forge.core.version.get_version``
+    would not affect the CLI, because the CLI holds its own reference
+    to the function.
     """
-    from importlib.metadata import PackageNotFoundError
-
-    # `import forge.cli.main as main_module` would bind the *function*
-    # `main`, because `main` shadows the module in `__all__`. Use
-    # `importlib.import_module` to get the actual module object.
-    main_module = importlib.import_module("forge.cli.main")
-
-    def raise_not_found(_name: str) -> str:
-        raise PackageNotFoundError
-
-    monkeypatch.setattr(main_module, "version", raise_not_found)
+    monkeypatch.setattr(
+        "forge.cli.main.get_version",
+        lambda: "0.0.0.dev0",
+    )
 
     result = cli_runner.invoke(forge_app, ["--version"])
+
     assert result.exit_code == 0, result.output
     assert "0.0.0.dev0" in result.output
+    # Verify the exact format the CLI promises: "forge, version <v>".
+    assert "forge, version 0.0.0.dev0" in result.output
 
 
 # =============================================================================
