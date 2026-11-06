@@ -1,4 +1,5 @@
 """forge verify — Verify a generated project."""
+
 from __future__ import annotations
 
 import typer

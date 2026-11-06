@@ -16,6 +16,7 @@ Design principles
 4. **No global state leakage**: fixtures that mutate ``os.environ`` or the
    current working directory always restore the previous state on teardown.
 """
+
 from __future__ import annotations
 
 import os
@@ -82,7 +83,7 @@ def _isolate_environment(
     monkeypatch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))
 
 
-@pytest.fixture
+@pytest.fixture()
 def isolated_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -103,7 +104,7 @@ def isolated_cwd(
 # -----------------------------------------------------------------------------
 # Settings fixture
 # -----------------------------------------------------------------------------
-@pytest.fixture
+@pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
     """Return a fully-isolated ``Settings`` instance for the current test.
 
@@ -118,7 +119,7 @@ def settings(tmp_path: Path) -> Settings:
 # -----------------------------------------------------------------------------
 # Blueprint fixtures
 # -----------------------------------------------------------------------------
-@pytest.fixture
+@pytest.fixture()
 def sample_blueprint_dict() -> dict[str, Any]:
     """Minimal valid blueprint payload for schema and loader tests."""
     return {
@@ -167,7 +168,7 @@ def sample_blueprint_dict() -> dict[str, Any]:
     }
 
 
-@pytest.fixture
+@pytest.fixture()
 def sample_blueprint_path(
     tmp_path: Path,
     sample_blueprint_dict: dict[str, Any],
@@ -192,7 +193,7 @@ def sample_blueprint_path(
 # -----------------------------------------------------------------------------
 # CLI fixtures
 # -----------------------------------------------------------------------------
-@pytest.fixture
+@pytest.fixture()
 def cli_runner() -> Any:
     """Return a Typer ``CliRunner`` bound to the Forge CLI app.
 
@@ -204,7 +205,7 @@ def cli_runner() -> Any:
     return CliRunner(mix_stderr=False)
 
 
-@pytest.fixture
+@pytest.fixture()
 def forge_app() -> Any:
     """Return the root Typer application object.
 
@@ -221,7 +222,7 @@ def forge_app() -> Any:
 # -----------------------------------------------------------------------------
 # Filesystem fixtures
 # -----------------------------------------------------------------------------
-@pytest.fixture
+@pytest.fixture()
 def project_root(tmp_path: Path) -> Path:
     """Return an empty directory that represents a generated project root."""
     project = tmp_path / "my-project"
@@ -229,7 +230,7 @@ def project_root(tmp_path: Path) -> Path:
     return project
 
 
-@pytest.fixture
+@pytest.fixture()
 def fake_forge_manifest(project_root: Path) -> Path:
     """Write a minimal, valid ``.forge/manifest.json`` into ``project_root``.
 
@@ -269,7 +270,7 @@ def fake_forge_manifest(project_root: Path) -> Path:
 # -----------------------------------------------------------------------------
 # Subprocess fixtures (end-to-end tests)
 # -----------------------------------------------------------------------------
-@pytest.fixture
+@pytest.fixture()
 def forge_executable() -> Iterator[str]:
     """Yield the path to the installed ``forge`` executable.
 

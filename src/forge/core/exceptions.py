@@ -1,4 +1,5 @@
 """Domain exceptions."""
+
 from enum import IntEnum
 
 
@@ -13,4 +14,5 @@ class ExitCode(IntEnum):
 
 class ForgeError(Exception):
     """Base exception for all Forge errors."""
+
     exit_code: ExitCode = ExitCode.INTERNAL_ERROR

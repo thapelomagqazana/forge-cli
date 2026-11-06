@@ -1,0 +1,48 @@
+# =============================================================================
+# Forge CLI — Code Ownership
+# =============================================================================
+# CODEOWNERS declares who is automatically requested to review a PR that
+# touches a given path. GitHub reads this file top-to-bottom and uses the
+# *last* matching pattern for each path.
+#
+# Even for a solo maintainer, this file documents intent. When a collaborator
+# is invited to the project, the routing is already in place.
+#
+# Reference: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# =============================================================================
+
+# Default: every file requires the maintainer's review.
+*                                   @thapelomagqazana
+
+# --- Core application -------------------------------------------------------
+/src/forge/cli/                    @thapelomagqazana
+/src/forge/core/                   @thapelomagqazana
+/src/forge/generation/             @thapelomagqazana
+/src/forge/verification/           @thapelomagqazana
+/src/forge/manifests/              @thapelomagqazana
+/src/forge/diagnostics/            @thapelomagqazana
+
+# --- Blueprints -------------------------------------------------------------
+# Every blueprint is a product in its own right. Changes here affect every
+# generated project, so they require explicit review.
+/src/forge/blueprints/             @thapelomagqazana
+/src/forge/schemas/                @thapelomagqazana
+
+# --- Security-sensitive paths ----------------------------------------------
+# Changes to security documentation or safety-critical modules require
+# explicit review with the safety model in mind.
+/docs/security/                    @thapelomagqazana
+/src/forge/core/exceptions.py      @thapelomagqazana
+
+# --- CI, tooling, and release ----------------------------------------------
+/.github/                          @thapelomagqazana
+/pyproject.toml                    @thapelomagqazana
+/uv.lock                           @thapelomagqazana
+/scripts/                          @thapelomagqazana
+
+# --- Documentation and governance ------------------------------------------
+/CONTRIBUTING.md                   @thapelomagqazana
+/SECURITY.md                       @thapelomagqazana
+/CODE_OF_CONDUCT.md                @thapelomagqazana
+/CHANGELOG.md                      @thapelomagqazana
+/docs/                             @thapelomagqazana

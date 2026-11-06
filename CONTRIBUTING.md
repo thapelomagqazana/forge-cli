@@ -1,13 +1,13 @@
 # Contributing to Forge CLI
 
-Thank you for your interest in contributing to Forge CLI! This document explains
+Thank you for your interest in contributing to Forge CLI. This document explains
 how to set up your development environment, the standards we follow, and the
 process for getting your change merged.
 
 We welcome contributions of all kinds:
 
-- 🐛 **Bug reports** — found something broken? [Open an issue](https://github.com/your-org/forge-cli/issues/new?template=bug_report.yml).
-- ✨ **Feature requests** — have an idea? [Open an issue](https://github.com/your-org/forge-cli/issues/new?template=blueprint_request.yml).
+- 🐛 **Bug reports** — found something broken? [Open an issue](https://github.com/thapelomagqazana/forge-cli/issues/new?template=bug_report.yml).
+- ✨ **Feature requests** — have an idea? [Open an issue](https://github.com/thapelomagqazana/forge-cli/issues/new?template=blueprint_request.yml).
 - 📖 **Documentation** — typos, unclear explanations, missing examples.
 - 🧪 **Tests** — new test cases, better coverage, edge cases.
 - 🔧 **Code** — bug fixes, new features, refactors.
@@ -27,6 +27,7 @@ By participating in this project, you agree to abide by our
 - [Code Style](#code-style)
 - [Testing Requirements](#testing-requirements)
 - [Pull Request Process](#pull-request-process)
+- [Code Review Process](#code-review-process)
 - [Definition of Done](#definition-of-done)
 - [Blueprint Contribution](#blueprint-contribution)
 - [Documentation Contribution](#documentation-contribution)
@@ -46,23 +47,18 @@ cd forge-cli
 # 2. Install uv (if you don't have it)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 3. Install all dependencies (including dev tools)
-uv sync --all-extras
+# 3. Install all dependencies (including dev tools) and pre-commit hooks
+make install
 
-# 4. Install pre-commit hooks
-uv run pre-commit install
+# 4. Verify everything works
+make check
 
-# 5. Verify everything works
-uv run pytest
-uv run ruff check .
-uv run mypy src
-
-# 6. Create a feature branch
+# 5. Create a feature branch
 git checkout -b feat/your-feature-name
 ```
 
 You are now ready to make changes. See [Development Environment](#development-environment)
-for more details on the toolchain.
+for the full toolchain reference.
 
 ---
 
@@ -75,7 +71,27 @@ for more details on the toolchain.
 | **Python** | 3.12+ | The language Forge CLI is written in. |
 | **uv** | Latest | Fast Python package and project manager. |
 | **Git** | 2.40+ | Version control. |
+| **make** | Any modern version | Task runner. See [Installing make](#installing-make) below. |
 | **Docker** | Optional | Required for the `docker_build` verification check. |
+
+### Installing make
+
+The `make` command is pre-installed on Linux and macOS (via Xcode Command Line
+Tools). On Windows, use one of:
+
+```powershell
+# Chocolatey
+choco install make
+
+# Scoop
+scoop install make
+
+# Or run the Makefile targets directly as the commands shown in `make help`
+```
+
+If `make` is unavailable, every target in the `Makefile` is a one-line shell
+command you can read and run manually — the Makefile is a convenience, not a
+requirement.
 
 ### Installation
 
@@ -90,28 +106,46 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install uv (Windows PowerShell)
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# Sync all dependencies (including dev tools)
-uv sync --all-extras
+# Install everything (runtime + dev + pre-commit hooks)
+make install
 ```
+
+`make install` runs `uv sync --all-extras` followed by `uv run pre-commit install`.
+It is idempotent — safe to run repeatedly.
 
 ### Common Commands
 
+The `Makefile` is the single source of truth for every development task. Run
+`make` (with no arguments) to print the list, or see the table below.
+
 | Task | Command |
 | :--- | :--- |
-| Run the CLI locally | `uv run forge --help` |
-| Run all tests | `uv run pytest` |
-| Run tests with coverage | `uv run pytest --cov=src/forge --cov-report=term-missing` |
-| Run a single test file | `uv run pytest tests/unit/test_config.py -v` |
-| Run tests by marker | `uv run pytest -m unit` |
-| Lint the code | `uv run ruff check .` |
-| Auto-fix lint issues | `uv run ruff check . --fix` |
-| Format the code | `uv run ruff format .` |
-| Type-check the code | `uv run mypy src` |
-| Run security scan | `uv run bandit -r src/ -ll` |
-| Audit dependencies | `uv run pip-audit` |
-| Run pre-commit hooks manually | `uv run pre-commit run --all-files` |
-| Build the package | `uv build` |
-| Install the package locally | `uv tool install --editable .` |
+| Show all commands | `make` |
+| Install dependencies and hooks | `make install` |
+| Sync dependencies from lockfile | `make sync` |
+| Update all dependencies | `make update` |
+| **Run the full quality gate** | `make check` |
+| Lint with Ruff | `make lint` |
+| Check formatting without writing | `make format-check` |
+| Format code (writes changes) | `make format` |
+| Type-check with mypy (strict) | `make type` |
+| Run all tests | `make test` |
+| Run only unit tests | `make test-unit` |
+| Run only integration tests | `make test-integration` |
+| Run only contract tests | `make test-contract` |
+| Run only E2E tests | `make test-e2e` |
+| Run only security tests | `make test-security` |
+| Run tests and open HTML coverage | `make coverage` |
+| Run Bandit and pip-audit | `make security` |
+| Auto-fix lint and format | `make fix` |
+| Build sdist and wheel | `make build` |
+| Serve documentation locally | `make docs` |
+| Clean caches and artifacts | `make clean` |
+| Run the CLI | `uv run forge --help` |
+
+The Makefile is the same one CI uses. When `make check` passes locally, CI will
+pass too — unless the failure is OS-specific, in which case the 3-OS CI matrix
+will surface it.
 
 ### Editor Setup
 
@@ -173,8 +207,10 @@ forge-cli/
 ├── docs/                       # Documentation (MkDocs Material)
 ├── examples/                   # Example projects generated by Forge
 ├── demos/                      # VHS scripts for terminal demos
+├── Makefile                    # Development task runner
 ├── pyproject.toml              # Project metadata and tool configuration
 ├── uv.lock                     # Lockfile (do not edit manually)
+├── .pre-commit-config.yaml     # Pre-commit hooks
 ├── CONTRIBUTING.md             # This file
 ├── SECURITY.md                 # Security policy
 ├── CODE_OF_CONDUCT.md          # Community standards
@@ -191,6 +227,14 @@ always needs a corresponding change in `tests/e2e/` or `tests/contract/`.
 
 We follow [**Conventional Commits**](https://www.conventionalcommits.org/en/v1.0.0/).
 This enables automatic changelog generation and semantic versioning.
+
+The commit convention is enforced in two places:
+
+1. **Locally** — the `conventional-pre-commit` hook runs on every `git commit`
+   and rejects invalid commit messages before they enter your history.
+2. **In CI** — the `pr-lint` workflow rejects pull request titles that do not
+   follow the convention. Since Forge CLI uses squash merges, the PR title
+   becomes the commit message on `main`.
 
 ### Format
 
@@ -254,6 +298,17 @@ for consistency with the rest of the CLI. Update any scripts that call
 `forge new` directly.
 ```
 
+### Why Conventional Commits?
+
+- **Changelog generation** — the changelog is generated from commit messages.
+- **Semantic versioning** — `feat:` implies a minor bump, `fix:` implies a
+  patch, `feat!:` implies a major bump.
+- **Searchable history** — `git log --grep="^feat"` shows every feature ever
+  added.
+- **Reviewer context** — a reviewer sees the type in the PR title and knows
+  immediately whether to look for design concerns (`feat`) or regression risk
+  (`fix`).
+
 ---
 
 ## Code Style
@@ -262,11 +317,11 @@ for consistency with the rest of the CLI. Update any scripts that call
 
 - **Python 3.12+** features are encouraged (`match`, `|` union types, `typing.override`, etc.).
 - **Line length:** 100 characters (configured in `pyproject.toml`).
-- **Formatting:** enforced by **Ruff** (`ruff format`).
+- **Formatting:** enforced by **Ruff** (`make format`).
 - **Linting:** enforced by **Ruff** with an extensive rule set
-  (`E`, `F`, `I`, `N`, `W`, `UP`, `B`, `C4`, `SIM`, `RUF`).
+  (`E`, `W`, `F`, `I`, `N`, `UP`, `B`, `C4`, `SIM`, `RUF`, `S`, `T20`, `PT`).
 - **Type hints:** required on all public functions and methods.
-  Enforced by **Mypy** in `strict` mode.
+  Enforced by **mypy** in `strict` mode.
 - **Docstrings:** required on all public modules, classes, and functions.
   Follow [PEP 257](https://peps.python.org/pep-0257/). We use the
   **Google style** for multi-line docstrings.
@@ -277,10 +332,10 @@ for consistency with the rest of the CLI. Update any scripts that call
 
 ```python
 """Module for resolving variable values from multiple sources."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 from forge.core.exceptions import UserInputError
 
@@ -371,46 +426,46 @@ Use the markers registered in `pyproject.toml`:
 
 ```python
 import pytest
+from pathlib import Path
 
 
 @pytest.mark.unit
-def test_resolve_variable_from_cli() -> None:
-    ...
+def test_resolve_variable_from_cli() -> None: ...
 
 
 @pytest.mark.integration
-def test_generation_creates_project(tmp_path: Path) -> None:
-    ...
+def test_generation_creates_project(tmp_path: Path) -> None: ...
 
 
 @pytest.mark.security
-def test_path_traversal_is_rejected(tmp_path: Path) -> None:
-    ...
+def test_path_traversal_is_rejected(tmp_path: Path) -> None: ...
 
 
 @pytest.mark.slow
-def test_full_blueprint_verification() -> None:
-    ...
+def test_full_blueprint_verification() -> None: ...
 ```
 
 ### Running Tests
 
 ```bash
 # All tests (fast)
-uv run pytest
+make test
 
 # Only unit tests
-uv run pytest -m unit
+make test-unit
 
 # Only integration tests
-uv run pytest -m integration
+make test-integration
+
+# Only security tests
+make test-security
 
 # All except slow tests (recommended for local development)
 uv run pytest -m "not slow"
 
-# With coverage report
-uv run pytest --cov=src/forge --cov-report=html
-open htmlcov/index.html  # view the report
+# With HTML coverage report
+make coverage
+# Then open htmlcov/index.html in a browser
 ```
 
 ### Test Fixtures
@@ -443,15 +498,15 @@ in the pull request description.
 1. **Search existing issues** to avoid duplicating work.
 2. **Open an issue first** for non-trivial changes (features, refactors) so
    maintainers can confirm the direction before you invest time.
-3. **Run the full local check suite:**
+3. **Run the full quality gate locally:**
 
    ```bash
-   uv run ruff check .
-   uv run ruff format --check .
-   uv run mypy src
-   uv run pytest --cov=src/forge --cov-fail-under=90
-   uv run bandit -r src/ -ll
+   make check
    ```
+
+   This runs lint, format check, type check, tests with coverage, and security
+   scans. It must pass before you push. If it passes locally, CI will pass too
+   (unless the failure is OS-specific).
 
 4. **Update the changelog** in `CHANGELOG.md` under the `[Unreleased]` section.
 5. **Update documentation** if the change is user-facing (commands, config,
@@ -459,7 +514,9 @@ in the pull request description.
 
 ### Opening the PR
 
-Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md). Include:
+Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md). Fill in every
+section. If a section does not apply, write "N/A" with a one-line reason — do
+not delete the section. Include:
 
 - **Summary:** what changed and why.
 - **Related issues:** `Closes #123`.
@@ -467,44 +524,82 @@ Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md). Include:
 - **Checklist:** confirm all items are complete.
 - **Screenshots or terminal output** for user-facing changes.
 
-### Review Process
-
-- A maintainer will review your PR within **5 business days**.
-- Address review comments by pushing new commits (do not force-push during review).
-- Once approved, a maintainer will squash-merge the PR into `main`.
-- The commit message will be derived from your PR title (which must follow
-  [Conventional Commits](#commit-convention)).
-
-### What Maintainers Look For
-
-| Criterion | Why It Matters |
-| :--- | :--- |
-| **Correctness** | Does the change do what it claims? Is it tested? |
-| **Safety** | Does it introduce path traversal, injection, or overwrite risks? |
-| **Backward compatibility** | Does it break existing projects, commands, or schemas? |
-| **Performance** | Does it introduce a regression in generation or verification time? |
-| **Documentation** | Is the change documented for users and future contributors? |
-| **Scope** | Is the PR focused on one concern? Large PRs are harder to review. |
-
 ### PR Size Guidelines
 
-- **Small PRs (< 200 lines):** reviewed within 2 days.
-- **Medium PRs (200–500 lines):** reviewed within 5 days.
+- **Small PRs (< 200 lines):** reviewed within 2 business days.
+- **Medium PRs (200–500 lines):** reviewed within 5 business days.
 - **Large PRs (> 500 lines):** split into smaller PRs where possible. If not
-  possible, expect a longer review and provide extra context.
+  possible, expect a longer review and provide extra context in the PR
+  description.
+
+---
+
+## Code Review Process
+
+### Who Reviews
+
+Forge CLI is currently maintained by a solo maintainer. As the project grows,
+reviewers will be assigned via [`.github/CODEOWNERS`](.github/CODEOWNERS).
+Until then, the maintainer reviews every PR.
+
+### What Reviewers Look For
+
+Every review checks the following, in order:
+
+1. **Correctness** — does the code do what it claims to do?
+2. **Safety** — does it respect the filesystem safety model (no silent
+   overwrites, no path traversal, no arbitrary code execution)?
+3. **Tests** — are the new behaviours covered by tests? Are edge cases
+   covered? Is coverage still ≥ 90%?
+4. **Types** — does `mypy --strict` pass? Are the types meaningful, or is
+   `Any` used as an escape hatch?
+5. **Documentation** — is the change documented? Is the documentation
+   accurate?
+6. **Design** — is the change in the right module? Does it respect the
+   separation of concerns? Is it the simplest thing that works?
+7. **Backward compatibility** — does it break existing behaviour? Is the
+   breaking change documented with a migration path?
+
+### How Reviewers Give Feedback
+
+- **Blocking comment** — "this must change before merge." Use for
+  correctness, safety, or Definition of Done violations.
+- **Non-blocking suggestion** — "consider this, but it's not a blocker."
+  Use for style, naming, or optional improvements.
+- **Question** — "why did you choose X over Y?" Use when the intent is
+  unclear. A question is not a request to change; it is a request to
+  explain.
+
+### How Authors Respond
+
+- **Address the comment.** If the reviewer is right, fix it and reply with
+  the commit SHA. Do not reply with "done" — reply with what you did.
+- **Push back.** If you disagree, explain why. A reviewer is not always right.
+  A respectful disagreement is healthy.
+- **Mark resolved.** Once a comment is addressed, mark it resolved. Do not
+  resolve a comment on behalf of the reviewer.
+
+### Timeline
+
+- Reviewers aim to respond within **two business days**.
+- Authors aim to address comments within **two business days** of receiving
+  them.
+- If either party is unavailable, they communicate that in the thread.
 
 ---
 
 ## Definition of Done
 
-A change is **not complete** until **all** of the following are true:
+A change is **not complete** until **all** of the following are true. This is
+the contract between the contributor and the reviewer.
 
 ### Code
 
 - [ ] The implementation is merged into `main` via a reviewed PR.
 - [ ] All new code has type hints and docstrings.
-- [ ] The code passes `ruff check` and `ruff format --check`.
-- [ ] The code passes `mypy --strict`.
+- [ ] `make lint` passes.
+- [ ] `make format-check` passes.
+- [ ] `make type` passes (`mypy --strict`).
 
 ### Tests
 
@@ -513,6 +608,13 @@ A change is **not complete** until **all** of the following are true:
 - [ ] Security tests cover adversarial inputs (if applicable).
 - [ ] Coverage remains ≥ 90% overall and ≥ 95% for critical modules.
 - [ ] All tests pass on Linux, Windows, and macOS in CI.
+
+### Security
+
+- [ ] `make security` passes (Bandit + pip-audit).
+- [ ] If the change touches the filesystem, path handling, or command
+      execution, it has been reviewed against the safety model in
+      `docs/security/`.
 
 ### Documentation
 
@@ -558,7 +660,7 @@ Every official blueprint must:
 
 ### Submitting a Blueprint
 
-1. **Open an issue** using the [Blueprint Request template](https://github.com/your-org/forge-cli/issues/new?template=blueprint_request.yml)
+1. **Open an issue** using the [Blueprint Request template](https://github.com/thapelomagqazana/forge-cli/issues/new?template=blueprint_request.yml)
    describing the use case, target users, and desired features.
 2. A maintainer will confirm whether the blueprint is in scope and assign a
    reviewer.
@@ -659,8 +761,8 @@ credited in the release notes (unless you prefer to remain anonymous).
 
 ## Community and Support
 
-- 💬 **GitHub Discussions:** [Ask questions, share ideas](https://github.com/your-org/forge-cli/discussions).
-- 🐛 **GitHub Issues:** [Report bugs, request features](https://github.com/your-org/forge-cli/issues).
+- 💬 **GitHub Discussions:** [Ask questions, share ideas](https://github.com/thapelomagqazana/forge-cli/discussions).
+- 🐛 **GitHub Issues:** [Report bugs, request features](https://github.com/thapelomagqazana/forge-cli/issues).
 - 🐦 **Twitter/X:** [@forgecli](https://twitter.com/forgecli) for announcements.
 - 📧 **Email:** [maintainers@forge-cli.dev](mailto:maintainers@forge-cli.dev) for private inquiries.
 
