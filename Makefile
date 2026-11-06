@@ -26,9 +26,10 @@ SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 # Tell Make that these targets are not files.
-.PHONY: help install sync update lock check lint format type test test-unit \
-        test-integration test-contract test-e2e test-security coverage \
-        security audit build clean docs pre-commit
+.PHONY: help install sync update lock check lint format format-check type \
+        test test-unit test-integration test-contract test-e2e test-security \
+        test-file coverage security audit fix build clean docs pre-commit \
+        adr adr-index adr-check
 
 # -----------------------------------------------------------------------------
 # Default target: print help.
@@ -73,7 +74,7 @@ lock: ## Regenerate uv.lock from pyproject.toml
 # -----------------------------------------------------------------------------
 # Quality gate — the one command you should always run before pushing.
 # -----------------------------------------------------------------------------
-check: lint format-check type test security ## Run the full quality gate (CI mirror)
+check: lint format-check type test security adr-check ## Run the full quality gate (CI mirror)
 	@echo ""
 	@echo "✅ All quality gates passed."
 
@@ -95,7 +96,7 @@ type: ## Type-check with mypy (strict)
 # -----------------------------------------------------------------------------
 # Testing
 # -----------------------------------------------------------------------------
-test: ## Run the full test suite with coverage
+test: ## Run the full test suite with coverage (the coverage gate is enforced here)
 	uv run pytest
 
 test-unit: ## Run only unit tests
@@ -113,6 +114,14 @@ test-e2e: ## Run only end-to-end tests
 test-security: ## Run only security tests
 	uv run pytest tests/security -m security
 
+test-file: ## Run a single test file without the coverage gate (usage: make test-file FILE=tests/unit/core/test_version.py)
+	@if [ -z "$(FILE)" ]; then \
+		echo "Error: 'FILE' is required." >&2; \
+		echo "Usage: make test-file FILE=tests/unit/core/test_version.py" >&2; \
+		exit 2; \
+	fi
+	uv run pytest "$(FILE)" -v --no-cov
+
 coverage: ## Run tests and open the HTML coverage report
 	uv run pytest --cov-report=html
 	@echo "Coverage report: htmlcov/index.html"
@@ -120,6 +129,9 @@ coverage: ## Run tests and open the HTML coverage report
 # -----------------------------------------------------------------------------
 # Security
 # -----------------------------------------------------------------------------
+# Bandit scans `src/` for common security anti-patterns. `pip-audit` scans
+# the *exported* dependency set (not the editable install, which would
+# trip `--strict` with a "distribution marked as editable" false positive).
 security: ## Run Bandit and pip-audit
 	@echo "==> Bandit (static analysis)..."
 	uv run bandit -r src/ -ll -q
@@ -136,6 +148,16 @@ fix: ## Auto-fix lint and format issues (writes changes)
 	uv run ruff check --fix .
 	uv run ruff format .
 	@echo "✅ Auto-fixes applied. Review with 'git diff' before committing."
+
+# -----------------------------------------------------------------------------
+# Pre-commit
+# -----------------------------------------------------------------------------
+# Runs the full pre-commit suite on all files. This is the same gate that
+# runs on `git commit`, but applied to every file at once. Useful before
+# opening a PR, or after a bulk edit, to catch anything the per-file hook
+# might have missed.
+pre-commit: ## Run pre-commit hooks on all files
+	uv run pre-commit run --all-files
 
 # -----------------------------------------------------------------------------
 # Build and packaging
