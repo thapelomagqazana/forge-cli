@@ -30,11 +30,11 @@ Acceptance criteria:
 
 Additional behaviour:
 
-6. ``_resolve_version`` falls back to a dev string when metadata is missing.
+6. The version callback delegates to ``get_version`` verbatim.
 7. The ``--debug`` flag is parsed and stored on ``ctx.obj``.
 8. ``ForgeError`` renders as a red error line, never a traceback.
 9. Unexpected exceptions render a generic message and exit 5.
-10. ``KeyboardInterrupt`` exits cleanly with "Cancelled."
+10. ``KeyboardInterrupt`` exits cleanly with "Cancelled.".
 11. ``--debug`` re-raises exceptions so contributors see tracebacks.
 
 Design principles
@@ -47,6 +47,12 @@ Design principles
   file imports only from ``typer`` and ``typer.testing``.
 - **Every test maps to a documented behaviour.** If a test fails, the
   docstring tells the next contributor exactly what broke and why.
+- **Command-agnostic.** The CLI's commands are registered by the
+  registry (``forge.cli.registry``), not by ``create_app()``. This
+  file tests the *contract* the registry guarantees (every command
+  appears in ``forge --help`` and is invokable), not the registry's
+  internals. Registry internals are tested in
+  ``tests/unit/cli/test_registry.py``.
 """
 
 from __future__ import annotations
@@ -132,15 +138,24 @@ def test_help_short_flag(cli_runner: CliRunner, forge_app: typer.Typer) -> None:
 def test_help_lists_all_commands(cli_runner: CliRunner, forge_app: typer.Typer) -> None:
     """The root help lists every registered command.
 
-    This is the "table of contents" contract: if a command is added to
-    ``create_app()`` but not to the help, users cannot discover it.
+    This is the "table of contents" contract: if a command module is
+    added to ``forge.cli.commands/`` but the registry skips it (e.g.,
+    because it violates the contract), it will not appear in
+    ``forge --help``. That would be a silent failure, so this test
+    asserts the presence of every command the project *promises*.
+
+    The expected list is explicit (not computed from the package) so
+    that removing a command is caught as a regression, not silently
+    accepted as "the package no longer has it."
     """
     result = cli_runner.invoke(forge_app, ["--help"])
     assert result.exit_code == 0, result.output
     for command in ("list", "create", "validate", "verify", "doctor", "ping"):
         assert command in result.output, (
             f"Command {command!r} is registered but missing from `forge --help`. "
-            "Check the `app.add_typer(...)` calls in `create_app()`."
+            "Check that the corresponding module under "
+            "`src/forge/cli/commands/` exists and exposes a "
+            "`typer.Typer` as `app`."
         )
 
 
@@ -197,6 +212,12 @@ def test_ping_prints_pong(cli_runner: CliRunner, forge_app: typer.Typer) -> None
     works, the CLI is installed, importable, and correctly wired to
     Typer. If it does not, the problem is installation, not the command
     the user was actually trying to run.
+
+    This test is *command-agnostic about the registry*. The ``ping``
+    command may be defined inline in ``create_app()``, as a module in
+    ``forge.cli.commands/``, or as a plugin. What matters is that
+    ``forge ping`` works. If the registry is ever refactored, this
+    test does not need to change.
     """
     result = cli_runner.invoke(forge_app, ["ping"])
     assert result.exit_code == 0, result.output
@@ -282,9 +303,6 @@ def test_debug_flag_is_stored_on_context(cli_runner: CliRunner, app: typer.Typer
     assert "debug=True" in result.output
 
 
-# -----------------------------------------------------------------------------
-# Coverage: version fallback when the package is not installed
-# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # Coverage: version fallback is printed without modification
 # -----------------------------------------------------------------------------

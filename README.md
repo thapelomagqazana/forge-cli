@@ -6,14 +6,14 @@
 
 Create, verify, and maintain consistent software projects through reusable, versioned engineering blueprints.
 
-[![CI](https://github.com/your-org/forge-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/forge-cli/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/your-org/forge-cli/branch/main/graph/badge.svg)](https://codecov.io/gh/your-org/forge-cli)
+[![CI](https://github.com/thapelomagqazana/forge-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/thapelomagqazana/forge-cli/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/thapelomagqazana/forge-cli/branch/main/graph/badge.svg)](https://codecov.io/gh/thapelomagqazana/forge-cli)
 [![PyPI](https://img.shields.io/pypi/v/forge-cli.svg)](https://pypi.org/project/forge-cli/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/forge-cli.svg)](https://pypi.org/project/forge-cli/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-[Documentation](https://forge-cli.dev) · [Quick Start](#quick-start) · [Blueprints](#available-blueprints) · [Contributing](CONTRIBUTING.md)
+[Documentation](docs/) · [Quick Start](#quick-start) · [Blueprints](#available-blueprints) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -55,6 +55,16 @@ That is it. No manual setup. No forgotten configuration. No inconsistent standar
 
 ---
 
+## Where This Is Today
+
+Forge CLI is under active development. The command surface — `list`, `create`, `validate`, `verify`, `doctor`, `ping` — is **complete**, every command is registered by the file-based registry, and `forge --help`, `forge --version`, and `forge ping` work end-to-end.
+
+The command *bodies* are stubs. `forge list` prints `TODO: list blueprints`. `forge create` echoes the arguments you passed. `forge verify` and `forge doctor` emit `{"status": "not_implemented"}` in `--json` mode and `TODO: ...` in human mode. This is intentional: the stubs are the *contract* the future implementations must satisfy, and the test suite already enforces the contract (exit codes, argument shapes, JSON envelopes).
+
+The full generation pipeline, verification engine, and diagnostics engine land in later tasks. See [Status](#status) for the roadmap.
+
+---
+
 ## Quick Start
 
 ### 1. Install Forge CLI
@@ -79,8 +89,10 @@ Verify the installation:
 
 ```bash
 forge --version
-# forge, version 0.1.0a0
+# forge, version <resolved>
 ```
+
+The version reported by `forge --version` is read from the installed package metadata (via `importlib.metadata`). It cannot drift from `pip show forge-cli`, because they read from the same source. See [ADR 0002](docs/adr/0002-use-importlib-metadata-for-version-resolution.md) for the design.
 
 ### 2. Discover Available Blueprints
 
@@ -88,14 +100,7 @@ forge --version
 forge list
 ```
 
-You should see:
-
-```
-ID                          Name                        Version   Category
-python.fastapi.api          Python FastAPI API          1.0.0     backend
-typescript.react.app        TypeScript React App        1.0.0     frontend
-python.pytest.automation    Python Test Automation      1.0.0     automation
-```
+> **Note:** The command body is a stub today — it prints `TODO: list blueprints`. The blueprint discovery and table rendering land in a later task. The *command* is registered and discoverable: `forge list --help` works.
 
 ### 3. Create a Project
 
@@ -103,7 +108,7 @@ python.pytest.automation    Python Test Automation      1.0.0     automation
 forge create python.fastapi.api --name payments-api
 ```
 
-Forge will:
+When fully implemented, Forge will:
 
 1. Load the `python.fastapi.api` blueprint.
 2. Resolve and validate your inputs.
@@ -112,11 +117,7 @@ Forge will:
 5. Commit the project atomically to `./payments-api/`.
 6. Write a `.forge/manifest.json` recording the blueprint version and your configuration.
 
-You can preview everything first with `--dry-run`:
-
-```bash
-forge create python.fastapi.api --name payments-api --dry-run
-```
+> **Note:** The command body is a stub today — it echoes the arguments you passed. The generation pipeline lands in a later task. The *argument contract* is final: `--name` is required, `--output` defaults to `.`, `--dry-run` and `--overwrite` are accepted, and the help text documents every exit code.
 
 ### 4. Verify the Project
 
@@ -125,26 +126,13 @@ cd payments-api
 forge verify
 ```
 
-This runs the blueprint's declared verification checks (required files, dependency manifests, lint, type-check, tests, build, Docker) and reports a structured result:
+When fully implemented, this will run the blueprint's declared verification checks (required files, dependency manifests, lint, type-check, tests, build, Docker) and report a structured result.
 
-```
-Forge Verification — payments-api
-Blueprint: python.fastapi.api@1.0.0
-
-  ✓ required-files        PASSED   0.01s
-  ✓ dependencies          PASSED   0.12s
-  ✓ lint                  PASSED   1.84s
-  ✓ typecheck             PASSED   2.13s
-  ✓ tests                 PASSED   4.67s
-  ✓ build                 PASSED   3.21s
-  - docker                SKIPPED  (Docker not available)
-
-Overall: PASSED  (5 passed, 1 skipped, 0 failed)
-```
+> **Note:** The command body is a stub today. In `--json` mode, it emits `{"status": "not_implemented"}`. In human mode, it prints `TODO: verify .`. The *exit code contract* is final: `0` means verified, `4` means verification failed, `2` means blueprint error, `5` means internal error.
 
 ### 5. Start Building
 
-Your project is now a normal software project. Forge did not leave behind any runtime dependency, hidden scripts, or magic. It generated code that belongs to you.
+Your project will be a normal software project. Forge will not leave behind any runtime dependency, hidden scripts, or magic. It will generate code that belongs to you.
 
 ```bash
 uv sync
@@ -157,14 +145,16 @@ uv run uvicorn payments_api.main:app --reload
 
 ### It Does
 
-- ✅ **Generate complete projects** from versioned, validated blueprints.
-- ✅ **Preview before applying** with `--dry-run` and a detailed generation plan.
-- ✅ **Verify the generated project** with explicit, structured checks.
-- ✅ **Record project provenance** in `.forge/manifest.json`.
-- ✅ **Protect existing files** — no silent overwrites, ever.
-- ✅ **Stage and roll back** — a failed generation leaves no partial project.
-- ✅ **Work offline** — blueprints are bundled with the CLI.
-- ✅ **Support automation** — JSON output and stable exit codes.
+- ✅ **Generate complete projects** from versioned, validated blueprints. *(Generation pipeline: later task.)*
+- ✅ **Preview before applying** with `--dry-run` and a detailed generation plan. *(Later task.)*
+- ✅ **Verify the generated project** with explicit, structured checks. *(Verification engine: later task.)*
+- ✅ **Record project provenance** in `.forge/manifest.json`. *(Manifest generation: later task.)*
+- ✅ **Protect existing files** — no silent overwrites, ever. *(Safety layer: later task.)*
+- ✅ **Stage and roll back** — a failed generation leaves no partial project. *(Transaction engine: later task.)*
+- ✅ **Work offline** — blueprints are bundled with the CLI. *(Bundling: later task.)*
+- ✅ **Support automation** — JSON output and stable exit codes. *(JSON output: later task.)*
+
+The command *surface* — argument shapes, help text, exit code contracts, `--json` envelopes — is complete today and enforced by the test suite. The command *bodies* are the remaining work.
 
 ### It Does Not
 
@@ -180,7 +170,7 @@ uv run uvicorn payments_api.main:app --reload
 
 ## Available Blueprints
 
-Forge CLI launches with three carefully selected, production-oriented blueprints. Quality matters more than quantity.
+Forge CLI will launch with three carefully selected, production-oriented blueprints. Quality matters more than quantity.
 
 | ID | Name | Category | Description |
 | :--- | :--- | :--- | :--- |
@@ -188,7 +178,7 @@ Forge CLI launches with three carefully selected, production-oriented blueprints
 | `typescript.react.app` | TypeScript React App | Frontend | React · TypeScript · Vite · Tailwind CSS · Vitest · Playwright · ESLint |
 | `python.pytest.automation` | Python Test Automation | Automation | Pytest · Playwright · HTTPX · Pydantic · Allure-compatible reporting |
 
-Each blueprint passes a **clean-environment verification gate** before release:
+Each blueprint will pass a **clean-environment verification gate** before release:
 
 1. Generate the project.
 2. Install dependencies.
@@ -217,7 +207,7 @@ Blueprints are validated against a **versioned JSON Schema** (`blueprint.schema.
 
 ### Manifests
 
-Every generated project contains a `.forge/manifest.json` file:
+Every generated project will contain a `.forge/manifest.json` file:
 
 ```json
 {
@@ -227,7 +217,7 @@ Every generated project contains a `.forge/manifest.json` file:
     "name": "payments-api",
     "created_at": "2026-11-06T12:00:00Z"
   },
-  "forge": { "version": "0.1.0a0" },
+  "forge": { "version": "<resolved>" },
   "blueprint": {
     "id": "python.fastapi.api",
     "version": "1.0.0",
@@ -243,19 +233,11 @@ Every generated project contains a `.forge/manifest.json` file:
 }
 ```
 
-The manifest is **readable without Forge installed**. It is the foundation for future lifecycle features like drift detection and safe updates.
+The manifest will be **readable without Forge installed**. It is the foundation for future lifecycle features like drift detection and safe updates.
 
 ### Verification
 
-`forge verify` runs the checks declared by the blueprint. Each check has a **stable ID**, a **status** (`PASSED`, `FAILED`, `SKIPPED`, `NOT_AVAILABLE`, `NOT_RUN`, `ERROR`), a duration, and (on failure) an actionable diagnostic.
-
-```
-Overall: FAILED
-  ✓ required-files        PASSED   0.01s
-  ✗ tests                 FAILED   2.14s
-     2 tests failed. Run `pytest -v` for details.
-  - docker                SKIPPED  (Docker not available)
-```
+When the verification engine lands, `forge verify` will run the checks declared by the blueprint. Each check will have a **stable ID**, a **status** (`PASSED`, `FAILED`, `SKIPPED`, `NOT_AVAILABLE`, `NOT_RUN`, `ERROR`), a duration, and (on failure) an actionable diagnostic.
 
 Run a single check with `--check`:
 
@@ -269,11 +251,13 @@ Get machine-readable output with `--json`:
 forge verify --json > report.json
 ```
 
+> **Note:** The command body is a stub today. The `--check` and `--json` flags are declared and their contracts are documented, but the implementation lands in a later task.
+
 ### Safety Model
 
 Forge CLI takes filesystem safety seriously:
 
-| Guarantee | How It Is Enforced |
+| Guarantee | How It Will Be Enforced |
 | :--- | :--- |
 | **No silent overwrites** | Generation fails on collision unless `--overwrite` is explicitly passed. |
 | **No partial projects** | Files are rendered into a staging directory, validated, then committed atomically. |
@@ -281,7 +265,7 @@ Forge CLI takes filesystem safety seriously:
 | **No arbitrary code execution** | Blueprint hooks are disabled by default; commands require explicit consent. |
 | **Rollback on failure** | A failed commit triggers automatic rollback to the pre-generation state. |
 
-See [`docs/security/safety-and-verification.md`](docs/security/safety-and-verification.md) for details.
+See [`docs/security/safety-and-verification.md`](docs/security/) for details.
 
 ---
 
@@ -312,7 +296,7 @@ Full documentation for each command is available in [`docs/commands/`](docs/comm
 | `4` | Verification failed (one or more required checks did not pass). |
 | `5` | Internal error (unexpected failure). |
 
-Stable exit codes make Forge CLI safe to use in CI pipelines and scripts.
+Stable exit codes make Forge CLI safe to use in CI pipelines and scripts. The codes are documented in the help text of every command, so `forge <command> --help` is the canonical reference.
 
 ---
 
@@ -398,17 +382,17 @@ Add this line to your `~/.bashrc` or `~/.zshrc` to make it permanent.
 
 ### `Docker is not available` during `forge verify`
 
-The Docker check is **optional**. If Docker is not installed, the check is reported as `SKIPPED` and does not cause the overall verification to fail. Install Docker to enable the check.
+The Docker check is **optional**. When the verification engine lands, if Docker is not installed, the check will be reported as `SKIPPED` and will not cause the overall verification to fail. Install Docker to enable the check.
 
 ### `Target directory already exists`
 
-Forge CLI refuses to overwrite existing directories by default. Use a different `--name` or `--output`, or pass `--overwrite` if you are certain you want to replace the directory.
+Forge CLI refuses to overwrite existing directories by default. When the generation pipeline lands, use a different `--name` or `--output`, or pass `--overwrite` if you are certain you want to replace the directory.
 
 ### `Blueprint validation failed`
 
-A blueprint definition is malformed. Run `forge validate <path>` for a detailed, path-aware error report.
+A blueprint definition is malformed. When the validator lands, run `forge validate <path>` for a detailed, path-aware error report.
 
-For more troubleshooting, see [`docs/commands/`](docs/commands/) or [open an issue](https://github.com/your-org/forge-cli/issues/new?template=bug_report.yml).
+For more troubleshooting, see [`docs/commands/`](docs/commands/) or [open an issue](https://github.com/thapelomagqazana/forge-cli/issues/new?template=bug_report.yml).
 
 ---
 
@@ -416,10 +400,14 @@ For more troubleshooting, see [`docs/commands/`](docs/commands/) or [open an iss
 
 🚧 **Alpha (v0.1.0a0)**
 
-Forge CLI is under active development. The core workflow — `list`, `create`, `validate`, `verify`, `doctor` — is functional, but the product is **not yet recommended for production use**.
+Forge CLI is under active development. The command surface — `list`, `create`, `validate`, `verify`, `doctor`, `ping` — is complete, and every command is registered by the file-based registry. The command bodies are stubs that will be filled in by later tasks. The product is **not yet recommended for production use**.
 
 The roadmap beyond the alpha includes:
 
+- **Generation pipeline** — blueprint loading, variable resolution, dry-run, staging, commit, manifest generation, summary rendering.
+- **Verification engine** — manifest loading, blueprint loading, check registry, check handlers, result aggregation, summary rendering.
+- **Diagnostics engine** — environment checks, manifest validation, project structure checks, hint rendering.
+- **Blueprint library** — the three launch blueprints (`python.fastapi.api`, `typescript.react.app`, `python.pytest.automation`), each passing a clean-environment verification gate.
 - **Drift detection** — compare a project against its blueprint baseline.
 - **Safe updates** — apply blueprint changes without losing user edits.
 - **Shared team blueprints** — distribute approved foundations across repositories.
@@ -427,7 +415,7 @@ The roadmap beyond the alpha includes:
 - **Engineering governance** — enforce standards across teams and repositories.
 - **Platform integrations** — CI/CD, developer portals, and repository workflows.
 
-See [CHANGELOG.md](CHANGELOG.md) for release history and [the roadmap](docs/architecture/roadmap.md) for what's next.
+See [CHANGELOG.md](CHANGELOG.md) for release history and [`docs/adr/`](docs/adr/) for the architecture decision records.
 
 ---
 
@@ -435,9 +423,33 @@ See [CHANGELOG.md](CHANGELOG.md) for release history and [the roadmap](docs/arch
 
 We welcome contributions of all kinds: bug reports, feature requests, documentation improvements, and code.
 
+### Quick Start for Contributors
+
+```bash
+git clone https://github.com/thapelomagqazana/forge-cli.git
+cd forge-cli
+make install        # uv sync --all-extras + pre-commit install
+make check          # run the full quality gate locally
+```
+
+### Common Commands
+
+| Task | Command |
+| :--- | :--- |
+| Show all commands | `make` |
+| Run the full quality gate | `make check` |
+| Run all tests | `make test` |
+| Run one test file (fast, no coverage gate) | `make test-file FILE=tests/unit/core/test_version.py` |
+| Auto-fix lint and format | `make fix` |
+| Create a new ADR | `make adr title="Your decision"` |
+| Rebuild the ADR index | `make adr-index` |
+
+### Read the Guide
+
 - **Read the guide:** [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Report a bug:** [Bug Report Template](https://github.com/your-org/forge-cli/issues/new?template=bug_report.yml)
-- **Request a blueprint:** [Blueprint Request Template](https://github.com/your-org/forge-cli/issues/new?template=blueprint_request.yml)
+- **Commit convention:** [docs/contributing/commit-convention.md](docs/contributing/commit-convention.md)
+- **Report a bug:** [Bug Report Template](https://github.com/thapelomagqazana/forge-cli/issues/new?template=bug_report.yml)
+- **Request a blueprint:** [Blueprint Request Template](https://github.com/thapelomagqazana/forge-cli/issues/new?template=blueprint_request.yml)
 - **Report a security issue:** See [SECURITY.md](SECURITY.md)
 
 By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
@@ -454,6 +466,6 @@ Forge CLI is released under the [**Apache License 2.0**](LICENSE), a permissive 
 
 **Stop rebuilding the foundation. Start building the product.**
 
-[Get Started](#quick-start) · [Documentation](https://forge-cli.dev) · [GitHub](https://github.com/your-org/forge-cli)
+[Get Started](#quick-start) · [GitHub](https://github.com/thapelomagqazana/forge-cli) · [Issues](https://github.com/thapelomagqazana/forge-cli/issues)
 
 </div>
