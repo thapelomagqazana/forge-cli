@@ -1,4 +1,5 @@
 """forge validate — Validate a blueprint."""
+
 from __future__ import annotations
 
 import typer

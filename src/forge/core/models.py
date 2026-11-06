@@ -1,4 +1,5 @@
 """Shared domain models."""
+
 from pydantic import BaseModel
 
 

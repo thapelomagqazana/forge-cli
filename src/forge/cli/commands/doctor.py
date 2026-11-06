@@ -1,4 +1,5 @@
 """forge doctor — Diagnose environment and project health."""
+
 from __future__ import annotations
 
 import typer

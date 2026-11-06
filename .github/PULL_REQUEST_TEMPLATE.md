@@ -7,7 +7,7 @@
   plus a one-line reason. Do not delete headings — reviewers scan for them.
 
   Before requesting review:
-    1. Run `./scripts/check_quality.sh` locally. All gates must pass.
+    1. Run `make check` locally. All gates must pass.
     2. Rebase on `main`. The branch must be up to date.
     3. Keep the PR focused on one logical change.
 -->
@@ -39,12 +39,12 @@ possible once it is? Who benefits?_
 
 <!--
   Use GitHub's closing keywords so issues auto-close on merge.
-    Closes #123      → auto-closes the issue
-    Fixes #456       → auto-closes
-    Part of #789     → does not close
-    Depends on #101  → does not close
-    Unblocks #102    → does not close
-    Refs #103        → does not close
+    Closes #123      -> auto-closes the issue
+    Fixes #456       -> auto-closes
+    Part of #789     -> does not close
+    Depends on #101  -> does not close
+    Unblocks #102    -> does not close
+    Refs #103        -> does not close
 -->
 
 - Closes #
@@ -82,26 +82,29 @@ possible once it is? Who benefits?_
 <!--
   Every box must be checked before review. If a box cannot be checked,
   explain why in the "Reviewer Notes" section instead of leaving it blank.
+  This checklist mirrors the Definition of Done in CONTRIBUTING.md.
 -->
 
 - [ ] **I have added tests that prove my fix or feature works.**
   - _List the test files added or modified._
   - _Describe the scenario(s) covered._
 
-- [ ] **All tests pass locally (`pytest`).**
-  - Verified via `uv run pytest`.
-  - Verified via `./scripts/check_quality.sh`.
+- [ ] **All tests pass locally.**
+  - Verified via `make test`.
+  - Verified via `make check` (full quality gate).
 
-- [ ] **Linting passes (`ruff check .`).**
-  - `ruff format --check` also passes.
+- [ ] **Linting passes.**
+  - `make lint` passes.
+  - `make format-check` passes (deterministic formatting enforced).
   - Rule sets enforced: `E`, `W`, `F`, `I`, `N`, `UP`, `B`, `C4`, `SIM`, `RUF`, `S`, `T20`, `PT`.
 
-- [ ] **Type checking passes (`mypy src`).**
+- [ ] **Type checking passes.**
+  - `make type` passes (`mypy --strict`).
   - Strict mode: `disallow_untyped_defs`, `disallow_any_generics`,
     `disallow_subclassing_any`, `no_implicit_optional`, `no_implicit_reexport`,
     `warn_unreachable`.
 
-- [ ] **Coverage is ≥ 90%.**
+- [ ] **Coverage is at least 90%.**
   - `--cov-fail-under=90` enforced in `pyproject.toml`.
   - `branch = true` — untested `else` branches fail the gate.
   - `coverage.xml` generated and uploaded as a CI artifact.
@@ -132,6 +135,16 @@ possible once it is? Who benefits?_
 2. _Specific file or decision #2 — the trade-off made._
 3. _Specific file or decision #3 — the assumption made._
 
+**Verification commands reviewers can run:**
+
+```bash
+git checkout <branch-name>
+make install
+make check
+```
+
+_Expected outcome: the final line reads `All quality gates passed.`_
+
 ---
 
 ## Test Plan
@@ -140,6 +153,16 @@ possible once it is? Who benefits?_
   Enumerate every test level affected by this PR. Use "N/A" for levels that
   are genuinely not applicable — never leave a row blank.
 -->
+
+| Level | Command | What it verifies |
+| :--- | :--- | :--- |
+| **Unit** | `make test-unit` | _What unit tests cover, or N/A_ |
+| **Contract** | `make test-contract` | _What contract tests cover, or N/A_ |
+| **Integration** | `make test-integration` | _What integration tests cover, or N/A_ |
+| **E2E** | `make test-e2e` | _What E2E tests cover, or N/A_ |
+| **Security** | `make test-security` | _What security tests cover, or N/A_ |
+| **Full gate** | `make check` | Lint + format + type + test + security |
+| **CI** | Push to branch and open PR | _Describe the CI jobs, for example 3-OS matrix + security + package build_ |
 
 ---
 
@@ -151,6 +174,24 @@ possible once it is? Who benefits?_
   For UI changes, include a screenshot or short GIF.
   For CI changes, include a screenshot of the workflow run.
 -->
+
+**Local quality gate passing:**
+
+```
+<Paste the output of `make check` here>
+```
+
+**CI matrix (expected on first push):**
+
+```
+<Paste expected job results here, for example:>
+
+quality (ubuntu-latest, py3.12)   pass
+quality (macos-latest, py3.12)    pass
+quality (windows-latest, py3.12)  pass
+security                          pass
+package                           pass
+```
 
 ---
 
@@ -166,7 +207,7 @@ possible once it is? Who benefits?_
 - **PyPI:** _Will this trigger a publish? If yes, describe the workflow._
 - **Docs site:** _Will this deploy docs? If yes, describe the workflow._
 - **Lockfile:** _Did `uv.lock` change? If yes, note that contributors must run
-  `uv sync --all-extras`._
+  `make sync`._
 - **Post-merge:** _Follow-up actions required, for example enable rule, rotate
   secret, notify team._
 
@@ -182,7 +223,7 @@ possible once it is? Who benefits?_
 
 > _One or two sentences in plain English. Use an analogy if helpful._
 >
-> _Example: "`uv.lock` is the recipe photo — everyone bakes the same cake."_
+> _Example: "uv.lock is the recipe photo — everyone bakes the same cake."_
 
 ---
 

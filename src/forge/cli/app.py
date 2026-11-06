@@ -1,10 +1,12 @@
 """Forge CLI application entry point."""
+
 from __future__ import annotations
 
 import typer
 from rich.console import Console
 
-from forge.cli.commands import create, doctor, list as list_cmd, validate, verify
+from forge.cli.commands import create, doctor, validate, verify
+from forge.cli.commands import list as list_cmd
 
 app = typer.Typer(
     name="forge",
@@ -25,6 +27,7 @@ console = Console()
 def _version_callback(value: bool) -> None:
     if value:
         from importlib.metadata import PackageNotFoundError, version
+
         try:
             v = version("forge-cli")
         except PackageNotFoundError:

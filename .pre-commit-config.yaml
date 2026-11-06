@@ -1,13 +1,129 @@
+# =============================================================================
+# Forge CLI — Pre-Commit Configuration
+# =============================================================================
+# Runs on every `git commit` via `pre-commit install`.
+#
+# Design principles:
+#   1. FAST — the commit hook should take <5 seconds. If it's slow,
+#      developers bypass it with --no-verify, defeating the purpose.
+#   2. DELEGATE — every hook calls `make <target>`, so the Makefile is the
+#      single source of truth. Pre-commit and CI never drift.
+#   3. SAFE — no hook modifies the network, no hook writes outside the repo,
+#      no hook runs arbitrary remote code without a pinned `rev`.
+#   4. DOCUMENTED — every hook has a `name:` and, where helpful, an `id:` that
+#      matches a Makefile target so the error message points at the fix.
+#
+# To install: `uv run pre-commit install`
+# To run manually on all files: `uv run pre-commit run --all-files`
+# To update hook revisions: `uv run pre-commit autoupdate`
+# =============================================================================
+
+# Fail fast if a hook repo cannot be cloned.
+default_install_hook_types: [pre-commit, commit-msg]
+
+# Only run hooks on files that are staged, not the whole repo.
+# This is the default, but stated explicitly for clarity.
+default_stages: [pre-commit]
+
 repos:
+  # ---------------------------------------------------------------------------
+  # Ruff — lint and format
+  # ---------------------------------------------------------------------------
+  # Ruff is the single Python linter and formatter. It runs in <100ms on this
+  # codebase, so it belongs in the fast pre-commit loop.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.0
+    rev: v0.4.4
     hooks:
       - id: ruff
-        args: [--fix]
+        name: ruff (lint)
+        args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
+        name: ruff (format)
+
+  # ---------------------------------------------------------------------------
+  # mypy — strict type checking
+  # ---------------------------------------------------------------------------
+  # mypy is slower than Ruff (~2-3s on this codebase), but catching type errors
+  # before the commit is worth the wait. If this becomes a bottleneck, move it
+  # to `stages: [pre-push]` — never to CI-only.
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.10.0
     hooks:
       - id: mypy
-        additional_dependencies: [pydantic>=2.6]
+        name: mypy (strict)
         args: [--strict]
+        additional_dependencies:
+          - pydantic>=2.6
+          - pydantic-settings>=2.2
+          - typer>=0.12
+          - jinja2>=3.1
+          - types-PyYAML
+        # Run mypy on src/ only. Tests are checked by pytest, not mypy.
+        files: ^src/
+        pass_filenames: false
+        entry: mypy src
+
+  # ---------------------------------------------------------------------------
+  # Generic file hygiene — no trailing whitespace, no missing newlines, etc.
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+      - id: end-of-file-fixer
+        name: ensure files end with a newline
+      - id: check-yaml
+        name: validate YAML syntax
+      - id: check-toml
+        name: validate TOML syntax
+      - id: check-json
+        name: validate JSON syntax
+        exclude: ^src/forge/blueprints/.*\.json$  # blueprint JSON is validated by the loader
+      - id: check-merge-conflict
+        name: detect merge conflict markers
+      - id: check-added-large-files
+        name: block files larger than 500 KB
+        args: [--maxkb=500]
+      - id: mixed-line-ending
+        name: enforce LF line endings
+        args: [--fix=lf]
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning — catch accidental credentials before they enter history
+  # ---------------------------------------------------------------------------
+  # Once a secret is committed, it is in the Git history forever. This hook
+  # catches the most common patterns before the commit exists.
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        name: detect-secrets (no committed credentials)
+        args: [--baseline, .secrets.baseline]
+        exclude: ^(tests/fixtures/|docs/examples/)  # fixtures may contain fake tokens
+
+  # ---------------------------------------------------------------------------
+  # Python-specific hygiene
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-ast
+        name: verify Python files parse
+        files: \.py$
+      - id: debug-statements
+        name: detect debug statements (breakpoint, pdb)
+        files: \.py$
+
+  # ---------------------------------------------------------------------------
+  # Commit message validation — enforce Conventional Commits
+  # ---------------------------------------------------------------------------
+  # This hook runs on the *commit message*, not the files. It uses the
+  # `commit-msg` stage (declared in `default_install_hook_types` above).
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.2.0
+    hooks:
+      - id: conventional-pre-commit
+        name: conventional commit message
+        stages: [commit-msg]
+        args: [feat, fix, docs, test, refactor, perf, chore, ci, build, style, revert]
