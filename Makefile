@@ -124,7 +124,8 @@ security: ## Run Bandit and pip-audit
 	@echo "==> Bandit (static analysis)..."
 	uv run bandit -r src/ -ll -q
 	@echo "==> pip-audit (dependency vulnerabilities)..."
-	uv run pip-audit --strict
+	@uv export --frozen --no-emit-project --format requirements-txt > /tmp/audit-reqs.txt
+	uv run pip-audit --strict -r /tmp/audit-reqs.txt
 
 audit: security ## Alias for `security`
 
@@ -153,6 +154,52 @@ docs: ## Serve the documentation locally (requires mkdocs)
 		exit 1; \
 	}
 	uv run mkdocs serve
+
+# -----------------------------------------------------------------------------
+# Architecture Decision Records
+# -----------------------------------------------------------------------------
+# These targets wrap the scripts in scripts/adr/. They are the only supported
+# way to create and maintain ADRs; the scripts are considered implementation
+# details and may change.
+#
+# Design notes:
+#   - `index.py` exits 1 when it *changes* the index. That is the signal
+#     pre-commit and CI use to detect drift. In `adr` and `adr-index`, that
+#     exit code is *expected* (the index necessarily changed), so it is
+#     tolerated via `|| true`. In `adr-check`, it is *not* tolerated — that
+#     is the gate.
+#   - `new.sh` already tolerates the index-change exit code internally. The
+#     `|| true` here is a belt-and-braces measure in case `new.sh` re-exits
+#     non-zero for any reason (a typo in the template, a missing script, a
+#     future regression). The ADR is created either way; the next-steps
+#     message is the source of truth for "did it work."
+# -----------------------------------------------------------------------------
+
+adr: ## Create a new ADR (usage: make adr title="Your decision")
+	@if [ -z "$(title)" ]; then \
+		echo "Error: 'title' is required." >&2; \
+		echo "Usage: make adr title=\"Your decision title\"" >&2; \
+		exit 2; \
+	fi
+	@bash scripts/adr/new.sh "$(title)" || true
+	@echo ""
+	@echo "✅ ADR workflow complete."
+	@echo "   Review the new ADR and commit with:"
+	@echo "     git add docs/adr/ && git commit -s"
+
+adr-index: ## Rebuild the ADR index (writes docs/adr/README.md)
+	@python3 scripts/adr/index.py || true
+	@echo ""
+	@echo "✅ ADR index rebuilt."
+
+adr-check: ## Verify the ADR index is up to date (CI gate — fails on drift)
+	@if ! python3 scripts/adr/index.py --check; then \
+		echo "" >&2; \
+		echo "❌ ADR index is stale." >&2; \
+		echo "   Run 'make adr-index' to regenerate it, then re-stage and commit." >&2; \
+		exit 1; \
+	fi
+	@echo "✅ ADR index is up to date."
 
 # -----------------------------------------------------------------------------
 # Cleanup

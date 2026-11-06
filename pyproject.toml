@@ -83,7 +83,7 @@ dev = [
 
 # Console entry point — `forge` becomes a real executable.
 [project.scripts]
-forge = "forge.cli.app:main"
+forge = "forge.cli.main:main"
 
 [project.urls]
 Homepage = "https://github.com/thapelomagqazana/forge-cli"
@@ -167,6 +167,15 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests may use assert (S101) and print (T20) for debugging.
 "tests/**/*.py" = ["S101", "T20"]
+
+# Scripts are standalone CLI tools, not library code. They are:
+#   - Not imported by any other module.
+#   - Not shipped in the wheel.
+#   - Not tested by pytest (invoked from the shell).
+# They legitimately need to write to stdout, and explicit if/else is
+# often clearer than a ternary. Relax only the rules that conflict
+# with the script role.
+"scripts/**/*.py" = ["T201", "SIM108"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["forge"]

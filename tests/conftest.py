@@ -9,12 +9,15 @@ Design principles
 1. **Isolation**: every fixture that touches the filesystem uses ``tmp_path``.
    No test may read or write the developer's real home directory, the real
    ``.forge/`` metadata, or the real environment.
-2. **Typed**: every fixture declares its return type so mypy strict can verify
-   test code as carefully as production code.
+2. **Typed**: every fixture declares its return type so mypy strict can
+   verify test code as carefully as production code.
 3. **Explicit markers**: markers are registered here so ``--strict-markers``
    catches typos in ``@pytest.mark.*`` decorators.
 4. **No global state leakage**: fixtures that mutate ``os.environ`` or the
    current working directory always restore the previous state on teardown.
+5. **Layered**: fixtures are grouped by layer (environment, settings,
+   blueprints, CLI, filesystem, subprocess) so a reader can find what they
+   need without scanning the whole file.
 """
 
 from __future__ import annotations
@@ -26,19 +29,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
+from typer.testing import CliRunner
 
 from forge.core.config import Settings
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Marker registration
-# -----------------------------------------------------------------------------
+# =============================================================================
 def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers to satisfy ``--strict-markers``.
 
     Without this, any ``@pytest.mark.unit`` (etc.) decorator would fail with
     ``--strict-markers`` enabled. Keeping the list here means the canonical
     set of markers is defined in exactly one place.
+
+    The marker list must stay in sync with ``[tool.pytest.ini_options]``
+    in ``pyproject.toml``.
     """
     markers = [
         "unit: Fast, isolated unit tests",
@@ -52,9 +60,9 @@ def pytest_configure(config: pytest.Config) -> None:
         config.addinivalue_line("markers", marker)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Environment and settings isolation
-# -----------------------------------------------------------------------------
+# =============================================================================
 @pytest.fixture(autouse=True)
 def _isolate_environment(
     monkeypatch: pytest.MonkeyPatch,
@@ -71,6 +79,10 @@ def _isolate_environment(
        read or write the real user's home directory.
     3. Sets ``XDG_CONFIG_HOME`` and ``XDG_CACHE_HOME`` at a temp directory
        so any config or cache written by ``forge`` goes into ``tmp_path``.
+
+    Removing this fixture is a bug: tests would start touching the real
+    developer home directory, and would produce different results on
+    different machines.
     """
     for key in list(os.environ):
         if key.startswith("FORGE_"):
@@ -87,11 +99,11 @@ def _isolate_environment(
 def isolated_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-) -> Path:
+) -> Iterator[Path]:
     """Run the test in an isolated working directory.
 
-    Yields the temporary directory and restores the original cwd on teardown,
-    even if the test raises.
+    Yields the temporary directory and restores the original cwd on
+    teardown, even if the test raises.
     """
     original = Path.cwd()
     monkeypatch.chdir(tmp_path)
@@ -101,14 +113,15 @@ def isolated_cwd(
         monkeypatch.chdir(original)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Settings fixture
-# -----------------------------------------------------------------------------
+# =============================================================================
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
     """Return a fully-isolated ``Settings`` instance for the current test.
 
-    All paths point inside ``tmp_path`` so nothing touches the real filesystem.
+    All paths point inside ``tmp_path`` so nothing touches the real
+    filesystem.
     """
     return Settings(
         log_level="DEBUG",
@@ -116,9 +129,81 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CLI fixtures
+# =============================================================================
+# These fixtures are the canonical way to invoke the Forge CLI in tests.
+# They bind to the app built by ``create_app()``, not the module-level
+# ``main`` function, so tests that register ``_probe_*`` commands get a
+# fresh app instance and do not interfere with each other.
+#
+# If a test needs to exercise ``main()`` itself (the entry point that
+# installs the exception handler), it should use ``subprocess`` with
+# ``python -m forge.cli`` — see ``test_python_m_entry_point`` in
+# ``tests/unit/cli/test_main.py`` for the reference implementation.
+# =============================================================================
+@pytest.fixture()
+def cli_runner() -> CliRunner:
+    """Return a ``CliRunner`` bound to the Forge CLI app.
+
+    Click 8.2+ removed the ``mix_stderr`` parameter because stdout and
+    stderr are now always captured separately. Typer 0.28 inherits that
+    behaviour. The parameter is omitted.
+
+    Usage::
+
+        def test_something(cli_runner, forge_app):
+            result = cli_runner.invoke(forge_app, ["ping"])
+            assert result.exit_code == 0
+    """
+    return CliRunner()
+
+
+@pytest.fixture()
+def forge_app() -> typer.Typer:
+    """Return a fresh Forge ``Typer`` application.
+
+    A *fresh* app per test is important: tests that register ``_probe_*``
+    commands (see ``tests/unit/cli/test_main.py``) must not leak those
+    commands into other tests.
+
+    The fixture is a factory call, not a module-level import, because the
+    module-level app would be shared across tests.
+    """
+    from forge.cli.main import create_app
+
+    return create_app()
+
+
+@pytest.fixture()
+def forge_executable() -> Iterator[str]:
+    """Yield the command prefix used to invoke Forge as a subprocess.
+
+    Returns a list (as a single string) that tests can split and pass to
+    ``subprocess.run``. Prefers the real ``forge`` console script when it
+    is on ``PATH``; falls back to ``python -m forge.cli`` so the fixture
+    works in every environment, including CI containers that do not
+    activate the virtualenv.
+
+    Note: the fallback module is ``forge.cli``, not ``forge``. The
+    ``forge`` module is the package; the ``forge.cli`` module is the
+    entry point with a ``__main__`` block.
+    """
+    from shutil import which
+
+    exe = which("forge")
+    if exe is not None:
+        yield exe
+        return
+
+    # Fallback: invoke the CLI module directly. Works on every OS and every
+    # environment, even when the console script is not on PATH.
+    yield f"{sys.executable} -m forge.cli"
+
+
+# =============================================================================
 # Blueprint fixtures
-# -----------------------------------------------------------------------------
+# =============================================================================
 @pytest.fixture()
 def sample_blueprint_dict() -> dict[str, Any]:
     """Minimal valid blueprint payload for schema and loader tests."""
@@ -190,38 +275,9 @@ def sample_blueprint_path(
     return blueprint_file
 
 
-# -----------------------------------------------------------------------------
-# CLI fixtures
-# -----------------------------------------------------------------------------
-@pytest.fixture()
-def cli_runner() -> Any:
-    """Return a Typer ``CliRunner`` bound to the Forge CLI app.
-
-    The returned object exposes ``invoke(app, args=...)``. Tests should
-    assert on ``result.exit_code``, ``result.stdout``, and ``result.stderr``.
-    """
-    from typer.testing import CliRunner
-
-    return CliRunner(mix_stderr=False)
-
-
-@pytest.fixture()
-def forge_app() -> Any:
-    """Return the root Typer application object.
-
-    Kept as a fixture (rather than a module-level import) so that importing
-    the CLI does not fail if a command module has a transient import error
-    during a large refactor. Failures surface as test failures, not as
-    collection errors.
-    """
-    from forge.cli.app import app
-
-    return app
-
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Filesystem fixtures
-# -----------------------------------------------------------------------------
+# =============================================================================
 @pytest.fixture()
 def project_root(tmp_path: Path) -> Path:
     """Return an empty directory that represents a generated project root."""
@@ -265,26 +321,3 @@ def fake_forge_manifest(project_root: Path) -> Path:
         encoding="utf-8",
     )
     return manifest_path
-
-
-# -----------------------------------------------------------------------------
-# Subprocess fixtures (end-to-end tests)
-# -----------------------------------------------------------------------------
-@pytest.fixture()
-def forge_executable() -> Iterator[str]:
-    """Yield the path to the installed ``forge`` executable.
-
-    Uses ``sys.executable -m forge`` as a portable fallback so the fixture
-    works even if the ``forge`` console script is not on PATH (e.g., when
-    tests run under ``uv run pytest`` without activating the venv).
-    """
-    # Prefer the real console script when it exists.
-    from shutil import which
-
-    exe = which("forge")
-    if exe is not None:
-        yield exe
-        return
-
-    # Fall back to ``python -m forge``.
-    yield f"{sys.executable} -m forge"
