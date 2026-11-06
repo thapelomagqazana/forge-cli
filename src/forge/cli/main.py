@@ -2,14 +2,16 @@
 
 This module is the single, canonical entry point for the ``forge``
 command. It is intentionally minimal: it creates the Typer application,
-registers the root callback (for global options), mounts the command
-groups, and hands control to Typer. It contains no business logic.
+registers the root callback (for global options), delegates command
+registration to the command registry, and hands control to Typer. It
+contains no business logic and no knowledge of which commands exist.
 
 Design principles
 -----------------
 1. **Thin entry point.** ``main()`` does three things: create the app,
-   register commands, and call the app. Anything else belongs in a
-   module under ``forge.cli.commands`` or ``forge.core``.
+   delegate registration to the registry, and call the app. Anything
+   else belongs in a module under ``forge.cli.commands`` or
+   ``forge.core``.
 2. **Version from metadata.** ``--version`` delegates to
    ``forge.core.version.get_version``, which reads the installed
    package version and falls back through a documented chain. No
@@ -20,7 +22,10 @@ Design principles
 4. **Error handling at the boundary.** Unhandled exceptions are caught
    here and rendered as user-friendly messages, never as raw
    tracebacks. The ``--debug`` flag re-raises them for contributors.
-5. **Testable.** ``main()`` can be invoked via ``Typer.CliRunner``
+5. **Command-agnostic.** The entry point does not import, list, or
+   reference any specific command. Adding a command means adding a
+   module under ``forge.cli.commands`` — this file never changes.
+6. **Testable.** ``main()`` can be invoked via ``Typer.CliRunner``
    without launching a subprocess, so unit tests run in milliseconds.
    The ``--debug`` detection is a separate, testable helper.
 """
@@ -33,6 +38,7 @@ from typing import Annotated, NoReturn
 import typer
 from rich.console import Console
 
+from forge.cli.registry import register_commands
 from forge.core.exceptions import ExitCode, ForgeError
 from forge.core.version import get_version
 
@@ -201,6 +207,11 @@ def create_app() -> typer.Typer:
     re-creatable for tests and for future multi-app scenarios (e.g., a
     separate ``forge-admin`` CLI that reuses the same commands).
 
+    Command registration is delegated to ``forge.cli.registry``. This
+    factory does not know which commands exist — it only knows how to
+    ask the registry to discover and register them. Adding a new
+    command does not require editing this file.
+
     Returns:
         A fully-configured ``typer.Typer`` instance with all commands
         mounted and the root callback installed.
@@ -237,39 +248,16 @@ def create_app() -> typer.Typer:
     # -------------------------------------------------------------------------
     # Command registration
     # -------------------------------------------------------------------------
-    # Commands are registered here, not via decorators, so that this module
-    # remains the single source of truth for "what commands exist". Each
-    # command lives in its own module under `forge.cli.commands`.
+    # Delegate to the registry. The registry discovers every module in
+    # ``forge.cli.commands`` that follows the command module contract
+    # (a module-level ``app: typer.Typer``) and registers it on this
+    # app. This file never changes when a command is added.
     #
-    # The imports are local to this function to avoid a circular import:
-    # `commands/*` modules import `main` indirectly through `forge.cli`.
-    from forge.cli.commands import create, doctor, validate, verify
-    from forge.cli.commands import list as list_cmd
-
-    app.add_typer(list_cmd.app, name="list")
-    app.add_typer(create.app, name="create")
-    app.add_typer(validate.app, name="validate")
-    app.add_typer(verify.app, name="verify")
-    app.add_typer(doctor.app, name="doctor")
-
-    # -------------------------------------------------------------------------
-    # Sanity-check command
-    # -------------------------------------------------------------------------
-    @app.command(name="ping", help="Print 'pong' to confirm the CLI is working.")
-    def ping() -> None:
-        """Print 'pong' to confirm the CLI is working.
-
-        This command exists for two reasons:
-
-        1. It is the fastest way to verify that a fresh install works
-           end-to-end. If ``forge ping`` fails, the problem is
-           installation, not the command the user was trying to run.
-        2. It is the simplest possible Typer command, so it doubles as a
-           reference for future contributors adding their own commands.
-
-        It takes no arguments and does no I/O beyond ``print``.
-        """
-        typer.echo("pong")
+    # The registry is called in non-strict mode (the default) so that
+    # a malformed command module is logged and skipped rather than
+    # crashing ``forge --help``. The test suite runs the registry in
+    # strict mode to catch contract violations in CI.
+    register_commands(app)
 
     return app
 

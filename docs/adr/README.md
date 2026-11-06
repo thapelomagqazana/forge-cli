@@ -12,6 +12,7 @@ If a decision changes, a new ADR supersedes the old one.
 | :--- | :--- | :--- | :--- |
 | [0001](0001-use-typer-for-the-cli-layer.md) | Use Typer for the CLI layer | Accepted | 2026-11-06 |
 | [0002](0002-use-importlib-metadata-for-version-resolution.md) | Use importlib.metadata for version resolution | Accepted | 2026-11-06 |
+| [0003](0003-use-a-file-based-command-registry.md) | Use a file-based command registry | Accepted | 2026-11-07 |
 
 ## Creating a new ADR
 
