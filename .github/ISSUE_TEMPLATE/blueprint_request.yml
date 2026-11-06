@@ -1,0 +1,25 @@
+name: Blueprint Request
+description: Request a new blueprint for Forge CLI
+labels: ["blueprint"]
+body:
+  - type: input
+    id: blueprint-id
+    attributes:
+      label: Proposed Blueprint ID
+      placeholder: "java.springboot.api"
+    validations:
+      required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: Who is this blueprint for? What problem does it solve?
+    validations:
+      required: true
+  - type: textarea
+    id: features
+    attributes:
+      label: Desired Features
+      description: What should the generated project include?
+    validations:
+      required: true
