@@ -103,6 +103,27 @@ code, no traceback.
 See ``docs/adr/0005-stabilize-exit-codes-as-a-public-contract.md``
 for the full reasoning.
 
+Dual-mode input handling (create command)
+-----------------------------------------
+The ``create`` command supports two input modes: interactive (a
+wizard that asks the user questions) and non-interactive (flags and
+defaults, suitable for CI). Two failure modes exist *only* when both
+modes are supported, and both are represented here as
+``UserInputError`` subclasses:
+
+- ``MissingRequiredFlagsError`` — non-interactive mode, one or more
+  required flags absent. Aggregates *all* missing flags into a single
+  message so the caller fixes everything in one pass instead of a
+  one-error-at-a-time loop.
+- ``PromptCancelledError`` — interactive mode, the user pressed
+  Ctrl+C or sent EOF at a prompt. Treated as a clean, non-buggy exit.
+
+Both inherit ``ExitCode.USER_ERROR`` (1). They are *not* given their
+own exit codes because doing so would be a breaking change to the
+public contract (ADR-0005) — and conceptually, both are "the user
+needs to do something differently," which is exactly what code 1
+means.
+
 Stability
 ---------
 The following are public API and will not change without a major
@@ -119,10 +140,16 @@ Adding a new subclass is a non-breaking change. Removing or
 renaming one is breaking. Adding a new attribute to ``ForgeError``
 is non-breaking (as long as it has a default). Removing one is
 breaking.
+
+The ``MissingRequiredFlagsError`` and ``PromptCancelledError``
+subclasses added for dual-mode input handling are **new public API**
+and are covered by the same stability guarantees as the four
+existing subclasses.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import IntEnum
 
 
@@ -337,6 +364,161 @@ class VerificationError(ForgeError):
 
 
 # -----------------------------------------------------------------------------
+# Dual-mode input handling subclasses (Task 1.1.6)
+# -----------------------------------------------------------------------------
+# These subclasses exist specifically to give the interactive and
+# non-interactive paths of the ``create`` command distinct, testable
+# failure types. They both map to ``ExitCode.USER_ERROR`` (1) because
+# the user can resolve both without help — one by passing flags, the
+# other by re-running the wizard.
+#
+# Keeping them as separate types (rather than raising bare
+# ``UserInputError``) is not cosmetic: the CLI error handler can render
+# each with a mode-appropriate hint, and tests can assert on the
+# specific failure path (``pytest.raises(MissingRequiredFlagsError)``)
+# rather than string-matching a message. That's the difference between
+# a contract and a suggestion.
+class MissingRequiredFlagsError(UserInputError):
+    """Non-interactive mode: required flags were not supplied.
+
+    **Exit code:** ``ExitCode.USER_ERROR`` (1), inherited from
+    ``UserInputError``.
+
+    **When raised:** ``forge create`` is run without a TTY (stdin is
+    not a terminal) and one or more required flags are absent.
+    Non-interactive mode cannot prompt, so the only correct behavior
+    is to fail fast and explain.
+
+    **What the user should do:** Pass the missing flags, or re-run in
+    an interactive terminal. The message lists *every* missing flag,
+    not just the first one found, so the caller fixes everything in a
+    single edit instead of a painful one-error-at-a-time loop.
+
+    **Examples:**
+
+    - ``forge create python.fastapi.api --no-interactive``
+      (missing ``--name``).
+    - ``echo "" | forge create`` (stdin is a pipe, not a TTY; all
+      required flags missing).
+
+    Attributes:
+        command: The command name (e.g., ``"create"``). Used in the
+            error message and by callers that want to add
+            command-specific guidance.
+        missing: The missing flag names, without the ``--`` prefix,
+            in stable declaration order. Stored as a tuple so the
+            instance stays hashable and immutable — a caught error
+            should not be mutable state.
+    """
+
+    # Class-level hint so the user always sees a remediation line,
+    # even when the raiser does not pass one. The constructor's
+    # ``hint=None`` default will not clobber this (see ForgeError.__init__).
+    hint = "Pass the missing flags, or re-run in an interactive terminal."
+
+    def __init__(
+        self,
+        command: str,
+        missing: Sequence[str],
+        *,
+        hint: str | None = None,
+    ) -> None:
+        """Initialize the error with the aggregate list of missing flags.
+
+        Args:
+            command: The command name (e.g., ``"create"``). Rendered
+                in the message so the user knows which command needs
+                fixing.
+            missing: The missing flag names, without the ``--``
+                prefix. Passed as any sequence so callers can
+                forward a list comprehension directly; normalized to
+                an immutable tuple here so the instance is safe to
+                pass across threads and store in test fixtures.
+            hint: Override the default hint. Most callers should not
+                pass this — the class-level hint is already correct
+                for every known caller.
+
+        The ``missing`` parameter is positional-only in spirit (no
+        keyword marker before it) because constructing the error is
+        always a two-argument operation: ``(command, missing)``. The
+        ``hint`` is keyword-only for the same reason as in
+        ``ForgeError``.
+        """
+        # Normalize to a tuple so the public attribute is stable.
+        # A caller that passes a generator (e.g., ``(f for f in ...)``)
+        # would otherwise be able to consume it exactly once, which is
+        # a subtle footgun. Materializing here makes the attribute
+        # safe to read in error handlers, loggers, and tests.
+        self.command = command
+        self.missing: tuple[str, ...] = tuple(missing)
+
+        # Render the flags with the ``--`` prefix and join with
+        # commas so the message is copy-pasteable. Using ", " as the
+        # separator (rather than "and") keeps the message short even
+        # with many missing flags and reads naturally in CI logs.
+        formatted = ", ".join(f"--{flag}" for flag in self.missing)
+        message = f"Missing required option(s) for non-interactive mode: " f"{formatted}."
+
+        super().__init__(message, hint=hint)
+
+
+class PromptCancelledError(UserInputError):
+    """Interactive mode: the user aborted a prompt.
+
+    **Exit code:** ``ExitCode.USER_ERROR`` (1), inherited from
+    ``UserInputError``.
+
+    **When raised:** The user pressed Ctrl+C or sent EOF at a
+    questionary prompt. This is a *clean* cancellation, not a bug:
+    the user exercised their right to stop, so the process should
+    exit quietly with a short message and no traceback.
+
+    **What the user should do:** Re-run the command when ready. The
+    hint reminds them that ``--no-interactive`` plus flags is
+    available if they prefer.
+
+    **Examples:**
+
+    - ``forge create python.fastapi.api`` (interactive), user hits
+      Ctrl+C at the project-name prompt.
+
+    Attributes:
+        prompt: The prompt message that was interrupted, if known.
+            Included in the error message so the user can see *where*
+            they cancelled, which matters for multi-step wizards.
+            ``None`` means "the interruption happened at a step we
+            cannot identify" (e.g., between prompts).
+    """
+
+    hint = "Re-run when ready, or use --no-interactive with explicit flags " "for scriptable usage."
+
+    def __init__(
+        self,
+        prompt: str | None = None,
+        *,
+        hint: str | None = None,
+    ) -> None:
+        """Initialize the cancellation error.
+
+        Args:
+            prompt: The prompt message that was interrupted. Optional
+                because the interruption may occur between prompts
+                (e.g., during a select menu that has no single
+                message). When provided, the message includes it so
+                the user knows which step they stopped at.
+            hint: Override the default hint. Most callers should not
+                pass this — the class-level hint already covers both
+                "re-run" and "switch to non-interactive."
+        """
+        self.prompt = prompt
+        if prompt:
+            message = f"Interactive prompt cancelled by user at '{prompt}'."
+        else:
+            message = "Interactive prompt cancelled by user."
+        super().__init__(message, hint=hint)
+
+
+# -----------------------------------------------------------------------------
 # Public re-exports
 # -----------------------------------------------------------------------------
 # Every name in this module is part of the public API except the
@@ -348,6 +530,8 @@ __all__ = [
     "ExitCode",
     "FilesystemConflictError",
     "ForgeError",
+    "MissingRequiredFlagsError",
+    "PromptCancelledError",
     "UserInputError",
     "VerificationError",
 ]

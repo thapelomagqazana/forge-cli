@@ -15,6 +15,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0003](0003-use-a-file-based-command-registry.md) | Use a file-based command registry | Accepted | 2026-11-07 |
 | [0004](0004-centralize-cli-output-and-error-handling.md) | Centralize CLI output and error handling | Accepted | 2026-11-07 |
 | [0005](0005-stabilize-exit-codes-as-a-public-contract.md) | Stabilize exit codes as a public contract | Accepted | 2026-11-07 |
+| [0006](0006-dual-mode-input-handling-with-a-single-validation-funnel.md) | Dual-Mode Input Handling with a Single Validation Funnel | Accepted | 2026-11-07 |
 
 ## Creating a new ADR
 

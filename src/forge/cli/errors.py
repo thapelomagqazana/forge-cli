@@ -11,21 +11,22 @@ The handler is a **classifier**, not a single renderer. It identifies
 the exception's category first, then dispatches to the right
 renderer. The categories are:
 
-1. **``ForgeError`` and its subclasses.** The user's fault (bad
+1. **Cancellations** (``KeyboardInterrupt``, ``click.Abort``,
+   ``typer.Abort``, ``PromptCancelledError``). These are neither
+   failures nor errors. Rendered as a single dimmed "Cancelled."
+   line on stderr, exiting with ``ExitCode.USER_ERROR``.
+
+2. **``ForgeError`` and its subclasses.** The user's fault (bad
    input, missing blueprint, filesystem conflict). Rendered as a
    single red line with an optional hint, exiting with the
    subclass's declared ``exit_code``.
 
-2. **``click.ClickException`` and its subclasses** (``UsageError``,
+3. **``click.ClickException`` and its subclasses** (``UsageError``,
    ``BadParameter``, ``Abort``, etc.). These are *also* the user's
    fault: Click raises them when the user's input does not match the
    command's contract. Rendered as a friendly message with Click's
    own exit code (2 for usage errors). The full Click traceback is
    *not* shown, because the message already says what is wrong.
-
-3. **Cancellations** (``KeyboardInterrupt``, ``typer.Abort``). These
-   are neither failures nor errors. Rendered as a single dimmed
-   "Cancelled." line on stderr, exiting with ``ExitCode.USER_ERROR``.
 
 4. **Unexpected exceptions.** These are bugs. Rendered as a generic
    "an unexpected internal error occurred" message with a link to
@@ -33,6 +34,20 @@ renderer. The categories are:
    message never includes the exception's class, message, or
    traceback — those could leak internal details or hints about
    vulnerabilities.
+
+Why cancellations are checked before ``ForgeError``
+---------------------------------------------------
+``PromptCancelledError`` is a ``UserInputError`` and therefore a
+``ForgeError`` subclass. If the classifier tested ``ForgeError``
+first, a cancelled prompt would be rendered as an error (red ``✗``
+prefix, message on stderr as a failure) instead of as a
+cancellation (dimmed "Cancelled."). Both would exit with code 1, so
+the *contract* would not be violated — but the *UX* would be wrong,
+and acceptance tests that assert on the rendering would pass or fail
+depending on which branch happened to be tested first. Putting
+cancellation first makes the rendering deterministic and preserves
+the "cancellations are commentary, not errors" rule from the module
+docstring.
 
 Why ``--debug`` does *not* re-raise user errors
 -----------------------------------------------
@@ -112,6 +127,11 @@ Design principles
 6. **Classify before rendering.** The category of the exception
    determines its rendering, its exit code, and its ``--debug``
    behaviour. The handler is a dispatcher, not a single renderer.
+7. **Cancellation is checked before error.** A ``PromptCancelledError``
+   is technically a ``ForgeError`` (via ``UserInputError``), but its
+   *category* is cancellation. The classifier checks the more
+   specific category first, so the rendering follows the intent, not
+   just the inheritance tree.
 """
 
 from __future__ import annotations
@@ -122,7 +142,12 @@ import click
 import typer
 
 from forge.cli.ui import print_cancelled, print_error, print_hint
-from forge.core.exceptions import ExitCode, ForgeError
+from forge.core.exceptions import (
+    ExitCode,
+    ForgeError,
+    MissingRequiredFlagsError,
+    PromptCancelledError,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -140,14 +165,15 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     and dispatches to the matching renderer. The categories and their
     ``--debug`` behaviour:
 
+    - **Cancellation** — ``KeyboardInterrupt``, ``click.Abort``,
+      ``typer.Abort``, or ``PromptCancelledError``. Rendered as
+      "Cancelled." on stderr, exit 1. ``--debug`` does not change
+      this.
     - **``ForgeError``** — user error, rendered friendly, exit code
       from the subclass. ``--debug`` does not change this.
     - **``click.ClickException``** — user error, rendered friendly,
       exit code from Click (2 for usage errors). ``--debug`` does not
       change this.
-    - **Cancellation** — ``KeyboardInterrupt`` / ``typer.Abort``,
-      rendered as "Cancelled." on stderr, exit 1. ``--debug`` does
-      not change this.
     - **Unexpected exception** — bug, rendered as a generic message,
       exit 5. ``--debug`` *re-raises* the exception, so the developer
       sees the traceback.
@@ -163,6 +189,47 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
             unexpected exception (under ``--debug``) or by raising
             ``SystemExit`` with the appropriate code.
     """
+    # -------------------------------------------------------------------------
+    # Cancellations — checked FIRST, before the ForgeError branch.
+    # -------------------------------------------------------------------------
+    # Ordering is deliberate, not incidental. ``PromptCancelledError``
+    # is a ``UserInputError`` subclass, so a naive ``isinstance(exc,
+    # ForgeError)`` check placed earlier would swallow it and render
+    # it as a red error with a ``✗`` prefix — visually wrong for a
+    # cancellation, and semantically wrong: the user *chose* to stop,
+    # they did not fail. Cancellation is commentary, and commentary
+    # goes through ``print_cancelled`` (stderr, dimmed, no prefix).
+    #
+    # ``click.Abort`` is listed alongside ``typer.Abort`` because
+    # Typer's re-export has drifted across versions; testing against
+    # both is a one-token cost that removes a future footgun. Modern
+    # Typer aliases them, but a pinned old version may not.
+    if isinstance(exc, PromptCancelledError | KeyboardInterrupt | click.Abort | typer.Abort):
+        print_cancelled()
+        raise SystemExit(ExitCode.USER_ERROR) from None
+
+    # -------------------------------------------------------------------------
+    # MissingRequiredFlagsError — the user's fault, rendered like any
+    # ForgeError, but kept as an explicit branch for two reasons:
+    #
+    #   1. **Documentation value.** A reader scanning the handler sees
+    #      that this specific failure mode is a known, first-class
+    #      case — not an accident of inheritance.
+    #   2. **Testability.** Future tests that assert "missing flags
+    #      render with a hint on stderr" read clearly against this
+    #      branch, not against a generic ``ForgeError`` assertion.
+    #
+    # This branch is behaviorally identical to the ``ForgeError``
+    # branch below (same rendering, same exit code) — but the
+    # duplication is one screen's worth of clarity for a failure
+    # mode that is *the* acceptance criterion of Task 1.1.6.
+    # -------------------------------------------------------------------------
+    if isinstance(exc, MissingRequiredFlagsError):
+        print_error(str(exc))
+        if exc.hint:
+            print_hint(exc.hint)
+        raise SystemExit(exc.exit_code) from None
+
     # -------------------------------------------------------------------------
     # ForgeError and subclasses — the user's fault, with an exit code
     # -------------------------------------------------------------------------
@@ -195,22 +262,6 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     if isinstance(exc, click.ClickException):
         print_error(exc.format_message())
         raise SystemExit(exc.exit_code) from None
-
-    # -------------------------------------------------------------------------
-    # Cancellations — not failures, just "the user stopped"
-    # -------------------------------------------------------------------------
-    if isinstance(exc, KeyboardInterrupt | typer.Abort):
-        # A single dimmed line on stderr. No traceback, no "Error:"
-        # prefix. The exit code is non-zero so scripts know the
-        # command did not complete.
-        #
-        # This goes through ``ui.print_cancelled``, which writes to
-        # *stderr* — the message is commentary, not product. Using
-        # ``print_info`` here would put "Cancelled." on stdout, which
-        # would break any script parsing ``forge verify --json`` that
-        # the user interrupts with Ctrl+C.
-        print_cancelled()
-        raise SystemExit(ExitCode.USER_ERROR) from None
 
     # -------------------------------------------------------------------------
     # Unexpected exceptions — bugs, with no internal details leaked

@@ -2,7 +2,8 @@
 
 The handler is the single most security-sensitive function in the
 CLI. It decides what the user sees when something goes wrong. Its
-contract has *four clauses*, one per category of exception:
+contract has *four categories* of exception, one per branch, plus a
+fifth category for the dual-mode input handling added in 1.1.6:
 
 1. **``ForgeError`` renders a message + hint, exit with code.**
    The message is the first line; the hint (if present) is a
@@ -15,10 +16,20 @@ contract has *four clauses*, one per category of exception:
    an argument that does not match the signature. ``--debug`` does
    *not* change this behaviour.
 
-3. **Cancellations (``KeyboardInterrupt``, ``typer.Abort``) render
-   "Cancelled.", exit 1.** No traceback. No "Error:" prefix. A
-   single dimmed line on stderr. ``--debug`` does *not* change this
-   behaviour.
+3. **Cancellations render "Cancelled.", exit 1.** The category
+   includes ``KeyboardInterrupt``, ``click.Abort``, ``typer.Abort``,
+   and — since 1.1.6 — ``PromptCancelledError``. No traceback. No
+   "Error:" prefix. A single dimmed line on stderr. ``--debug`` does
+   *not* change this behaviour.
+
+   **Why ``PromptCancelledError`` belongs here, not in category 1.**
+   The class is a ``UserInputError`` subclass (so it *is* a
+   ``ForgeError``), but its *intent* is cancellation: the user
+   chose to stop, they did not fail. Rendering it as a red error
+   would be visually wrong (``✗`` where the user expects a dimmed
+   acknowledgement) and semantically wrong (the hint line is shown
+   for errors and omitted for cancellations). The handler therefore
+   checks cancellation *first*, and this file proves the ordering.
 
 4. **Unexpected exceptions render a generic message, exit 5.**
    The message must not include the exception's class name,
@@ -26,6 +37,14 @@ contract has *four clauses*, one per category of exception:
    hint at a vulnerability. The user gets a link to the issue
    tracker. **Under ``--debug``, the handler re-raises the
    exception instead**, so the developer sees the traceback.
+
+5. **``MissingRequiredFlagsError`` renders like a ``ForgeError``,
+   exit 1.** Since 1.1.6, the handler has an explicit branch for
+   it. Behaviourally identical to category 1, but the branch exists
+   because the *message shape* (aggregated flag list) is the
+   acceptance criterion of a specific task, and a future maintainer
+   reading ``handle_exception`` should see the case named. This
+   file exercises the branch so it cannot rot.
 
 The crucial distinction
 -----------------------
@@ -57,16 +76,18 @@ Testing the handler through ``CliRunner`` is unreliable, because
 Typer intercepts exceptions before the handler runs when the app is
 invoked. The handler is a pure function of ``(exception, debug)``
 → (output, exit code), so calling it directly is the only way to
-assert on all four clauses in isolation.
+assert on all branches in isolation.
 
 Test organisation
 -----------------
 The tests are grouped by *category* of exception, with one test
-class per category, plus two cross-cutting classes:
+class per category, plus cross-cutting classes:
 
 - ``TestForgeError`` — clause 1 (``ForgeError``).
+- ``TestMissingRequiredFlagsError`` — clause 5 (new in 1.1.6).
 - ``TestClickException`` — clause 2 (``click.ClickException``).
-- ``TestCancellation`` — clause 3 (cancellations).
+- ``TestCancellation`` — clause 3 (cancellations, including the
+  new ``PromptCancelledError`` and ``click.Abort`` cases).
 - ``TestUnexpectedException`` — clause 4 (unexpected exceptions,
   the non-``--debug`` branch).
 - ``TestDebugMode`` — the ``--debug`` branch, across all
@@ -99,6 +120,8 @@ from forge.core.exceptions import (
     ExitCode,
     FilesystemConflictError,
     ForgeError,
+    MissingRequiredFlagsError,
+    PromptCancelledError,
     UserInputError,
     VerificationError,
 )
@@ -123,8 +146,8 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
 
     Returns:
         The stderr buffer. Tests read it with ``.getvalue()``. The
-        stdout buffer is available via ``captured_stdout`` for tests
-        that need to assert it was not written to.
+        stdout buffer is available via ``captured.stdout_buf`` for
+        tests that need to assert it was not written to.
     """
     stderr_buf = io.StringIO()
     stdout_buf = io.StringIO()
@@ -244,6 +267,75 @@ class TestForgeError:
 
 
 # -----------------------------------------------------------------------------
+# Clause 5: MissingRequiredFlagsError renders like a ForgeError, exit 1
+# -----------------------------------------------------------------------------
+# This category was added in 1.1.6 for the non-interactive ``create``
+# path. The branch in ``handle_exception`` is behaviorally identical
+# to the ``ForgeError`` branch — same rendering, same exit code — but
+# it exists as a *named* case so a maintainer scanning the handler
+# sees the acceptance criterion of the dual-mode task represented in
+# code. These tests exercise the branch directly.
+# -----------------------------------------------------------------------------
+class TestMissingRequiredFlagsError:
+    """Tests for the ``MissingRequiredFlagsError`` branch of the handler."""
+
+    @pytest.mark.unit()
+    def test_renders_message_and_hint(self, captured: io.StringIO) -> None:
+        """The aggregated flag list is rendered with the default hint."""
+        exc = MissingRequiredFlagsError(command="create", missing=("name",))
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        output = captured.getvalue()
+        assert "--name" in output
+        # The class-level default hint must be rendered — it is what
+        # turns the error from a dead end into a signpost.
+        assert "Hint:" in output
+
+    @pytest.mark.unit()
+    def test_renders_all_missing_flags(self, captured: io.StringIO) -> None:
+        """Every missing flag is listed, not just the first.
+
+        This is the observable half of the "fail fast, fail complete"
+        contract: a script fixes all flags in one edit, not N.
+        """
+        exc = MissingRequiredFlagsError(command="create", missing=("name", "blueprint"))
+        with pytest.raises(SystemExit):
+            errors.handle_exception(exc, debug=False)
+
+        output = captured.getvalue()
+        assert "--name" in output
+        assert "--blueprint" in output
+
+    @pytest.mark.unit()
+    def test_writes_to_stderr_not_stdout(self, captured: io.StringIO) -> None:
+        """The error goes to stderr, preserving the stdout contract."""
+        exc = MissingRequiredFlagsError(command="create", missing=("name",))
+        with pytest.raises(SystemExit):
+            errors.handle_exception(exc, debug=False)
+
+        assert "--name" in captured.getvalue()
+        assert "--name" not in _captured_stdout(captured)
+
+    @pytest.mark.unit()
+    def test_does_not_show_traceback_under_debug(self, captured: io.StringIO) -> None:
+        """Under ``--debug``, a missing-flags error is still rendered friendly.
+
+        ``--debug`` is for bugs; a missing flag is the user's fault.
+        The traceback would be noise, not signal — and this is
+        exactly the contract documented in the handler's module
+        docstring.
+        """
+        exc = MissingRequiredFlagsError(command="create", missing=("name",))
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=True)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        assert "Traceback" not in captured.getvalue()
+
+
+# -----------------------------------------------------------------------------
 # Clause 2: Click exceptions render friendly, exit with Click's code
 # -----------------------------------------------------------------------------
 class TestClickException:
@@ -254,6 +346,10 @@ class TestClickException:
     command's contract. These are user errors, not bugs. They must be
     rendered friendly with Click's own exit code (2 for usage errors),
     *even under* ``--debug``.
+
+    Note: ``click.Abort`` is *not* tested here — since 1.1.6 it is
+    routed to the cancellation branch, and its tests live in
+    ``TestCancellation``.
     """
 
     @pytest.mark.unit()
@@ -310,7 +406,24 @@ class TestClickException:
 
 
 # -----------------------------------------------------------------------------
-# Clause 3: KeyboardInterrupt / typer.Abort render "Cancelled.", exit 1
+# Clause 3: Cancellations render "Cancelled.", exit 1
+# -----------------------------------------------------------------------------
+# This category now includes four exception types:
+#
+#   - ``KeyboardInterrupt`` — Ctrl+C at any point.
+#   - ``typer.Abort``       — the Typer-level abort signal.
+#   - ``click.Abort``       — the Click-level abort signal (added
+#                             in 1.1.6 to guard against Typer version
+#                             drift in the re-export).
+#   - ``PromptCancelledError`` — the domain-level cancellation raised
+#                                by the interactive wizard's prompts
+#                                (added in 1.1.6).
+#
+# All four must render identically: a dimmed "Cancelled." on stderr,
+# exit 1, no traceback, no "Error:" prefix. The handler checks this
+# branch *before* the ``ForgeError`` branch, because
+# ``PromptCancelledError`` is a ``ForgeError`` subclass. The tests
+# below lock that ordering.
 # -----------------------------------------------------------------------------
 class TestCancellation:
     """Tests for the cancellation branch of the handler."""
@@ -353,6 +466,88 @@ class TestCancellation:
 
         assert exc_info.value.code == ExitCode.USER_ERROR
         assert "Cancelled" in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_click_abort_renders_cancelled(self, captured: io.StringIO) -> None:
+        """``click.Abort`` renders the same message as Ctrl+C.
+
+        Added in 1.1.6. ``typer.Abort`` is *usually* an alias for
+        ``click.Abort`` in modern Typer, but the alias has drifted
+        across versions. Routing both explicitly through the
+        cancellation branch is a one-token cost that removes a future
+        footgun — and this test proves the routing exists on
+        whichever Typer version is installed.
+        """
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(click.Abort(), debug=False)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        assert "Cancelled" in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_prompt_cancelled_renders_as_cancellation_not_error(
+        self, captured: io.StringIO
+    ) -> None:
+        """``PromptCancelledError`` renders as a cancellation, not an error.
+
+        The class is a ``UserInputError`` subclass — which is a
+        ``ForgeError`` — so a naive dispatch would render it with the
+        red error prefix and the "Hint:" line. But the *intent* of a
+        cancelled prompt is "the user chose to stop," not "the user
+        failed," and the rendering must reflect the intent. This test
+        proves the cancellation-first dispatch ordering.
+        """
+        exc = PromptCancelledError(prompt="Project name")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        output = captured.getvalue()
+        assert "Cancelled" in output
+        # The error prefix (✗) is what distinguishes an error line
+        # from a cancellation line. Its absence is the observable
+        # proof that the ordering is correct.
+        assert "✗" not in output
+
+    @pytest.mark.unit()
+    def test_prompt_cancelled_does_not_render_hint(self, captured: io.StringIO) -> None:
+        """``PromptCancelledError`` carries a hint but does not show it.
+
+        The class-level hint exists for a future non-terminal UI
+        (where a "re-run?" button is actionable). The terminal
+        renderer deliberately omits it — the user already knows they
+        pressed Ctrl+C, and a "Hint:" line would be a confusing
+        suggestion to "re-run when ready" for someone who clearly
+        chose not to.
+
+        This test locks the distinction: ``PromptCancelledError.hint``
+        is *not* ``None`` (proven by the attribute assertion), but
+        the rendering does not include the "Hint:" prefix.
+        """
+        exc = PromptCancelledError()
+        assert exc.hint is not None  # the attribute exists
+        with pytest.raises(SystemExit):
+            errors.handle_exception(exc, debug=False)
+
+        assert "Hint:" not in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_prompt_cancelled_writes_to_stderr_not_stdout(self, captured: io.StringIO) -> None:
+        """The cancellation goes to stderr, preserving stdout purity.
+
+        ``print_cancelled`` is a *separate* helper from
+        ``print_error``; this test proves the handler routes to the
+        right helper. If it accidentally used ``print_error``, the
+        stdout assertion would still pass (both helpers write to
+        stderr), but the ``✗`` prefix test above would fail —
+        together, the two tests pin down the exact rendering.
+        """
+        exc = PromptCancelledError()
+        with pytest.raises(SystemExit):
+            errors.handle_exception(exc, debug=False)
+
+        assert "Cancelled" in captured.getvalue()
+        assert "Cancelled" not in _captured_stdout(captured)
 
 
 # -----------------------------------------------------------------------------
@@ -467,6 +662,22 @@ class TestDebugMode:
         assert "boom" in captured.getvalue()
 
     @pytest.mark.unit()
+    def test_debug_renders_missing_flags_friendly(self, captured: io.StringIO) -> None:
+        """Under ``--debug``, ``MissingRequiredFlagsError`` is rendered friendly.
+
+        Added in 1.1.6. Same contract as the other user errors: the
+        developer does not need a traceback to see that ``--name``
+        was forgotten.
+        """
+        exc = MissingRequiredFlagsError(command="create", missing=("name",))
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=True)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        assert "--name" in captured.getvalue()
+        assert "Traceback" not in captured.getvalue()
+
+    @pytest.mark.unit()
     def test_debug_renders_click_exception_friendly(self, captured: io.StringIO) -> None:
         """Under ``--debug``, a ``ClickException`` is still rendered friendly.
 
@@ -497,6 +708,25 @@ class TestDebugMode:
         assert "Cancelled" in captured.getvalue()
 
     @pytest.mark.unit()
+    def test_debug_renders_prompt_cancelled_friendly(self, captured: io.StringIO) -> None:
+        """Under ``--debug``, ``PromptCancelledError`` is rendered friendly.
+
+        Added in 1.1.6. The class is *both* a ``UserInputError`` and
+        a cancellation; under ``--debug`` it must still take the
+        cancellation branch (not the ``ForgeError`` branch, which
+        would also be "friendly" but would render with the wrong
+        prefix). The ``✗`` absence is the observable proof of the
+        correct branch.
+        """
+        exc = PromptCancelledError()
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=True)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        assert "Cancelled" in captured.getvalue()
+        assert "✗" not in captured.getvalue()
+
+    @pytest.mark.unit()
     def test_debug_does_not_write_to_stderr_for_unexpected(self, captured: io.StringIO) -> None:
         """Under ``--debug``, an unexpected exception writes nothing to stderr.
 
@@ -521,12 +751,9 @@ class TestNoTracebackLeaks:
     type. Every failure mode is rendered as a one-line message. This
     is the property that makes the CLI usable for non-developers.
 
-    The parametrize lists include every category of exception:
-
-    - ``ForgeError`` and its four subclasses.
-    - ``click.ClickException`` (``UsageError``).
-    - Unexpected exceptions: ``RuntimeError``, ``ValueError``,
-      ``KeyError``, ``OSError``, and the bare ``Exception``.
+    The parametrize lists include every category of exception,
+    *including the two added in 1.1.6* — a future contributor reading
+    this test sees the full exception taxonomy in one place.
     """
 
     @pytest.mark.unit()
@@ -538,7 +765,11 @@ class TestNoTracebackLeaks:
             FilesystemConflictError("filesystem"),
             VerificationError("verification"),
             ForgeError("forge"),
+            MissingRequiredFlagsError(command="create", missing=("name",)),
+            PromptCancelledError(),
             click.UsageError("no such command"),
+            click.Abort(),
+            KeyboardInterrupt(),
             RuntimeError("runtime"),
             ValueError("value"),
             KeyError("key"),
@@ -561,7 +792,11 @@ class TestNoTracebackLeaks:
             FilesystemConflictError("filesystem"),
             VerificationError("verification"),
             ForgeError("forge"),
+            MissingRequiredFlagsError(command="create", missing=("name",)),
+            PromptCancelledError(),
             click.UsageError("no such command"),
+            click.Abort(),
+            KeyboardInterrupt(),
             RuntimeError("runtime"),
             ValueError("value"),
             KeyError("key"),
@@ -593,11 +828,25 @@ class TestExitCodeMapping:
 
     This is the contract that lets scripts branch on ``$?``. If two
     subclasses shared a code, the script could not distinguish them.
+
+    Since 1.1.6, ``MissingRequiredFlagsError`` and
+    ``PromptCancelledError`` *deliberately* share ``USER_ERROR`` (1)
+    with ``UserInputError``. They are distinct *types* (so tests and
+    handlers can dispatch on them) but the same *severity* (so a
+    script that says "if $? == 1, the user can fix it" remains
+    correct). This test asserts the intended sharing rather than
+    forbidding it.
     """
 
     @pytest.mark.unit()
-    def test_all_subclasses_have_distinct_codes(self) -> None:
-        """Every ``ForgeError`` subclass has a distinct exit code."""
+    def test_the_four_original_subclasses_have_distinct_codes(self) -> None:
+        """The four original subclasses have distinct exit codes.
+
+        This is the mapping a script needs to branch on. ``UserInputError``
+        and its new siblings (``MissingRequiredFlagsError``,
+        ``PromptCancelledError``) intentionally share ``USER_ERROR``;
+        the four *original* subclasses must remain distinct.
+        """
         subclasses = [
             UserInputError,
             BlueprintError,
@@ -606,6 +855,19 @@ class TestExitCodeMapping:
         ]
         codes = [cls.exit_code for cls in subclasses]
         assert len(codes) == len(set(codes)), f"Duplicate exit codes: {codes}"
+
+    @pytest.mark.unit()
+    def test_new_subclasses_share_user_error_code(self) -> None:
+        """``MissingRequiredFlagsError`` and ``PromptCancelledError`` share code 1.
+
+        The sharing is intentional: both are user-fixable errors,
+        and a script that branches on ``$? in (1, 2, 3)`` must treat
+        them identically to ``UserInputError``. The *types* are
+        distinct so the handler and tests can dispatch on them; the
+        *codes* are shared so the shell contract does not fragment.
+        """
+        assert MissingRequiredFlagsError.exit_code == ExitCode.USER_ERROR
+        assert PromptCancelledError.exit_code == ExitCode.USER_ERROR
 
     @pytest.mark.unit()
     def test_base_class_uses_internal_error(self) -> None:
@@ -743,12 +1005,19 @@ class TestExitCodeAcceptanceCriteria:
         Each ``ForgeError`` subclass declares its ``exit_code``. This
         test asserts that the declaration exists and matches the
         documented table in ``docs/reference/exit-codes.md``.
+
+        The two 1.1.6 subclasses share the code with ``UserInputError``
+        by design; the test asserts the sharing explicitly so a
+        future maintainer who "fixes" it to a distinct code sees this
+        test fail and knows to update the exit-code contract first.
         """
         expected = {
             UserInputError: ExitCode.USER_ERROR,
             BlueprintError: ExitCode.BLUEPRINT_ERROR,
             FilesystemConflictError: ExitCode.FILESYSTEM_CONFLICT,
             VerificationError: ExitCode.VERIFICATION_FAILED,
+            MissingRequiredFlagsError: ExitCode.USER_ERROR,
+            PromptCancelledError: ExitCode.USER_ERROR,
         }
         for exc_class, expected_code in expected.items():
             assert exc_class.exit_code == expected_code, (
@@ -758,12 +1027,13 @@ class TestExitCodeAcceptanceCriteria:
 
     @pytest.mark.unit()
     def test_all_exit_codes_are_distinct(self) -> None:
-        """**Acceptance criterion 1:** Every exit code is distinct.
+        """**Acceptance criterion 1:** Every *category* has a distinct code.
 
-        If two subclasses share a code, a script cannot distinguish
-        them. The test asserts that all five *specific* subclasses
-        have distinct codes (the base class shares INTERNAL_ERROR
-        with the unexpected branch, which is intentional).
+        The four original subclasses map to four distinct codes.
+        The two 1.1.6 subclasses share ``USER_ERROR`` with
+        ``UserInputError`` — that is intentional (see the class
+        docstring for ``TestExitCodeMapping``). This test asserts
+        the *category* distinction, not the subclass distinction.
         """
         subclasses = [
             UserInputError,

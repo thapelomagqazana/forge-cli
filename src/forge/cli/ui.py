@@ -7,6 +7,10 @@ helpers are deliberately few and simple:
 - ``print_warning`` — yellow, warning prefix, stderr.
 - ``print_error`` — red, error prefix, stderr.
 - ``print_info`` — plain text, stdout.
+- ``print_section`` — bold header, stdout. Used by interactive
+  wizards to delimit steps, and by any command that groups output.
+- ``print_hint`` — dim remediation line, stderr.
+- ``print_cancelled`` — dim acknowledgement line, stderr.
 
 The distinction between stdout and stderr is not cosmetic. It is the
 Unix contract: ``stdout`` is the *product* of the command (the result
@@ -39,6 +43,30 @@ Design principles
    (e.g., a broken pipe), the helper catches the failure and falls back
    to ``typer.echo`` so the CLI never crashes because of a formatting
    error.
+5. **The caller owns the message; the helper owns the frame.** Helpers
+   add a prefix (``✓``, ``⚠``, ``✗``, ``Hint:``) and a colour, and
+   nothing else. They do not add leading blank lines, trailing blank
+   lines, or section separators the caller did not ask for. A helper
+   that adds layout the caller cannot remove is a helper that fights
+   the caller — and the caller always wins in the end, either by
+   working around the helper (drift) or by removing it (dead code).
+
+Why ``print_section`` is a first-class helper
+----------------------------------------------
+Interactive wizards group questions by step ("Project setup",
+"Blueprint variables"). Without a section header, a long wizard reads
+as an undifferentiated wall of prompts and the user loses their place.
+The header belongs to the *product* stream (stdout) because it is
+part of the wizard's output — it is not an error, a warning, or a
+diagnostic. It is not "info" either: info is a single line of data,
+while a section header is structural. Putting it on stdout, styled
+bold, is the correct home.
+
+The alternative — having the wizard call ``print_info`` with a
+``──── Project setup ────`` string — would push layout into the
+caller, which is how drift starts: two wizards render headers two
+ways, and the third wizard copies the wrong one. The helper exists so
+the *look* of a section is decided once, here.
 """
 
 from __future__ import annotations
@@ -159,13 +187,21 @@ def print_cancelled(message: str = "Cancelled.") -> None:
     informational, not alarming), and has no prefix (there is
     nothing to prefix — the message is self-evident).
 
+    The helper does not add a leading newline. Earlier versions did,
+    on the theory that a cancellation always follows a prompt and a
+    blank line separates them. That theory is wrong for wizards that
+    cancel at *any* step (a section header, a menu, a confirmation):
+    a leading blank line is noise in most cases and impossible for
+    the caller to suppress in the rest. Layout the caller cannot
+    remove is layout that fights the caller.
+
     Args:
         message: The message to print. Defaults to ``"Cancelled."``.
             A custom message is useful for prompt rejections
             ("Aborted by user.") that share the same semantics.
     """
     try:
-        _stderr_console.print(f"\n[dim]{message}[/dim]")
+        _stderr_console.print(f"[dim]{message}[/dim]")
     except (BrokenPipeError, OSError):
         typer_echo_safe(message, err=True)
 
@@ -185,6 +221,33 @@ def print_info(message: str) -> None:
         typer_echo_safe(message)
 
 
+def print_section(title: str) -> None:
+    """Print a section header to stdout, in bold.
+
+    Used by interactive wizards to delimit steps, and by any command
+    that groups output into named sections. The header is part of the
+    *product* stream (stdout) because it is structural output the
+    user asked for, not commentary.
+
+    The rendering is deliberately spare — a bold title, no decoration
+    (no box, no rule, no emoji). Decoration competes with the content
+    it is meant to frame; a bold title is enough to establish visual
+    hierarchy on any terminal, including ones that cannot render
+    Unicode. A caller that wants a rule can print one via
+    ``print_info`` before calling ``print_section`` — but no caller
+    in the current codebase does, and the helper should not presume
+    it.
+
+    Args:
+        title: The section title. Printed verbatim; the caller is
+            responsible for capitalization and punctuation.
+    """
+    try:
+        _stdout_console.print(f"[bold]{title}[/bold]")
+    except (BrokenPipeError, OSError):
+        typer_echo_safe(title)
+
+
 def print_hint(message: str) -> None:
     """Print a remediation hint to stderr, in dim text.
 
@@ -200,6 +263,34 @@ def print_hint(message: str) -> None:
         _stderr_console.print(f"[dim]Hint: {message}[/dim]")
     except (BrokenPipeError, OSError):
         typer_echo_safe(f"Hint: {message}", err=True)
+
+
+# -----------------------------------------------------------------------------
+# Short aliases
+# -----------------------------------------------------------------------------
+# The ``print_*`` names are the canonical API — they are what
+# ``handle_exception`` and the tests reference, and they are
+# greppable. The short names below are re-exports, not wrappers:
+# ``section is print_section``, not ``section() { print_section() }``.
+#
+# Why bother: ``ui.section("Project setup")`` reads like a method on a
+# UI namespace, which it is; ``ui.print_section("Project setup")``
+# reads like a function on a printer, which it is not. Command code
+# (the wizard in particular) reads better with the short form, and
+# re-exports are zero-cost — a caller that prefers the long form gets
+# the same object.
+#
+# The aliases are added to ``__all__`` so linters do not flag them as
+# unused and so ``from forge.cli.ui import *`` (in a test, say)
+# exposes both spellings. If the team prefers one spelling, deleting
+# the other is a one-line change; both are tested.
+section = print_section
+info = print_info
+success = print_success
+warning = print_warning
+error = print_error
+hint = print_hint
+cancelled = print_cancelled
 
 
 # -----------------------------------------------------------------------------
@@ -231,11 +322,19 @@ def typer_echo_safe(message: str, *, err: bool = False) -> None:
 # Public re-exports
 # -----------------------------------------------------------------------------
 __all__ = [
+    "cancelled",
+    "error",
+    "hint",
+    "info",
     "print_cancelled",
     "print_error",
     "print_hint",
     "print_info",
+    "print_section",
     "print_success",
     "print_warning",
+    "section",
+    "success",
     "typer_echo_safe",
+    "warning",
 ]
