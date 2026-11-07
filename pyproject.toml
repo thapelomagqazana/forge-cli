@@ -65,6 +65,7 @@ dependencies = [
     "pyyaml>=6.0.1,<7.0",
     "jsonschema>=4.21.0,<5.0",
     "httpx>=0.27.0,<1.0",
+    "click>=8.1.0,<9.0",
 ]
 
 # Development dependencies: installed with `uv sync --all-extras`.
@@ -274,6 +275,14 @@ omit = [
     "*/__init__.py",
     "*/_version.py",
     "src/forge/blueprints/*",
+
+    # `__main__.py` is a three-line entry point whose only job is to
+    # call `main()`. Its behaviour is tested by the
+    # `test_python_m_entry_point` integration test, which runs the
+    # CLI via `subprocess`. Coverage cannot see subprocess-invoked
+    # code, so omitting `__main__.py` from the report is honest: the
+    # behaviour is tested, the coverage tool just cannot observe it.
+    "src/forge/cli/__main__.py",
 ]
 
 [tool.coverage.report]
