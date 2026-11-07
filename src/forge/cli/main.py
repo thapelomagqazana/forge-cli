@@ -3,31 +3,36 @@
 This module is the single, canonical entry point for the ``forge``
 command. It is intentionally minimal: it creates the Typer application,
 registers the root callback (for global options), delegates command
-registration to the command registry, and hands control to Typer. It
-contains no business logic and no knowledge of which commands exist.
+registration to the command registry, delegates error rendering to the
+centralized handler, and hands control to Typer. It contains no
+business logic, no knowledge of which commands exist, and no
+error-rendering code of its own.
 
 Design principles
 -----------------
 1. **Thin entry point.** ``main()`` does three things: create the app,
-   delegate registration to the registry, and call the app. Anything
-   else belongs in a module under ``forge.cli.commands`` or
-   ``forge.core``.
+   delegate registration, and call the app. It does not print, and it
+   does not render errors. Anything else belongs in a module under
+   ``forge.cli`` or ``forge.core``.
 2. **Version from metadata.** ``--version`` delegates to
    ``forge.core.version.get_version``, which reads the installed
-   package version and falls back through a documented chain. No
-   hard-coded strings, no drift.
-3. **Exit codes are contractual.** Every documented failure mode maps to
-   an ``ExitCode`` enum value. The enum lives in
-   ``forge.core.exceptions``.
-4. **Error handling at the boundary.** Unhandled exceptions are caught
-   here and rendered as user-friendly messages, never as raw
-   tracebacks. The ``--debug`` flag re-raises them for contributors.
-5. **Command-agnostic.** The entry point does not import, list, or
+   package version and falls back through a documented chain.
+3. **Exit codes are contractual.** Every documented failure mode maps
+   to an ``ExitCode`` enum value in ``forge.core.exceptions``.
+4. **Error handling is delegated.** Unhandled exceptions are rendered
+   by ``forge.cli.errors.handle_exception``, which is tested in
+   isolation. This module hands the exception off; it does not decide
+   what the user sees.
+5. **Output is delegated.** Version output goes through
+   ``forge.cli.ui.print_info``, which routes to stdout. This module
+   does not touch a console.
+6. **Command-agnostic.** The entry point does not import, list, or
    reference any specific command. Adding a command means adding a
    module under ``forge.cli.commands`` — this file never changes.
-6. **Testable.** ``main()`` can be invoked via ``Typer.CliRunner``
-   without launching a subprocess, so unit tests run in milliseconds.
-   The ``--debug`` detection is a separate, testable helper.
+7. **Testable.** The app can be invoked via ``Typer.CliRunner``
+   without launching a subprocess. The exception handler is tested
+   separately (``tests/unit/cli/test_errors.py``), and the output
+   helpers are tested separately (``tests/unit/cli/test_ui.py``).
 """
 
 from __future__ import annotations
@@ -36,19 +41,12 @@ import sys
 from typing import Annotated, NoReturn
 
 import typer
-from rich.console import Console
 
+from forge.cli.errors import handle_exception
 from forge.cli.registry import register_commands
-from forge.core.exceptions import ExitCode, ForgeError
+from forge.cli.ui import print_info
+from forge.core.exceptions import ExitCode
 from forge.core.version import get_version
-
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-# A single, module-level console so every message flows through the same
-# Rich configuration. Rich's ``Console`` handles TTY detection, colour,
-# width, and ``--no-color`` internally — no need to reimplement any of it.
-console = Console()
 
 
 # -----------------------------------------------------------------------------
@@ -70,9 +68,13 @@ def _version_callback(value: bool) -> None:
     The resolved string is cached for the lifetime of the process, so
     ``forge --version`` reports the same value no matter how many times
     it is called during a single invocation.
+
+    Output goes through ``forge.cli.ui.print_info``, which writes to
+    stdout. This module does not own a console; the voice belongs to
+    the ``ui`` module.
     """
     if value:
-        console.print(f"forge, version {get_version()}")
+        print_info(f"forge, version {get_version()}")
         raise typer.Exit(code=ExitCode.SUCCESS)
 
 
@@ -143,58 +145,6 @@ def _root_callback(
     # Using a dict (rather than a dataclass) keeps the callback trivial;
     # if shared state grows, promote it to a dataclass in a later task.
     ctx.obj = {"debug": debug}
-
-
-# -----------------------------------------------------------------------------
-# Exception handling
-# -----------------------------------------------------------------------------
-def _handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
-    """Render a user-facing error and exit with the correct exit code.
-
-    ``ForgeError`` subclasses are rendered as a single, human-readable
-    line with an optional hint, and exit with their documented exit code.
-    ``KeyboardInterrupt`` and ``typer.Abort`` are rendered as a dimmed
-    "Cancelled." message and exit 1 (user error). Unexpected exceptions
-    are rendered as a generic "internal error" line and exit with
-    ``ExitCode.INTERNAL_ERROR``. In ``--debug`` mode, all of the above
-    are re-raised so the developer sees the traceback.
-
-    Args:
-        exc: The exception to render.
-        debug: Whether to re-raise the exception instead of rendering it.
-
-    Raises:
-        NoReturn: This function always exits.
-    """
-    if debug:
-        raise exc
-
-    # --- User-facing ForgeError ---------------------------------------------
-    if isinstance(exc, ForgeError):
-        console.print(f"[red]Error:[/red] {exc}", highlight=False)
-        hint = getattr(exc, "hint", None)
-        if hint:
-            console.print(f"[dim]Hint: {hint}[/dim]", highlight=False)
-        raise typer.Exit(code=exc.exit_code) from None
-
-    # --- User cancellation --------------------------------------------------
-    if isinstance(exc, KeyboardInterrupt | typer.Abort):
-        console.print("\n[dim]Cancelled.[/dim]", highlight=False)
-        raise typer.Exit(code=ExitCode.USER_ERROR) from None
-
-    # --- Unexpected exception -----------------------------------------------
-    # Do not leak implementation details (class names, stack frames) to
-    # the user. Point at the issue tracker so they have a next step.
-    console.print(
-        "[red]Error:[/red] An unexpected internal error occurred.",
-        highlight=False,
-    )
-    console.print(
-        "[dim]Run with --debug to see the full traceback, or "
-        "report this at https://github.com/thapelomagqazana/forge-cli/issues[/dim]",
-        highlight=False,
-    )
-    raise typer.Exit(code=ExitCode.INTERNAL_ERROR) from None
 
 
 # -----------------------------------------------------------------------------
@@ -270,11 +220,12 @@ def main(argv: list[str] | None = None) -> NoReturn:
 
     This is the function referenced by ``[project.scripts]`` in
     ``pyproject.toml``. It is deliberately tiny: it builds the app,
-    installs the exception handler, and calls the app.
+    hands uncaught exceptions to the centralized handler, and calls
+    the app. It does not print, and it does not render errors.
 
     The function is declared ``-> NoReturn`` because it is a process
     entry point: every path through ``main()`` ends in a call to
-    ``sys.exit()`` (via ``SystemExit`` or ``_handle_exception``),
+    ``sys.exit()`` (via ``SystemExit`` or ``handle_exception``),
     never in a normal return. This matches the contract of a real
     process entry point — the caller is the shell, and the shell
     expects an exit code, not a return value.
@@ -287,7 +238,7 @@ def main(argv: list[str] | None = None) -> NoReturn:
     Raises:
         NoReturn: This function always exits, via ``SystemExit`` for
             clean exits (``--help``, ``--version``, successful
-            commands) or via ``_handle_exception`` for unexpected
+            commands) or via ``handle_exception`` for unexpected
             errors.
     """
     app = create_app()
@@ -317,10 +268,10 @@ def main(argv: list[str] | None = None) -> NoReturn:
         # Re-raise so the process exits with the correct code.
         raise
     except BaseException as exc:
-        # Unhandled exception. ``_handle_exception`` always raises
-        # ``typer.Exit`` with the appropriate code, so this path is
-        # guaranteed to exit as well.
-        _handle_exception(exc, debug=debug)
+        # Unhandled exception. ``handle_exception`` always raises
+        # ``typer.Exit`` with the appropriate code (or re-raises under
+        # --debug), so this path is guaranteed to exit as well.
+        handle_exception(exc, debug=debug)
 
     # If ``app(...)`` returned normally, the command succeeded. Convert
     # that success into an explicit exit so every path through
@@ -338,4 +289,4 @@ def main(argv: list[str] | None = None) -> NoReturn:
 # -----------------------------------------------------------------------------
 # Exports
 # -----------------------------------------------------------------------------
-__all__ = ["create_app", "console", "main"]
+__all__ = ["create_app", "main"]
