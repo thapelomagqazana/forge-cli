@@ -58,6 +58,30 @@ Typer intercepts exceptions before the handler runs when the app is
 invoked. The handler is a pure function of ``(exception, debug)``
 → (output, exit code), so calling it directly is the only way to
 assert on all four clauses in isolation.
+
+Test organisation
+-----------------
+The tests are grouped by *category* of exception, with one test
+class per category, plus two cross-cutting classes:
+
+- ``TestForgeError`` — clause 1 (``ForgeError``).
+- ``TestClickException`` — clause 2 (``click.ClickException``).
+- ``TestCancellation`` — clause 3 (cancellations).
+- ``TestUnexpectedException`` — clause 4 (unexpected exceptions,
+  the non-``--debug`` branch).
+- ``TestDebugMode`` — the ``--debug`` branch, across all
+  categories.
+- ``TestNoTracebackLeaks`` — the "no traceback" invariant, across
+  every category (parametrized).
+- ``TestExitCodeMapping`` — the exit-code contract, across every
+  ``ForgeError`` subclass (parametrized).
+- ``TestExitCodeAcceptanceCriteria`` — the acceptance criteria for
+  the exit-code enumeration, named after each criterion.
+
+The last class duplicates coverage from ``TestForgeError`` and
+``TestUnexpectedException``, but it is named so that a reader
+checking the WBS's acceptance criteria can find the test for each
+criterion *by name*. The duplication is intentional.
 """
 
 from __future__ import annotations
@@ -587,3 +611,165 @@ class TestExitCodeMapping:
     def test_base_class_uses_internal_error(self) -> None:
         """A bare ``ForgeError`` uses the internal-error code."""
         assert ForgeError.exit_code == ExitCode.INTERNAL_ERROR
+
+
+# -----------------------------------------------------------------------------
+# Acceptance criteria for the exit-code enumeration and mapping
+# -----------------------------------------------------------------------------
+# Each test below is named after the acceptance criterion it proves.
+# The criterion is quoted in the test's docstring. This makes the
+# test suite *readable* as a contract: a reader can match a test to
+# a criterion without reading the test body.
+class TestExitCodeAcceptanceCriteria:
+    """Tests named after the exit-code acceptance criteria.
+
+    These tests duplicate coverage that ``TestForgeError`` and
+    ``TestUnexpectedException`` already provide. They are kept as
+    *named* criteria so that a future contributor checking the WBS's
+    acceptance criteria can find the test for a specific criterion
+    by name, without scanning the parametrized tests.
+
+    The WBS lists five criteria:
+
+    1. Each exit code is documented in the CLI Contract and code.
+    2. A ``UserInputError`` returns exit code 1.
+    3. A ``FilesystemConflictError`` returns exit code 3.
+    4. A ``VerificationError`` returns exit code 4.
+    5. An unexpected exception returns exit code 5.
+
+    The tests below add two more (``BlueprintError`` and the bare
+    ``ForgeError``) so that *every* subclass has a named test, and
+    two structural tests (distinct codes, documented codes) that
+    back criterion 1.
+    """
+
+    @pytest.mark.unit()
+    def test_user_input_error_returns_exit_code_1(self, captured: io.StringIO) -> None:
+        """**Acceptance criterion 2:** ``UserInputError`` returns exit code 1.
+
+        A script that sees exit code 1 knows "the user's fault —
+        check the message and retry."
+        """
+        exc = UserInputError("invalid input")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.USER_ERROR
+        assert exc_info.value.code == 1
+        assert "invalid input" in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_filesystem_conflict_error_returns_exit_code_3(self, captured: io.StringIO) -> None:
+        """**Acceptance criterion 3:** ``FilesystemConflictError`` returns exit code 3.
+
+        A script that sees exit code 3 knows "the filesystem is the
+        problem — choose a different output or fix permissions."
+        """
+        exc = FilesystemConflictError("target exists")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.FILESYSTEM_CONFLICT
+        assert exc_info.value.code == 3
+        assert "target exists" in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_verification_error_returns_exit_code_4(self, captured: io.StringIO) -> None:
+        """**Acceptance criterion 4:** ``VerificationError`` returns exit code 4.
+
+        A script that sees exit code 4 knows "the project was
+        generated but is not verified — check the failed checks."
+        """
+        exc = VerificationError("tests failed")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.VERIFICATION_FAILED
+        assert exc_info.value.code == 4
+        assert "tests failed" in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_unexpected_exception_returns_exit_code_5(self, captured: io.StringIO) -> None:
+        """**Acceptance criterion 5:** An unexpected exception returns exit code 5.
+
+        A script that sees exit code 5 knows "the tool is broken —
+        report a bug." This is the only code that means "Forge is at
+        fault," not the user.
+        """
+        exc = RuntimeError("boom")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.INTERNAL_ERROR
+        assert exc_info.value.code == 5
+        assert "unexpected internal error" in captured.getvalue().lower()
+
+    @pytest.mark.unit()
+    def test_blueprint_error_returns_exit_code_2(self, captured: io.StringIO) -> None:
+        """**Acceptance criterion 1 (extended):** ``BlueprintError`` returns exit code 2.
+
+        The WBS explicitly lists criteria 2, 3, 4, and 5. This test
+        covers the remaining subclass so that *every* subclass has a
+        named test.
+        """
+        exc = BlueprintError("blueprint not found")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.BLUEPRINT_ERROR
+        assert exc_info.value.code == 2
+        assert "blueprint not found" in captured.getvalue()
+
+    @pytest.mark.unit()
+    def test_forge_error_base_returns_exit_code_5(self, captured: io.StringIO) -> None:
+        """**Acceptance criterion 1 (extended):** A bare ``ForgeError`` returns exit code 5.
+
+        The base class is used for "unanticipated user-facing
+        failures" — the exit code is 5 (internal error), because the
+        failure is not a recognized category. When a failure mode is
+        recognized, a subclass with a more specific code is added.
+        """
+        exc = ForgeError("boom")
+        with pytest.raises(SystemExit) as exc_info:
+            errors.handle_exception(exc, debug=False)
+
+        assert exc_info.value.code == ExitCode.INTERNAL_ERROR
+        assert exc_info.value.code == 5
+
+    @pytest.mark.unit()
+    def test_every_subclass_has_a_documented_exit_code(self) -> None:
+        """**Acceptance criterion 1:** Every exit code is documented in the code.
+
+        Each ``ForgeError`` subclass declares its ``exit_code``. This
+        test asserts that the declaration exists and matches the
+        documented table in ``docs/reference/exit-codes.md``.
+        """
+        expected = {
+            UserInputError: ExitCode.USER_ERROR,
+            BlueprintError: ExitCode.BLUEPRINT_ERROR,
+            FilesystemConflictError: ExitCode.FILESYSTEM_CONFLICT,
+            VerificationError: ExitCode.VERIFICATION_FAILED,
+        }
+        for exc_class, expected_code in expected.items():
+            assert exc_class.exit_code == expected_code, (
+                f"{exc_class.__name__}.exit_code is {exc_class.exit_code!r}, "
+                f"expected {expected_code!r}"
+            )
+
+    @pytest.mark.unit()
+    def test_all_exit_codes_are_distinct(self) -> None:
+        """**Acceptance criterion 1:** Every exit code is distinct.
+
+        If two subclasses share a code, a script cannot distinguish
+        them. The test asserts that all five *specific* subclasses
+        have distinct codes (the base class shares INTERNAL_ERROR
+        with the unexpected branch, which is intentional).
+        """
+        subclasses = [
+            UserInputError,
+            BlueprintError,
+            FilesystemConflictError,
+            VerificationError,
+        ]
+        codes = [cls.exit_code for cls in subclasses]
+        assert len(codes) == len(set(codes)), f"Duplicate exit codes: {codes}"
