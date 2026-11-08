@@ -1,0 +1,13 @@
+# Consumed by:
+#   tests/unit/loading/test_yaml_parser.py::TestNonMappingRoots
+#   tests/unit/loading/test_loader_malformed_yaml.py::test_empty_document
+#
+# Proves: an empty document produces a specific "empty or comments
+# only" message, not the generic "root must be a mapping" — the two
+# mistakes have different fixes and deserve different messages.
+#
+# This file intentionally has no content below the comment block.
+# Editors and `git diff` will show it as a one-line file; that is the
+# point. Adding whitespace to make it "look like" a YAML file would
+# make it indistinguishable from a hand-written placeholder and would
+# stop the fixture from proving what it claims.

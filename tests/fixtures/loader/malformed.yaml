@@ -1,0 +1,14 @@
+# Consumed by:
+#   tests/unit/loading/test_yaml_parser.py::TestSyntaxErrors
+#   tests/unit/loading/test_loader_malformed_yaml.py
+#
+# Proves: YAML syntax errors are located and surfaced as
+# ValidationError, not raised as YAMLError.
+#
+# The failure is an unclosed flow sequence on the last line. Line 3
+# is where the parser reports the error, so a test asserting
+# `result.line == 3` pins the 1-based conversion at the parser
+# boundary.
+id: sample.malformed
+name: Malformed Example
+tags: [unclosed

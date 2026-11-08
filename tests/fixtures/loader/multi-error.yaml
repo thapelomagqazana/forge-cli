@@ -1,0 +1,24 @@
+# Consumed by:
+#   tests/unit/loading/test_loader_multi_error.py
+#   tests/integration/test_validate_command.py
+#
+# Proves: schema validation aggregates *every* violation, not just the
+# first. This fixture violates three required fields simultaneously so
+# the loader's Err([...]) must carry at least three entries.
+#
+# Violations:
+#   * `id` is missing entirely (required).
+#   * `version` is "1.0" (not SemVer — the schema pattern rejects it).
+#   * `category` is "nope" (not in the enum).
+schema_version: "1.0.0"
+name: Multi Error
+version: "1.0"
+description: A deliberately invalid blueprint with three violations.
+category: nope
+files: []
+verification:
+  - id: ok
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

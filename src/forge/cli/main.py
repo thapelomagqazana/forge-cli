@@ -14,31 +14,103 @@ Design principles
    delegate registration, and call the app. It does not print, and it
    does not render errors. Anything else belongs in a module under
    ``forge.cli`` or ``forge.core``.
+
 2. **Version from metadata.** ``--version`` delegates to
    ``forge.core.version.get_version``, which reads the installed
    package version and falls back through a documented chain.
+
 3. **Exit codes are contractual.** Every documented failure mode maps
-   to an ``ExitCode`` enum value in ``forge.core.exceptions``.
+   to an ``ExitCode`` enum value in ``forge.core.exceptions``. This
+   module never invents a code; it converts between the two forms the
+   process boundary understands (``typer.Exit`` from command bodies,
+   ``SystemExit`` from the entry point).
+
 4. **Error handling is delegated.** Unhandled exceptions are rendered
    by ``forge.cli.errors.handle_exception``, which is tested in
    isolation. This module hands the exception off; it does not decide
    what the user sees.
+
 5. **Output is delegated.** Version output goes through
    ``forge.cli.ui.print_info``, which routes to stdout. This module
    does not touch a console.
+
 6. **Command-agnostic.** The entry point does not import, list, or
    reference any specific command. Adding a command means adding a
    module under ``forge.cli.commands`` — this file never changes.
+
 7. **Testable.** The app can be invoked via ``Typer.CliRunner``
    without launching a subprocess. The exception handler is tested
    separately (``tests/unit/cli/test_errors.py``), and the output
    helpers are tested separately (``tests/unit/cli/test_ui.py``).
+
+Non-obvious decisions
+---------------------
+* **``standalone_mode=False`` on ``app(...)``.** By default Typer
+   converts its ``typer.Exit`` exceptions into ``sys.exit()`` calls
+   and its ``UsageError`` exceptions into rendered messages followed
+   by ``sys.exit(2)``. ``standalone_mode=False`` disables both
+   conversions, leaving the raw exceptions for ``main()`` to
+   classify. That is the whole point of the flag: the entry point
+   owns the exit-code contract, not Typer.
+
+* **Three exception types are "clean exits", not crashes.**
+   ``main()`` distinguishes them explicitly:
+
+   1. ``typer.Exit`` — a command body signalling "I finished with
+      this code". Converted to ``SystemExit(code)``.
+   2. ``SystemExit`` — already the canonical exit signal. Propagated
+      unchanged.
+   3. Usage errors (``UsageError`` and its subclasses) — Typer
+      rejecting the invocation for a malformed argument. Converted
+      to ``SystemExit(2)``.
+
+   Everything else is a genuine unexpected exception and goes to
+   ``handle_exception``, which renders the generic "unexpected
+   internal error" and exits 5. That split is the exit-code contract
+   in code: 0/1/2 are user-facing, 5 is "report a bug".
+
+* **Usage errors are classified by *class name*, not by class
+   identity.** Typer vendors a private copy of Click under
+   ``typer._click``. Its ``UsageError`` is *not* the same class as
+   ``click.exceptions.UsageError`` — the two have separate
+   inheritance trees. An ``isinstance`` check against either one
+   misses the other. The class *names* are the stable API (Typer
+   mirrors Click's public names intentionally); the module paths and
+   class identities are not. See ``_USAGE_ERROR_CLASS_NAMES`` for the
+   list and the reasoning.
+
+* **``SystemExit``, not ``typer.Exit``, at the bottom of ``main()``.**
+   ``typer.Exit`` is meaningful only *inside* a Typer command; raised
+   outside, it propagates as an uncaught exception, and ``sys.exit()``
+   treats an uncaught exception as failure (exit code 1 plus a
+   traceback). ``SystemExit`` is the canonical Python exit signal and
+   is handled correctly by ``sys.exit(main())`` in the console script.
+
+* **Two ``--debug`` detections.** The root callback parses
+   ``--debug`` and stores it on ``ctx.obj`` so subcommands can read
+   it. The exception handler, however, may run *before* the callback
+   (e.g. if the callback itself raises, or if Typer rejects the
+   invocation before invoking the callback). For that path,
+   ``_resolve_debug_flag(argv)`` scans ``argv`` directly. The two
+   sources are intentionally redundant: ``ctx.obj["debug"]`` is the
+   truth for subcommands, ``_resolve_debug_flag(argv)`` is the
+   superset the exception handler uses, and the two agree whenever
+   the callback ran. ``_resolve_debug_flag`` is documented as a
+   fallback, not as a competing parser.
+
+* **Strict command registration in production.** A command module
+   that does not expose a module-level ``app: typer.Typer`` is a
+   *packaging bug*, not a user-runtime condition. Skipping it
+   silently would mean a user sees fewer commands than the release
+   notes promised, with no diagnostic. Failing at startup means the
+   bug is caught the first time the wheel is installed, on a
+   contributor's machine, not in a user's terminal six weeks later.
 """
 
 from __future__ import annotations
 
 import sys
-from typing import Annotated, NoReturn
+from typing import Annotated, Final, NoReturn
 
 import typer
 
@@ -47,6 +119,42 @@ from forge.cli.registry import register_commands
 from forge.cli.ui import print_info
 from forge.core.exceptions import ExitCode
 from forge.core.version import get_version
+
+# -----------------------------------------------------------------------------
+# Usage-error class names
+# -----------------------------------------------------------------------------
+# The set of exception class *names* that represent a malformed
+# invocation — a user mistake, not a CLI bug. Matched by name rather
+# than by ``isinstance`` because Typer vendors a private copy of
+# Click under ``typer._click``, and its ``UsageError`` is a *different
+# class* from ``click.exceptions.UsageError``. An ``isinstance``
+# check against either one silently misses the other, and the
+# fallthrough is exit 5 (internal error) — the exact wrong
+# classification.
+#
+# The names below are Click's public API. They have been stable for
+# years, and both Click and Typer have committed to them in their
+# documentation. A rename would be a breaking change to those
+# libraries' public surface, which neither has any reason to make.
+#
+# If a future Typer or Click adds a new subclass that represents an
+# invocation error, it will not be in this set — the exception will
+# fall through to ``handle_exception`` (exit 5) with the standard
+# "report a bug" message. That is the correct conservative fallback:
+# a novel exception shape should not be silently misclassified as a
+# usage error just because it *might* be one. The user sees the exit
+# 5 message with a clear note to report the issue, and the
+# maintainers see it in the issue tracker and add the name to this
+# set.
+_USAGE_ERROR_CLASS_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "UsageError",  # click.exceptions.UsageError
+        "BadParameter",  # click.exceptions.BadParameter — invalid value
+        "NoSuchOption",  # click.exceptions.NoSuchOption — unknown --flag
+        "MissingParameter",  # click.exceptions.MissingParameter — required not provided
+        "BadOptionUsage",  # click.exceptions.BadOptionUsage — option used wrong
+    }
+)
 
 
 # -----------------------------------------------------------------------------
@@ -85,21 +193,18 @@ def _resolve_debug_flag(argv: list[str]) -> bool:
     """Return ``True`` if ``--debug`` appears anywhere in ``argv``.
 
     This is intentionally a simple ``in`` check rather than a full
-    argument parser. Reasons:
+    argument parser. See the module docstring's "Two ``--debug``
+    detections" note for the invariant this function maintains and
+    the reason a full parse would be worse:
 
-    1. The root callback already parses ``--debug`` (as a Typer option)
-       for every code path that reaches the callback. This helper is
-       only used as a *fallback* when the callback did not run — e.g.,
-       if a subcommand raised before the root callback completed, or
-       if a malformed invocation confused Typer before the callback
-       could parse anything.
-    2. A full parse here would duplicate Typer's parsing logic, and
+    1. A full parse here would duplicate Typer's parsing logic, and
        the two could disagree. A literal string check cannot disagree
        with itself.
-    3. The only way ``--debug`` can appear in ``argv`` *without* being
+    2. The only way ``--debug`` can appear in ``argv`` *without* being
        the debug flag is if a subcommand declares its own ``--debug``
        option. No Forge command does, and if one ever does, this
-       helper should be revisited.
+       helper should be revisited — the test suite asserts the
+       absence by scanning every registered command's options.
 
     Args:
         argv: The argument list passed to ``main()`` (or
@@ -140,10 +245,12 @@ def _root_callback(
 
     Runs once, before any subcommand, and stores shared state on
     ``ctx.obj`` so subcommands can read it (e.g., ``ctx.obj["debug"]``).
+
+    The ``ctx.obj`` dict is the truth for subcommands; the exception
+    handler additionally scans ``argv`` (see
+    ``_resolve_debug_flag``) because it may run before this callback.
+    Whenever this callback runs, the two sources agree.
     """
-    # Store shared state on the context object. Subcommands read from it.
-    # Using a dict (rather than a dataclass) keeps the callback trivial;
-    # if shared state grows, promote it to a dataclass in a later task.
     ctx.obj = {"debug": debug}
 
 
@@ -165,6 +272,12 @@ def create_app() -> typer.Typer:
     Returns:
         A fully-configured ``typer.Typer`` instance with all commands
         mounted and the root callback installed.
+
+    Raises:
+        RuntimeError: If a command module violates the registry
+            contract (missing ``app`` attribute, wrong type). Failing
+            at startup surfaces packaging bugs immediately rather
+            than shipping a wheel with silently missing commands.
     """
     app = typer.Typer(
         name="forge",
@@ -175,39 +288,24 @@ def create_app() -> typer.Typer:
             "baseline checks, and maintain consistent engineering standards "
             "over time."
         ),
-        # The root callback handles --version and --debug. Subcommands
-        # are responsible for their own arguments.
         callback=_root_callback,
-        # Do not invoke the callback when no subcommand is given; instead,
-        # show the help text. This makes `forge` with no args useful
-        # rather than an error. Note: Typer still exits 2 (usage error)
-        # because no command was given — the help is a courtesy, not a
-        # successful invocation.
         no_args_is_help=True,
-        # Enable shell completion (Typer emits the instructions for the
-        # user's shell). Completion is a "polish" feature, but it pays
-        # for itself the first time a user types `forge cl<TAB>`.
         add_completion=True,
-        # Disable Rich markup in help text; help is plain text so it
-        # renders predictably in every terminal, including CI logs.
         rich_markup_mode=None,
-        # Keep the help output narrow enough to fit an 80-column terminal.
         context_settings={"help_option_names": ["-h", "--help"]},
     )
 
     # -------------------------------------------------------------------------
     # Command registration
     # -------------------------------------------------------------------------
-    # Delegate to the registry. The registry discovers every module in
-    # ``forge.cli.commands`` that follows the command module contract
-    # (a module-level ``app: typer.Typer``) and registers it on this
-    # app. This file never changes when a command is added.
-    #
-    # The registry is called in non-strict mode (the default) so that
-    # a malformed command module is logged and skipped rather than
-    # crashing ``forge --help``. The test suite runs the registry in
-    # strict mode to catch contract violations in CI.
-    register_commands(app)
+    # ``strict=True`` is deliberate: a malformed command module is a
+    # packaging bug, not a user-runtime condition. Failing here means
+    # the wheel was broken at install time, not at the user's first
+    # invocation. If a future release needs to tolerate a plugin
+    # ecosystem with best-effort discovery, that is a *different*
+    # registry call (``register_plugins``), not a loosening of the
+    # core contract.
+    register_commands(app, strict=True)
 
     return app
 
@@ -238,8 +336,8 @@ def main(argv: list[str] | None = None) -> NoReturn:
     Raises:
         NoReturn: This function always exits, via ``SystemExit`` for
             clean exits (``--help``, ``--version``, successful
-            commands) or via ``handle_exception`` for unexpected
-            errors.
+            commands, usage errors) or via ``handle_exception`` for
+            unexpected errors.
     """
     app = create_app()
 
@@ -249,40 +347,98 @@ def main(argv: list[str] | None = None) -> NoReturn:
     # the app received, not ``sys.argv``.
     actual_argv = argv if argv is not None else sys.argv[1:]
 
-    # Detect --debug up front. The root callback also parses --debug and
-    # stores it on ``ctx.obj``, but if a subcommand raises before the
-    # callback runs (or if the callback itself raises), ``ctx.obj`` is
-    # not available. Reading ``actual_argv`` directly is the safest way
-    # to decide whether the contributor wants a traceback.
+    # Detect --debug up front. The root callback also parses --debug
+    # and stores it on ``ctx.obj``, but if a subcommand raises before
+    # the callback runs (or if the callback itself raises), ``ctx.obj``
+    # is not available. Reading ``actual_argv`` directly is the safest
+    # way to decide whether the contributor wants a traceback.
     debug = _resolve_debug_flag(actual_argv)
 
+    # ------------------------------------------------------------------
+    # Exit-code classification: three clean-exit types, one crash type
+    # ------------------------------------------------------------------
+    #
+    # The order of the ``except`` clauses below is significant, because
+    # Python matches them top-to-bottom and the classes overlap:
+    #
+    #   * ``typer.Exit`` is a subclass of ``Exception`` (not
+    #     ``SystemExit``). It must be caught before ``BaseException``.
+    #   * ``SystemExit`` is a subclass of ``BaseException`` (not
+    #     ``Exception``). It must be caught before ``BaseException``
+    #     to propagate unchanged.
+    #   * Usage errors (by class name — see ``_USAGE_ERROR_CLASS_NAMES``)
+    #     are the classes Typer raises for malformed invocations. They
+    #     are caught in the ``BaseException`` branch by name because
+    #     ``isinstance`` cannot match Typer's vendored Click classes
+    #     against ``click.exceptions``.
+    #
+    # The catch order below is the canonical order:
+    #
+    #   1. ``typer.Exit`` — command body signalled "I finished with
+    #      this code". Convert to ``SystemExit(code)``.
+    #   2. ``SystemExit`` — already the canonical exit signal.
+    #      Propagate unchanged.
+    #   3. Anything else — check the class name against
+    #      ``_USAGE_ERROR_CLASS_NAMES``; if it matches, convert to
+    #      ``SystemExit(2)``. Otherwise hand to ``handle_exception``,
+    #      which classifies it as an internal error (exit 5).
+    #
+    # The ``typer.Exit`` clause must come *before* the
+    # ``_USAGE_ERROR_CLASS_NAMES`` check because ``typer.Exit`` is a
+    # clean exit regardless of whether its class name happens to
+    # match a usage-error name (it does not today, but the ordering
+    # is defensive).
     try:
-        # ``standalone_mode=False`` lets Typer return the command's
-        # result instead of calling ``sys.exit()`` itself. That is the
-        # right behaviour here: it lets us convert the return into an
-        # explicit exit below, keeping the ``NoReturn`` contract honest
-        # and preserving control over the process exit code.
-        app(args=actual_argv, standalone_mode=False)
+        result = app(args=actual_argv, standalone_mode=False)
+    except typer.Exit as exc:
+        # Command body signalled "I finished with this code".
+        # Convert to ``SystemExit`` — the canonical exit signal — so
+        # the shell sees ``$? == exc.exit_code``.
+        raise SystemExit(exc.exit_code) from exc
     except SystemExit:
-        # Clean exit from Typer (--help, --version, typer.Exit).
-        # Re-raise so the process exits with the correct code.
+        # Already the canonical exit signal. Propagate unchanged.
         raise
     except BaseException as exc:
-        # Unhandled exception. ``handle_exception`` always raises
-        # ``typer.Exit`` with the appropriate code (or re-raises under
-        # --debug), so this path is guaranteed to exit as well.
+        # Typer raises its own vendored copies of Click's exception
+        # classes when the invocation is malformed. Those copies live
+        # under ``typer._click.exceptions`` and are *not* identical to
+        # ``click.exceptions.*`` — ``isinstance(exc, click.UsageError)``
+        # returns False for a Typer-vendored ``UsageError`` because the
+        # two classes have separate inheritance trees. The class
+        # *names* are the stable API (Typer mirrors Click's public
+        # names intentionally); the module paths are not.
+        #
+        # ``type(exc).__name__`` works for both the vendored and the
+        # standalone-imported classes, and for any future Typer
+        # release that switches from one to the other.
+        if type(exc).__name__ in _USAGE_ERROR_CLASS_NAMES:
+            raise SystemExit(ExitCode.USER_ERROR) from exc
+        # Not a clean exit. Delegate to the central handler, which
+        # renders the generic "unexpected internal error" message and
+        # exits with ``ExitCode.INTERNAL_ERROR`` — or re-raises under
+        # ``--debug`` for a full traceback.
         handle_exception(exc, debug=debug)
 
-    # If ``app(...)`` returned normally, the command succeeded. Convert
-    # that success into an explicit exit so every path through
-    # ``main()`` ends in an exit rather than a return.
+    # ``app(...)`` returned normally. Interpret the return value as
+    # the command's exit code, or as "the command succeeded".
     #
-    # Use ``SystemExit`` (the Python exit signal), *not* ``typer.Exit``.
-    # ``typer.Exit`` is only meaningful inside a Typer command; raised
-    # outside, it propagates as an uncaught exception and ``sys.exit()``
-    # treats it as a failure (exit code 1 plus a traceback on stderr).
-    # ``SystemExit`` is the canonical Python exit signal and is handled
-    # correctly by ``sys.exit(main())`` in the console script.
+    # ``standalone_mode=False`` always returns the callback's return
+    # value from ``app(...)``. That is the documented contract, and
+    # it is the mechanism the project's commands use to signal their
+    # exit code (see ``validate.py``'s "Exit-code mechanism"
+    # docstring). The return value is:
+    #
+    #   * an ``int`` — the command's exit code (a command declared
+    #     ``-> int`` that returned successfully).
+    #   * ``None`` — the command's callback returned normally without
+    #     signalling a code (a command declared ``-> None``, or a
+    #     command declared ``-> int`` that fell off the end after an
+    #     unreachable branch).
+    #
+    # Both cases are treated as success unless the value is a
+    # non-zero integer.
+    if isinstance(result, int):
+        raise SystemExit(result)
     raise SystemExit(ExitCode.SUCCESS)
 
 

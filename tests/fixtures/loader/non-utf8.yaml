@@ -1,0 +1,2 @@
+# tests/unit/loading/test_yaml_parser.py (inside TestDecodeFailures)
+raw = b"description: caf\xe9\n"

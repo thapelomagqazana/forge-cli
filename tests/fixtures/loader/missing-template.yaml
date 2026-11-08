@@ -1,0 +1,30 @@
+# Consumed by:
+#   tests/unit/loading/test_loader_missing_template.py
+#
+# Proves: a structurally valid blueprint that references a template
+# which does not exist returns a ValidationError whose path is
+# `files.0.source`, not a crash deep in the renderer.
+#
+# The referenced template — `templates/does-not-exist.j2` — must
+# *not* be created. If a contributor adds it to this directory to
+# "make the test pass", the test stops testing what it claims to.
+#
+# The `id` must match the schema's pattern
+# (`^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$`) — no hyphens inside a
+# segment. `sample.missing-template` and `sample.missing_template`
+# are both invalid; `sample.missingtemplate` is valid.
+schema_version: "1.0.0"
+id: sample.missingtemplate
+name: Missing Template
+version: 1.0.0
+description: References a template that does not exist on disk.
+category: api
+files:
+  - source: templates/does-not-exist.j2
+    destination: README.md
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0
