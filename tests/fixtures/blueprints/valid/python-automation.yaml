@@ -1,0 +1,89 @@
+# =============================================================================
+# Python Automation Blueprint — Reference Fixture
+# =============================================================================
+# A minimal Python scripting/automation project. Chosen as a target
+# blueprint because it represents the "lean" end of the spectrum:
+# fewer variables, no conditional files, one verification check.
+#
+# Its purpose in the fixture set is to prove the schema does not
+# *require* optional features. A schema that only accepts rich
+# blueprints would be over-constrained; this fixture is the proof
+# that a legitimate minimal blueprint validates.
+# =============================================================================
+
+schema_version: "1.0.0"
+id: python.automation.script
+name: Python Automation Script
+version: 1.0.0
+description: >-
+  A single-entry-point Python automation project with argument
+  parsing, structured logging, and a pytest harness. Designed for
+  scheduled jobs, data-pipeline steps, and one-off operational
+  tooling.
+category: automation
+maintainer: "@platform-team"
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables:
+  - id: author
+    type: string
+    description: Author name used in pyproject metadata.
+    required: true
+    default: forge
+
+  - id: python_version
+    type: enum
+    description: Python minor version targeted by the generated project.
+    required: true
+    default: "3.12"
+    validation:
+      enum:
+        - "3.11"
+        - "3.12"
+        - "3.13"
+
+  - id: cli_framework
+    type: enum
+    description: Argument-parsing library for the entry point.
+    required: true
+    default: argparse
+    validation:
+      enum:
+        - argparse
+        - click
+        - typer
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+  - source: templates/README.md.j2
+    destination: README.md
+
+  - source: templates/src/__init__.py.j2
+    destination: src/{{ project_name }}/__init__.py
+
+  - source: templates/src/cli.py.j2
+    destination: src/{{ project_name }}/cli.py
+
+  - source: templates/tests/test_cli.py.j2
+    destination: tests/test_cli.py
+
+  - source: templates/.gitignore
+    destination: .gitignore
+
+# No conditional_files: this blueprint is intentionally minimal.
+# The schema accepts an empty list, and this fixture proves it — a
+# valid blueprint is not required to use every feature.
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+
+  - id: tests_pass
+    type: command
+    command: python -m pytest -q
+    timeout: 180

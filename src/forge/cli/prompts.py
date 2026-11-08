@@ -111,12 +111,26 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Sequence
-from typing import Final, TypeVar, cast
+from typing import TYPE_CHECKING, Final, TypeVar, cast
 
 from forge.core.exceptions import (
     PromptCancelledError,
     UserInputError,
 )
+
+if TYPE_CHECKING:
+    # Imported for the type checker only. ``TYPE_CHECKING`` is a
+    # module-level constant that is ``False`` at runtime and ``True``
+    # only inside type checkers, so this import does not execute in
+    # production. It exists so that ``_make_style`` can be annotated
+    # as returning ``questionary.Style`` — the type questionary's
+    # own stubs declare for its prompt constructors' ``style=``
+    # parameter — without paying questionary's import cost in
+    # non-interactive commands (``forge verify`` in CI, etc.). The
+    # lazy import inside each prompt function is retained; this is
+    # a *type-only* import, not a runtime one.
+    import questionary
+
 
 # -----------------------------------------------------------------------------
 # Public type aliases
@@ -188,7 +202,7 @@ what the wizard looks like.
 # -----------------------------------------------------------------------------
 # Style factory
 # -----------------------------------------------------------------------------
-def _make_style() -> object:
+def _make_style() -> questionary.Style:
     """Build a ``questionary.Style`` from ``_PROMPT_STYLE``.
 
     The ``answer`` and ``invalid`` glyphs are not top-level keyword
@@ -198,19 +212,27 @@ def _make_style() -> object:
     change to ``_PROMPT_STYLE`` (e.g., "use ``[y]`` instead of ``✓``")
     is one edit, not two.
 
-    The return type is annotated as ``object`` rather than
-    ``questionary.Style`` because ``questionary`` is imported lazily
-    inside the prompt functions (to keep CLI startup fast for
-    non-interactive runs). Importing it at module level for a type
-    annotation would defeat that. The value returned is a real
-    ``questionary.Style`` instance; callers pass it straight to
-    ``questionary``'s prompt constructors, which accept any object
-    with the right shape.
+    The return type is ``questionary.Style`` — the exact type
+    questionary's own stubs declare for its prompt constructors'
+    ``style=`` parameter. The import needed to *name* that type is
+    gated behind ``TYPE_CHECKING`` (see the top of the module): it
+    exists for mypy only, and does not execute at runtime. That
+    preserves the module's design goal — ``questionary`` is imported
+    lazily inside each prompt function so that non-interactive
+    commands like ``forge verify`` do not pay for its import cost —
+    while letting the annotation tell the truth. An earlier version
+    of this function annotated the return as ``object`` to avoid
+    needing the type-only import; that worked while questionary had
+    no stubs, but now that its stubs declare ``style: Style | None``
+    on every prompt constructor, the ``object`` annotation produced
+    ``arg-type`` errors at every call site. The ``TYPE_CHECKING``
+    import is the correct fix: it costs nothing at runtime and gives
+    the type checker the real type.
 
     Returns:
         A ``questionary.Style`` instance whose prompt and pointer
         tokens match ``_PROMPT_STYLE``. See questionary's style docs
-        for the token names -- they are stable across the versions
+        for the token names — they are stable across the versions
         this project pins.
     """
     import questionary

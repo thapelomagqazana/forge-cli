@@ -1,0 +1,24 @@
+schema_version: "1.0.0"
+id: sample.extrafield
+name: Extra Field Blueprint
+version: 1.0.0
+description: >-
+  A valid blueprint with exactly one defect: it declares a top-level
+  field that the schema does not define.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables: []
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+
+extra_field: this-field-does-not-exist-in-the-schema

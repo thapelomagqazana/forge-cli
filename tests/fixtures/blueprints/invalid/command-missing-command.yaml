@@ -1,0 +1,26 @@
+schema_version: "1.0.0"
+id: sample.commandmissingcommand
+name: Command Check Missing Command Blueprint
+version: 1.0.0
+description: >-
+  A valid blueprint with exactly one defect: a verification check
+  declares `type: command` but omits the `command` field.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables: []
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: tests_pass
+    type: command
+    timeout: 300
+
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml

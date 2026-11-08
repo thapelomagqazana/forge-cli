@@ -1,0 +1,22 @@
+schema_version: "1.0.0"
+id: sample.badversion
+name: Bad Version Blueprint
+version: "1.0"
+description: >-
+  A valid blueprint with exactly one defect: its `version` field is
+  not a full SemVer triple.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables: []
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml

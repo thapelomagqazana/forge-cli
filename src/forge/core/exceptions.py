@@ -124,6 +124,30 @@ public contract (ADR-0005) — and conceptually, both are "the user
 needs to do something differently," which is exactly what code 1
 means.
 
+Schema validation (blueprint documents)
+---------------------------------------
+``SchemaValidationError`` is the sole failure type raised by
+``forge.verification.validate_blueprint_document`` when a blueprint
+document does not conform to the bundled JSON Schema (ADR-0007).
+
+Unlike the message-only subclasses above, this error carries
+*structured* error paths — a tuple of ``(json_pointer, message)``
+pairs, with pointers following RFC 6901. That makes it consumable by
+three audiences without string parsing:
+
+- **Humans** — the ``__str__`` renders one bullet per violation.
+- **Scripts** — iterate ``exc.errors`` directly and branch on the
+  pointer, not the prose.
+- **Tests** — assert ``("/id", ...)`` is in ``exc.errors`` rather
+  than regex-matching a message that may be reworded tomorrow.
+
+The error inherits ``ExitCode.USER_ERROR`` (1) because a malformed
+blueprint shipped by the *user* is a user error; a malformed
+blueprint shipped by *Forge itself* is a packaging bug and is caught
+earlier (during schema construction) as an ``INTERNAL_ERROR``. The
+distinction is preserved by construction: the schema-construction
+path never routes through ``SchemaValidationError``.
+
 Stability
 ---------
 The following are public API and will not change without a major
@@ -132,24 +156,29 @@ version bump:
 - The ``ExitCode`` values (``0`` through ``5``).
 - The ``ForgeError`` attributes (``exit_code``, ``hint``).
 - The subclass names (``UserInputError``, ``BlueprintError``,
-  ``FilesystemConflictError``, ``VerificationError``).
+  ``FilesystemConflictError``, ``VerificationError``,
+  ``SchemaValidationError``).
 - The constructor signature
-  (``message: str, *, hint: str | None = None``).
+  (``message: str, *, hint: str | None = None``) for message-only
+  subclasses.
+- The ``SchemaValidationError`` constructor signature
+  (``source: str, errors: tuple[tuple[str, str], ...]``).
 
 Adding a new subclass is a non-breaking change. Removing or
 renaming one is breaking. Adding a new attribute to ``ForgeError``
 is non-breaking (as long as it has a default). Removing one is
 breaking.
 
-The ``MissingRequiredFlagsError`` and ``PromptCancelledError``
-subclasses added for dual-mode input handling are **new public API**
-and are covered by the same stability guarantees as the four
-existing subclasses.
+The ``MissingRequiredFlagsError``, ``PromptCancelledError``, and
+``SchemaValidationError`` subclasses are **new public API** and are
+covered by the same stability guarantees as the four existing
+subclasses.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import IntEnum
 
 
@@ -364,7 +393,7 @@ class VerificationError(ForgeError):
 
 
 # -----------------------------------------------------------------------------
-# Dual-mode input handling subclasses (Task 1.1.6)
+# Dual-mode input handling subclasses
 # -----------------------------------------------------------------------------
 # These subclasses exist specifically to give the interactive and
 # non-interactive paths of the ``create`` command distinct, testable
@@ -519,6 +548,134 @@ class PromptCancelledError(UserInputError):
 
 
 # -----------------------------------------------------------------------------
+# Schema validation failure (blueprint documents)
+# -----------------------------------------------------------------------------
+# Unlike every other subclass in this module, ``SchemaValidationError``
+# is not message-only: it carries a tuple of ``(json_pointer, message)``
+# pairs so callers can *act* on violations without parsing prose. The
+# decision to give it a distinct shape was deliberate — it is the sole
+# failure type of the document validator, and that validator is called
+# from CI, from the loader, and from tests. Each of those audiences wants
+# to enumerate violations, not read a paragraph.
+#
+# Why a dataclass frozen=True:
+# * The error is a value object — two errors with the same source and
+#   the same violations *are* the same failure. Equality matters for
+#   tests that assert on the whole error rather than a substring.
+# * Frozen prevents a caught error from being mutated by an exception
+#   handler that wants to "helpfully" append a violation — mutation
+#   there would break the audit trail.
+# * slots=True keeps the per-instance cost low; this error is
+#   constructed once per failed validation, and validation can run
+#   hundreds of times per CI job.
+@dataclass(frozen=True, slots=True)
+class SchemaValidationError(ForgeError):
+    """A blueprint document did not conform to the bundled JSON Schema.
+
+    **Exit code:** ``ExitCode.USER_ERROR`` (1). A blueprint that the
+    user authored and shipped invalidly is a user error. A schema that
+    Forge itself ships brokenly is caught earlier, during validator
+    construction, and propagates as a plain ``jsonschema`` exception
+    with the ``INTERNAL_ERROR`` exit code — the two failure modes are
+    distinguished by construction, not by string matching.
+
+    **When raised:**
+    ``forge.verification.validate_blueprint_document`` when the parsed
+    document does not conform to the schema. Also raised by any future
+    importer that routes through that function — which is every
+    importer, by design.
+
+    **What the user should do:** Fix the reported violations. The
+    ``errors`` tuple names every offending JSON Pointer; the hint
+    points at ``SCHEMA_REFERENCE.md`` for field-level guidance.
+
+    **Examples:**
+
+    - A blueprint missing ``id``.
+    - A blueprint with an unknown top-level field.
+    - A blueprint whose ``version`` is ``1.0`` rather than ``1.0.0``.
+    - A blueprint whose variable declares ``type: integer``.
+
+    Attributes:
+        source: A caller-supplied label (usually a file path) used to
+            make the message self-contained. Never inspected.
+        errors: A tuple of ``(json_pointer, message)`` pairs, sorted
+            by pointer for deterministic output. Empty pointers
+            (``""``) refer to the document root. Pointers follow
+            RFC 6901 (``~`` → ``~0``, ``/`` → ``~1``).
+    """
+
+    hint = "See docs/reference/SCHEMA_REFERENCE.md for field-level guidance."
+
+    # The exit code is *class-level*, not a dataclass field — this is
+    # load-bearing. ``ForgeError`` declares
+    # ``exit_code = ExitCode.INTERNAL_ERROR`` as its default; if this
+    # subclass does not override it, a schema-validation failure
+    # silently reports as an internal error (exit 5) instead of a
+    # user error (exit 1). The bug is invisible at the call site
+    # (``raise SchemaValidationError(...)`` works either way) and
+    # only surfaces at the CLI boundary, where
+    # ``handle_exception`` dispatches on ``exc.exit_code`` — a
+    # ``match`` statement that would fall through to the wrong branch.
+    #
+    # Because ``exit_code`` is *not* annotated with a type, the
+    # dataclass machinery does not treat it as a field: it stays a
+    # plain class attribute, is inherited by instances via normal
+    # attribute lookup, and is not part of the generated ``__init__``
+    # signature. Callers therefore cannot override the exit code at
+    # construction time — which is correct: the exit code is a
+    # *contract*, not a parameter.
+    exit_code = ExitCode.USER_ERROR
+
+    source: str
+    errors: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        """Initialize ``Exception.args`` so ``str()`` and pickling work.
+
+        ``Exception.__init__`` is normally called in ``__init__``, but
+        a frozen dataclass generates ``__init__`` for us. We call the
+        base initializer here with the message that ``__str__`` will
+        render, so ``repr(exc)`` and pickle round-trips behave as
+        callers expect from an exception.
+
+        Why not ``object.__setattr__`` inside ``__init__``? Because
+        the dataclass fields (``source``, ``errors``) are the state;
+        ``Exception.args`` is a *derived* view, not state. Computing
+        it once in ``__post_init__`` is the idiomatic way to bridge
+        the two worlds.
+        """
+        # ``Exception.__init__`` assigns ``self.args``. Since the
+        # dataclass is frozen, we cannot assign to ``self.args``
+        # directly; but ``Exception.__init__`` mutates via
+        # ``BaseException``'s internal slot, which ``frozen`` does
+        # not guard (the dataclass only blocks assignment to its
+        # *own* declared fields). This is the documented way to mix
+        # frozen dataclasses with Exception.
+        Exception.__init__(self, self.__str__())
+
+    def __str__(self) -> str:
+        """Render one bullet per violation, with JSON Pointer paths.
+
+        Two audiences are served by the same string:
+
+        * Humans reading a terminal see ``• /variables/0/type: 'integer'
+          is not one of ['string', 'boolean', 'enum']``.
+        * Log scrapers keyed on the leading ``•`` can split on it.
+
+        Scripts should use ``errors`` directly, not parse this string.
+        The message format is stable but not contractual.
+        """
+        if not self.errors:
+            return f"Blueprint '{self.source}' failed schema validation."
+        lines = [f"Blueprint '{self.source}' failed schema validation:"]
+        for pointer, message in self.errors:
+            rendered_pointer = pointer if pointer else "/"
+            lines.append(f"  • {rendered_pointer}: {message}")
+        return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
 # Public re-exports
 # -----------------------------------------------------------------------------
 # Every name in this module is part of the public API except the
@@ -532,6 +689,7 @@ __all__ = [
     "ForgeError",
     "MissingRequiredFlagsError",
     "PromptCancelledError",
+    "SchemaValidationError",
     "UserInputError",
     "VerificationError",
 ]

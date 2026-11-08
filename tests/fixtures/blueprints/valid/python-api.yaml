@@ -1,0 +1,126 @@
+# =============================================================================
+# Python FastAPI API Blueprint — Reference Fixture
+# =============================================================================
+# A production-shaped FastAPI service. This is the most feature-complete
+# of the three target blueprints: it exercises every variable type,
+# every file-mapping form, both conditional and unconditional files,
+# and both verification check types.
+#
+# It is deliberately the *hardest* case for the schema: if any schema
+# regression slips through, this fixture is the one most likely to
+# catch it. The other two are leaner by design — they exist to prove
+# the schema is not so strict that minimal blueprints become impossible.
+# =============================================================================
+
+schema_version: "1.0.0"
+id: python.fastapi.api
+name: Python FastAPI API
+version: 1.0.0
+description: >-
+  A FastAPI service with typed settings, health checks, structured
+  logging, and pytest scaffolding. Suitable as the starting point for
+  a production HTTP API.
+category: api
+maintainer: "@platform-team"
+
+compatibility:
+  # FastAPI blueprint requires Forge 1.0.0 or newer for the
+  # conditional-files feature that arrived with the v1 schema.
+  min_forge_version: 1.0.0
+
+variables:
+  - id: author
+    type: string
+    description: Author name used in LICENSE and pyproject metadata.
+    required: true
+    default: forge
+
+  - id: python_version
+    type: enum
+    description: Python minor version targeted by the generated project.
+    required: true
+    default: "3.12"
+    validation:
+      enum:
+        - "3.11"
+        - "3.12"
+        - "3.13"
+
+  - id: include_docker
+    type: boolean
+    description: Include a Dockerfile and docker-compose.yml.
+    required: false
+    default: true
+
+  - id: include_ci
+    type: boolean
+    description: Include a GitHub Actions CI workflow.
+    required: false
+    default: true
+
+  - id: license_id
+    type: enum
+    description: SPDX license identifier for the generated project.
+    required: true
+    default: Apache-2.0
+    validation:
+      enum:
+        - Apache-2.0
+        - MIT
+        - BSD-3-Clause
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+  - source: templates/README.md.j2
+    destination: README.md
+
+  - source: templates/LICENSE.j2
+    destination: LICENSE
+
+  - source: templates/src/main.py.j2
+    destination: src/{{ project_name }}/main.py
+
+  - source: templates/src/__init__.py.j2
+    destination: src/{{ project_name }}/__init__.py
+
+  - source: templates/tests/test_health.py.j2
+    destination: tests/test_health.py
+
+  - source: templates/.gitignore
+    destination: .gitignore
+
+conditional_files:
+  - condition: include_docker == true
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+      - source: templates/docker-compose.yml.j2
+        destination: docker-compose.yml
+      - source: templates/.dockerignore
+        destination: .dockerignore
+
+  - condition: include_ci == true
+    files:
+      - source: templates/.github/workflows/ci.yml.j2
+        destination: .github/workflows/ci.yml
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+
+  - id: has_health_test
+    type: required_file
+    path: tests/test_health.py
+
+  - id: tests_pass
+    type: command
+    command: python -m pytest -q
+    timeout: 300
+
+  - id: imports_cleanly
+    type: command
+    command: python -c "import {{ project_name }}"
+    timeout: 30

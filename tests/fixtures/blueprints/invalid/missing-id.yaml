@@ -1,0 +1,44 @@
+# =============================================================================
+# Invalid: missing required top-level field `id`
+# =============================================================================
+# Expected rejection: schema's top-level "required" array.
+# Expected pointer:   /id
+#
+# The document is otherwise a complete, valid blueprint. Removing `id`
+# is the *only* defect, so a rejection here can only be caused by the
+# absence of `id` — not by any other missing field, malformed value,
+# or unknown key. This near-copy structure is what makes the test
+# meaningful: without it, a document with three bugs would still pass
+# the "rejected" assertion, but we would not know *why* it was
+# rejected without inspecting the pointer.
+# =============================================================================
+
+schema_version: "1.0.0"
+# id: intentionally omitted
+name: Missing-ID Blueprint
+version: 1.0.0
+description: >-
+  A valid blueprint with exactly one defect: it omits the required
+  top-level `id` field. Everything else about this document is
+  intentionally valid so that the only way the schema can reject it
+  is by catching the missing `id`.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables:
+  - id: author
+    type: string
+    description: Author name.
+    required: true
+    default: forge
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml

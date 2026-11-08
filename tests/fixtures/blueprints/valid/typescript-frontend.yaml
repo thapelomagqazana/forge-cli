@@ -1,0 +1,123 @@
+# =============================================================================
+# TypeScript Frontend Blueprint — Reference Fixture
+# =============================================================================
+# A Vite + React + TypeScript frontend. Chosen as a target blueprint
+# because it is the only non-Python blueprint in the MVP and therefore
+# the strongest test of schema language-agnosticism: none of the schema's
+# keywords (``enum``, ``pattern``, ``conditional_files``, …) are
+# Python-specific, and this fixture proves that in practice rather than
+# in principle.
+#
+# It is also the only fixture whose verification commands do not invoke
+# Python, which is a useful cross-check that the schema does not
+# accidentally encode "Python project" assumptions into the blueprint
+# format.
+# =============================================================================
+
+schema_version: "1.0.0"
+id: typescript.vite.react
+name: TypeScript Vite React App
+version: 1.0.0
+description: >-
+  A Vite + React + TypeScript single-page application with routing,
+  ESLint, Prettier, and Vitest. Suitable as the frontend half of a
+  full-stack project or as a standalone SPA.
+category: frontend
+maintainer: "@platform-team"
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables:
+  - id: author
+    type: string
+    description: Author name used in package.json.
+    required: true
+    default: forge
+
+  - id: package_manager
+    type: enum
+    description: Node package manager for the generated project.
+    required: true
+    default: npm
+    validation:
+      enum:
+        - npm
+        - pnpm
+        - yarn
+
+  - id: include_router
+    type: boolean
+    description: Include React Router with two example routes.
+    required: false
+    default: true
+
+  - id: include_vitest
+    type: boolean
+    description: Include Vitest and a smoke test.
+    required: false
+    default: true
+
+files:
+  - source: templates/package.json.j2
+    destination: package.json
+
+  - source: templates/tsconfig.json
+    destination: tsconfig.json
+
+  - source: templates/vite.config.ts.j2
+    destination: vite.config.ts
+
+  - source: templates/index.html.j2
+    destination: index.html
+
+  - source: templates/src/main.tsx.j2
+    destination: src/main.tsx
+
+  - source: templates/src/App.tsx.j2
+    destination: src/App.tsx
+
+  - source: templates/.eslintrc.cjs
+    destination: .eslintrc.cjs
+
+  - source: templates/.prettierrc
+    destination: .prettierrc
+
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: include_router == true
+    files:
+      - source: templates/src/router.tsx.j2
+        destination: src/router.tsx
+      - source: templates/src/routes/Home.tsx.j2
+        destination: src/routes/Home.tsx
+      - source: templates/src/routes/About.tsx.j2
+        destination: src/routes/About.tsx
+
+  - condition: include_vitest == true
+    files:
+      - source: templates/vitest.config.ts.j2
+        destination: vitest.config.ts
+      - source: templates/src/App.test.tsx.j2
+        destination: src/App.test.tsx
+
+verification:
+  - id: has_package_json
+    type: required_file
+    path: package.json
+
+  - id: has_tsconfig
+    type: required_file
+    path: tsconfig.json
+
+  - id: typecheck_passes
+    type: command
+    command: npx tsc --noEmit
+    timeout: 300
+
+  - id: tests_pass
+    type: command
+    command: npm test -- --run
+    timeout: 300
