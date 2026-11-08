@@ -1,0 +1,42 @@
+# One variable of each type, in declaration order. The order matters:
+# the wizard prompts in this order, and the parity test asserts both
+# engines agree on the whole list regardless of which type is first.
+# Reordering this list is a meaningful change — do not do it casually.
+schema_version: "1.0.0"
+id: python.mixed
+name: Mixed Variables
+version: 1.0.0
+description: A blueprint exercising every variable type.
+category: api
+variables:
+  - id: service_name
+    type: string
+    description: Name of the service.
+    required: true
+    validation:
+      pattern: "^[a-z][a-z0-9-]*$"
+  - id: include_docker
+    type: boolean
+    description: Include a Dockerfile.
+    required: false
+    default: false
+  - id: license
+    type: enum
+    description: SPDX license identifier.
+    required: true
+    default: Apache-2.0
+    validation:
+      enum:
+        - Apache-2.0
+        - MIT
+        - BSD-3-Clause
+verification:
+  - id: readme
+    type: required_file
+    path: README.md
+  - id: tests_pass
+    type: command
+    command: "pytest -q"
+    timeout: 300
+compatibility:
+  min_forge_version: 1.0.0

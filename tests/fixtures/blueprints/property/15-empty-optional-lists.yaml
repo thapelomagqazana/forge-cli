@@ -1,0 +1,18 @@
+# All optional lists omitted, required list present. This is the
+# document shape a blueprint author produces when their blueprint has
+# no configurable options — everything is templated literally and
+# verification is a single file-presence check. The schema permits
+# it; a tighter-than-schema model would reject it, so this seed is
+# the boundary that catches over-strictness.
+schema_version: "1.0.0"
+id: minimal.optional
+name: Optional Lists Empty
+version: 1.0.0
+description: A blueprint with no variables, files, or conditional files.
+category: cli
+verification:
+  - id: readme
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

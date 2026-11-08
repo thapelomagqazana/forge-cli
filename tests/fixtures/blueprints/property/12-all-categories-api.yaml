@@ -1,0 +1,17 @@
+# Category: api. The most common category in the target blueprint set
+# (python.fastapi.api lives here), so it is also the category most
+# likely to be exercised by other integration tests. Kept as its own
+# file so a category-specific bug reports a filename containing
+# "api".
+schema_version: "1.0.0"
+id: python.category.api
+name: API Category
+version: 1.0.0
+description: A blueprint in the api category.
+category: api
+verification:
+  - id: placeholder
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

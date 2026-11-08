@@ -1,0 +1,29 @@
+# An enum variable with three allowed values. The parity test asserts
+# this is accepted, and asserts that mutating it by (a) removing
+# `validation`, (b) emptying `validation.enum`, or (c) setting
+# `default` to a value not in the list all cause both engines to
+# reject identically. The three failure modes are three separate
+# sub-properties even though they exercise the same field.
+schema_version: "1.0.0"
+id: python.enum
+name: Enum Variable
+version: 1.0.0
+description: A blueprint that picks a database backend.
+category: api
+variables:
+  - id: database
+    type: enum
+    description: Which database driver to configure.
+    required: true
+    default: postgres
+    validation:
+      enum:
+        - postgres
+        - mysql
+        - sqlite
+verification:
+  - id: config
+    type: required_file
+    path: config/database.yml
+compatibility:
+  min_forge_version: 1.0.0

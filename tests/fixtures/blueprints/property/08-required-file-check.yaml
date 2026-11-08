@@ -1,0 +1,18 @@
+# A blueprint whose verification is entirely file-based. The mirror of
+# 07-command-check.yaml: together they pin both branches of the
+# `CheckDefinition` discriminated-payload rule.
+schema_version: "1.0.0"
+id: python.file.check
+name: File Check
+version: 1.0.0
+description: A blueprint verified by asserting files exist.
+category: library
+verification:
+  - id: pyproject
+    type: required_file
+    path: pyproject.toml
+  - id: readme
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

@@ -1,0 +1,17 @@
+# Smallest possible valid blueprint. Every list is at minItems,
+# every string is at minLength (except semantically empty categories,
+# which use the shortest legal enum value). The parity test asserts
+# both engines accept this; if either rejects it, the schema and models
+# have diverged on what "minimal" means.
+schema_version: "1.0.0"
+id: a.b
+name: x
+version: 0.0.1
+description: d
+category: other
+verification:
+  - id: f
+    type: required_file
+    path: p
+compatibility:
+  min_forge_version: 0.0.1

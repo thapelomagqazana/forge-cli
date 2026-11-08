@@ -1,0 +1,16 @@
+# A blueprint whose own version carries a prerelease identifier. Also
+# exercises the compatibility floor: a prerelease blueprint may require
+# a stable minimum (as here), because the two versions are independent
+# facts about the document.
+schema_version: "1.0.0"
+id: python.prerelease
+name: Prerelease Blueprint
+version: 1.0.0-alpha.1
+description: A blueprint that is itself a prerelease.
+category: library
+verification:
+  - id: placeholder
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

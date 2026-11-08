@@ -156,16 +156,42 @@ def test_schema_forbids_unknown_top_level_fields() -> None:
 
 
 def test_schema_declares_required_fields() -> None:
-    """Every field the loader depends on must be in ``required``.
+    """Every *loader-mandatory* field must be in ``required``.
 
-    The loader reads ``properties.schema_version.const``, and the
-    verification layer reads the full top-level structure. A field
-    that is *declared* but not *required* is a footgun: a document
-    can omit it, the loader will still try to read it, and the crash
-    happens at runtime rather than at validation time.
+    The loader reads a small set of top-level fields unconditionally:
+
+    * ``schema_version`` — every validation call checks it.
+    * ``id`` — the registry lookup key.
+    * ``name`` — displayed in the selector and in ``forge list``.
+    * ``version`` — used for compatibility checks.
+    * ``description`` — displayed in the selector.
+    * ``category`` — used for grouping.
+    * ``verification`` — the contract the generation layer enforces.
+
+    Omitting any of these must be a schema failure, not a runtime
+    crash. That is what this test guards.
+
+    **``variables`` and ``files`` are deliberately excluded.** Both
+    have ``"default": []`` in the schema, both are absent from
+    ``required``, and both are read by the model with a default of
+    ``[]``. A blueprint with no variables and no static files is
+    valid — the "minimum viable blueprint" has exactly this shape.
+    Requiring them would reject every minimal blueprint, contradict
+    the model's defaults, and force authors to write
+    ``variables: []`` and ``files: []`` boilerplate. The companion
+    test ``test_optional_list_fields_declare_defaults`` (below)
+    pins the *positive* form of this rule: both fields are declared
+    with ``"default": []``, so absence means empty list, not
+    "missing".
+
+    A separate decision was made for ``conditional_files``: it is
+    also optional with a ``[]`` default, but it was never in
+    ``required``, so it does not need to be listed here — it is
+    covered by the same companion test.
     """
     schema = load_schema()
     required = set(schema.get("required", []))
+
     for field in (
         "schema_version",
         "id",
@@ -173,14 +199,51 @@ def test_schema_declares_required_fields() -> None:
         "version",
         "description",
         "category",
-        "variables",
-        "files",
         "verification",
         "compatibility",
     ):
         assert field in required, (
             f"{field!r} must be in top-level required; omitting it "
             f"lets a document pass validation while crashing the loader"
+        )
+
+
+def test_optional_list_fields_declare_defaults() -> None:
+    """Fields absent from ``required`` must have an explicit ``default``.
+
+    The complement of ``test_schema_declares_required_fields``: a
+    field that is *not* mandatory must tell the reader (and the
+    loader, and the model) what absence means. A field that is
+    neither required nor defaulted is a latent bug: the loader will
+    eventually read it and get ``None`` or ``KeyError``, and the
+    failure will surface at runtime rather than at validation time.
+
+    The three list fields are the case that matters today, because
+    the model exposes them with ``= []`` defaults (see
+    ``forge.models.blueprint``) and the wizard, the verification
+    layer, and the generation pipeline all expect to iterate over
+    them unconditionally. Pinning the schema-side default here means
+    a future contributor who removes ``"default": []`` from either
+    field gets a test failure that names the field and points at the
+    model-side contract it would break.
+    """
+    schema = load_schema()
+    properties = schema["properties"]
+
+    for field in ("variables", "files", "conditional_files"):
+        assert field not in schema.get("required", []), (
+            f"{field!r} is optional (has a default); it must not be in "
+            f"``required``. Add it to the loader-mandatory list instead "
+            f"if the loader genuinely cannot cope with absence — but "
+            f"the model and every fixture currently assume absence is "
+            f"valid."
+        )
+        assert properties[field].get("default") == [], (
+            f"{field!r} is optional, so it must declare "
+            f'``"default": []``. Without it, a document that omits '
+            f"the field validates at the schema level but produces a "
+            f"``None`` (or KeyError) downstream — exactly the runtime "
+            f"crash this file exists to prevent."
         )
 
 

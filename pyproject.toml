@@ -56,51 +56,74 @@ classifiers = [
 
 # Runtime dependencies: intentionally minimal and bounded.
 # Every dependency is a liability. We choose a small, well-maintained set.
+#
+# The list is alphabetised for two reasons:
+#   1. It is scannable — a reviewer looking for "is X a dependency?"
+#      knows where to look without reading every line.
+#   2. Merge-conflict resolution becomes mechanical. ``uv.lock``
+#      encodes dependency order; any reordering of this list produces
+#      a spurious lockfile diff, and mechanical resolution prevents
+#      "I resolved the conflict by reordering, and now everything is
+#      broken" incidents.
 dependencies = [
-    "typer>=0.12.0,<1.0",
-    "rich>=13.7.0,<14.0",
-    "pydantic>=2.6.0,<3.0",
-    "pydantic-settings>=2.2.0,<3.0",
+    "click>=8.1.0,<9.0",
+    "httpx>=0.27.0,<1.0",
     "jinja2>=3.1.3,<4.0",
-    "pyyaml>=6.0.1,<7.0",
     # ``jsonschema`` 4.22+ is the minimum that ships a stable, public
     # ``Draft202012Validator`` with the ``iter_errors`` API our
     # verification funnel relies on, and that resolves the Draft
     # 2020-12 meta-schema without extra deps. Pinning the floor
-    # tighter than the previous 4.21 prevents silent regressions on
-    # older hosts.
+    # tighter than 4.21 prevents silent regressions on older hosts.
     "jsonschema>=4.22.0,<5.0",
-    "httpx>=0.27.0,<1.0",
-    "click>=8.1.0,<9.0",
-    # ``questionary`` powers the interactive wizard. Its public API
-    # is stable; the ``unsafe_ask`` entry point used by
+    # ``pydantic`` 2.7+ is the minimum that ships the strict-mode
+    # ``ConfigDict(extra="forbid", strict=True)`` behaviour our
+    # generated models depend on, and that preserves the ``loc`` tuple
+    # shapes ``_format_pydantic_errors`` relies on for JSON-Pointer
+    # translation. The floor matches the version the codegen tool
+    # targets when it emits ``pydantic_v2.BaseModel`` output.
+    "pydantic>=2.7.0,<3.0",
+    "pydantic-settings>=2.2.0,<3.0",
+    "pyyaml>=6.0.1,<7.0",
+    # ``questionary`` powers the interactive wizard. Its public API is
+    # stable; the ``unsafe_ask`` entry point used by
     # ``forge.cli.prompts`` raises ``KeyboardInterrupt`` and
     # ``EOFError`` on cancellation, which the prompt engine converts
     # into ``PromptCancelledError`` — no other library behaviour is
     # depended on.
     "questionary>=2.0.1,<3.0",
+    "rich>=13.7.0,<14.0",
+    "typer>=0.12.0,<1.0",
     # ``importlib-resources`` is stdlib on 3.9+, so no conditional
-    # dependency is required. ``jsonschema`` and ``questionary`` are
-    # the only additions relative to the previous version.
+    # dependency is required. ``jsonschema``, ``pydantic``, and
+    # ``questionary`` are the only additions relative to the previous
+    # version.
 ]
 
 # Development dependencies: installed with `uv sync --all-extras`.
 [project.optional-dependencies]
 dev = [
+    "bandit>=1.7.8,<2.0",
+    # ``datamodel-code-generator`` produces ``forge.models.blueprint``
+    # from the canonical JSON Schema (ADR-0008). It is a *dev* dep —
+    # the generated file is committed, so the runtime wheel does not
+    # need the tool. The floor is the oldest version whose CLI flags
+    # match ``_GENERATOR_ARGS`` in ``forge.models._generator``; if a
+    # future release changes flag names, that module is the only file
+    # to update.
+    "datamodel-code-generator>=0.25.0,<0.26",
+    "hypothesis>=6.100,<7.0",
+    "mypy>=1.10,<2.0",
+    "pip-audit>=2.7.0,<3.0",
+    "pre-commit>=3.7,<4.0",
     "pytest>=8.0,<9.0",
     "pytest-cov>=5.0,<6.0",
     "pytest-xdist>=3.5,<4.0",
-    "hypothesis>=6.100,<7.0",
     "ruff==0.4.4",
-    "mypy>=1.10,<2.0",
-    "bandit>=1.7.8,<2.0",
-    "pip-audit>=2.7.0,<3.0",
-    "pre-commit>=3.7,<4.0",
     # Stubs for libraries that ship without annotations. Keeping them
     # as *dev* dependencies (not runtime) means the wheel stays lean
     # while developers get full type coverage locally and in CI.
-    "types-PyYAML>=6.0.12",
     "types-jsonschema>=4.22.0",
+    "types-PyYAML>=6.0.12",
 ]
 
 # Console entry point — `forge` becomes a real executable.
@@ -133,23 +156,34 @@ version-file = "src/forge/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/forge"]
 
-# ``force-include`` is reserved for assets that live outside the
-# package directory and must appear inside it in the installed wheel.
-# Everything under ``src/forge/`` — including ``schemas/`` and
-# ``blueprints/`` — is already covered by ``packages`` above; the
-# entries here are the ones Hatchling would otherwise miss.
+# Ship the canonical JSON Schema as a package resource (ADR-0007).
+# Hatchling's ``packages`` directive ships ``*.py`` files by default;
+# non-Python package-internal files must be declared explicitly, or they
+# will be absent from the installed wheel, causing
+# ``importlib.resources.files("forge.schemas")`` to raise
+# ``FileNotFoundError`` at runtime — even though the same code works
+# from an editable install (where the file is read directly from the
+# source tree). That divergence is the classic "works on my machine,
+# breaks for users" packaging bug, and it would be fatal here because
+# the schema is the canonical contract (ADR-0007): the shipped wheel
+# must contain it, or the CLI cannot validate any blueprint.
+#
+# ``artifacts`` ships files verbatim regardless of Hatchling's language
+# heuristics. The glob (rather than a single filename) anticipates a
+# future v2 schema shipped alongside v1 during migration: adding a
+# schema becomes a data change, not a config change.
+#
+# Do *not* replace this with ``shared-data``: that directive places
+# files under the wheel's ``share/`` tree, which is *outside* the
+# importable package and unreachable via ``importlib.resources``. An
+# earlier revision of this file used ``shared-data`` and silently
+# shipped a duplicate copy of the schema that no code path could read.
+artifacts = ["src/forge/schemas/*.json"]
+
+# ``force-include`` is reserved for assets that live *outside* the
+# package directory and must appear *inside* it in the installed wheel.
 [tool.hatch.build.targets.wheel.force-include]
 "src/forge/py.typed" = "forge/py.typed"
-
-# Explicitly declare the JSON schema documents as package data. The
-# ``packages = ["src/forge"]`` directive ships everything under the
-# package tree, but the JSON Schema loader depends on the file being
-# *present as a file* inside the wheel (not embedded in a zip-only
-# layout). Declaring it here documents that intent and makes the
-# dependency visible to reviewers who inspect this file without
-# reading Hatchling's defaults.
-[tool.hatch.build.targets.wheel.shared-data]
-"src/forge/schemas" = "share/forge/schemas"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -173,6 +207,14 @@ line-length = 100
 src = ["src", "tests"]
 extend-exclude = [
     "src/forge/blueprints",
+    # Generated by ``scripts/generate_models.py`` (ADR-0008). Linting a
+    # file whose content is derived from the schema is a losing battle:
+    # any fix would be undone on the next ``make models``, and any rule
+    # the generator's output violates would become a permanent ignore
+    # in this file. The generated file is instead *reviewed* as a
+    # projection of the schema, and its invariants are enforced by the
+    # parity test — a stronger guarantee than ruff could provide.
+    "src/forge/models/blueprint.py",
     "src/forge/_version.py",
     ".venv",
     "build",
@@ -204,6 +246,21 @@ ignore = [
 # Tests may use assert (S101) and print (T20) for debugging.
 "tests/**/*.py" = ["S101", "T20"]
 
+# The drift test invokes ``scripts/generate_models.py`` as a subprocess
+# with arguments that are all compile-time literals (``sys.executable``,
+# the module-level ``_GENERATOR_SCRIPT`` constant, and the literal
+# ``"--check"``). Bandit's S603 fires because the argument *list* is
+# computed, not because any element is untrusted — the same false
+# positive as every other safe ``subprocess.run([...])`` call.
+#
+# The suppression lives here rather than as an inline ``# ruff: noqa``
+# in the test file because inline directives at line 1 of a file that
+# begins with a docstring are silently stripped by Ruff's ``RUF100``
+# cleanup (an unused-``noqa`` rule that runs under ``--fix``) on the
+# next ``make fix``. A per-file ignore has no such interaction with
+# other rules and does not participate in the noqa-cleanup pass.
+"tests/unit/models/test_generated_in_sync.py" = ["S603"]
+
 # Scripts are standalone CLI tools, not library code. They are:
 #   - Not imported by any other module.
 #   - Not shipped in the wheel.
@@ -213,12 +270,22 @@ ignore = [
 # with the script role.
 "scripts/**/*.py" = ["T201", "SIM108"]
 
+# ``forge.models._generator`` is a developer tool, not library code.
+# It legitimately prints to stdout/stderr (its whole job is to
+# communicate regeneration results to a human running ``make models``),
+# and it shells out to ``datamodel-code-generator`` for the reasons
+# documented in that module. Relaxing only the rules that conflict
+# with the tool's role keeps the rest of the package under the strict
+# ruleset.
+"src/forge/models/_generator.py" = ["T201", "S603", "S607"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["forge"]
 known-third-party = [
     "typer",
     "rich",
     "pydantic",
+    "pydantic_settings",
     "jinja2",
     "yaml",
     "jsonschema",
@@ -256,7 +323,18 @@ show_error_codes = true
 show_error_context = true
 pretty = true
 files = ["src"]
-exclude = ["src/forge/blueprints", "src/forge/_version.py"]
+exclude = [
+    "src/forge/blueprints",
+    # Generated — see the corresponding Ruff exclusion. The file's
+    # types are derived from the schema; mypy errors against it would
+    # be addressed by regenerating with different flags (a decision in
+    # ``_GENERATOR_ARGS``), not by editing the generated output. The
+    # ``_model_class`` indirection in the verification funnel means
+    # callers still see fully typed models — only the *definition*
+    # site is exempt, not its use.
+    "src/forge/models/blueprint.py",
+    "src/forge/_version.py",
+]
 
 [[tool.mypy.overrides]]
 # ``forge._version`` is generated by hatch-vcs at build time. It has
@@ -276,6 +354,10 @@ ignore_missing_imports = true
 # ``questionary`` needs an explicit cast. ``yaml`` is covered by
 # ``types-PyYAML``; the override is belt-and-braces so a developer
 # running mypy outside the dev extras still passes.
+#
+# ``datamodel_code_generator`` is only imported by
+# ``scripts/generate_models.py`` (not under ``files = ["src"]``), so
+# no override is needed — mypy never sees it.
 module = ["yaml.*", "questionary.*"]
 ignore_missing_imports = true
 
@@ -319,6 +401,27 @@ omit = [
     "*/__init__.py",
     "*/_version.py",
     "src/forge/blueprints/*",
+
+    # ``forge.models.blueprint`` is generated (ADR-0008) and its
+    # *content* is fully exercised by the parity tests through
+    # ``validate_blueprint_document``. Counting its lines would inflate
+    # coverage without measuring behaviour — every branch in the
+    # generated file is either pydantic internals or hand-tuned code
+    # whose behaviour is asserted by ``test_schema_model_parity`` and
+    # ``test_model_error_messages``. The *handlers* that call into the
+    # model, and the facade that exposes it, remain covered.
+    "src/forge/models/blueprint.py",
+
+    # ``forge.models._generator`` is a developer tool invoked by
+    # ``make models`` and CI, not by ``forge``. Its behaviour is
+    # exercised by ``test_generated_in_sync`` (which calls
+    # ``main(["--check"])``) and by the regeneration step itself in
+    # CI, but neither path runs under pytest's coverage hooks — the
+    # test invokes ``main`` in-process, and the CI path runs
+    # ``python -m forge.models._generator`` as a subprocess. Omitting
+    # it here is honest: the behaviour is tested, coverage just
+    # cannot observe both invocations uniformly.
+    "src/forge/models/_generator.py",
 
     # `__main__.py` is a three-line entry point whose only job is to
     # call `main()`. Its behaviour is tested by the

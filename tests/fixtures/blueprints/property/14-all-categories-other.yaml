@@ -1,0 +1,16 @@
+# Category: other. The last enum value, and the escape hatch for
+# blueprints that do not fit a specific category. Kept distinct from
+# 12 and 13 so a regression on the last enum member reports a
+# filename containing "other".
+schema_version: "1.0.0"
+id: misc.category.other
+name: Other Category
+version: 1.0.0
+description: A blueprint in the other category.
+category: other
+verification:
+  - id: placeholder
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

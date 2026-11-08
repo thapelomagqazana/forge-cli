@@ -1,0 +1,24 @@
+# A string variable constrained by a regex. The pattern is deliberately
+# strict enough that a future "does the model actually compile it?"
+# mutation is meaningful, but simple enough that the seed itself is
+# obviously valid.
+schema_version: "1.0.0"
+id: python.string.constrained
+name: Constrained String
+version: 1.0.0
+description: A blueprint with a regex-validated string variable.
+category: cli
+variables:
+  - id: module_name
+    type: string
+    description: Python module identifier (lowercase, underscores).
+    required: true
+    validation:
+      pattern: "^[a-z][a-z0-9_]*$"
+verification:
+  - id: check
+    type: command
+    command: "true"
+    timeout: 60
+compatibility:
+  min_forge_version: 1.0.0

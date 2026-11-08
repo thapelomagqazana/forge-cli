@@ -223,6 +223,15 @@ adr-check: ## Verify the ADR index is up to date (CI gate — fails on drift)
 	fi
 	@echo "✅ ADR index is up to date."
 
+PY ?= uv run python
+
+.PHONY: models models-check
+models:
+	$(PY) scripts/generate_models.py
+
+models-check:
+	$(PY) scripts/generate_models.py --check
+
 # -----------------------------------------------------------------------------
 # Cleanup
 # -----------------------------------------------------------------------------
