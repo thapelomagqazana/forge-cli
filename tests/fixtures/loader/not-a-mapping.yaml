@@ -1,0 +1,20 @@
+# Consumed by:
+#   tests/unit/loading/test_yaml_parser.py::TestNonMappingRoots
+#   tests/unit/loading/test_loader_malformed_yaml.py::test_list_root_rejected
+#
+# Proves: a top-level list is rejected with a message that names the
+# fix ("wrap top-level lists under their intended key") rather than
+# the rule ("root must be a mapping"). The distinction matters —
+# the second sentence tells the user what to do, the first does not.
+#
+# A common authoring mistake is to write the `variables` list at the
+# top level because that is what a variables file looks like in
+# other tools.
+- id: author
+  type: string
+  description: Author name
+  required: true
+- id: include_docker
+  type: boolean
+  description: Include a Dockerfile
+  required: false

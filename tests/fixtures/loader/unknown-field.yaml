@@ -1,0 +1,21 @@
+# Consumed by:
+#   tests/unit/loading/test_loader_multi_error.py::test_unknown_top_level_field
+#
+# Proves: the schema's `additionalProperties: false` is enforced at
+# the top level. An unrecognised field is a validation error, not
+# silently ignored — silently ignoring extra fields is a footgun
+# because users think their custom field is taking effect.
+schema_version: "1.0.0"
+id: sample.unknown-field
+name: Unknown Field
+version: 1.0.0
+description: Contains a field the schema does not recognise.
+category: api
+unknown_field: should-be-rejected
+files: []
+verification:
+  - id: ok
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

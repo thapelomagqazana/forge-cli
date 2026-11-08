@@ -79,11 +79,42 @@ repos:
         name: ensure files end with a newline
       - id: check-yaml
         name: validate YAML syntax
+        # Fixtures under tests/fixtures/loader/ are *intentionally*
+        # malformed: they exercise the parser's error path. Linting
+        # them would amount to asserting that our error-handling
+        # tests are not testing error handling.
+        #
+        # Note: this exclusion is scoped to tests/fixtures/loader/,
+        # not tests/fixtures/ generally, because other fixture
+        # directories (e.g. tests/fixtures/blueprints/) contain
+        # *valid* YAML that the hook should continue to lint. A
+        # future intentionally-broken fixture belongs under
+        # tests/fixtures/loader/ (or a new explicitly-excluded
+        # directory), not under tests/fixtures/ at large.
+        exclude: ^tests/fixtures/loader/
       - id: check-toml
         name: validate TOML syntax
       - id: check-json
         name: validate JSON syntax
-        exclude: ^src/forge/blueprints/.*\.json$  # blueprint JSON is validated by the loader
+        # Two exclusions, for two distinct reasons:
+        #
+        # 1. Bundled blueprints under src/ are validated by the loader,
+        #    not by check-json. They may be valid JSON today and will
+        #    remain valid as long as the loader's schema governs them;
+        #    check-json would duplicate that check without knowing about
+        #    the loader's validation rules.
+        #
+        # 2. Test fixtures under tests/fixtures/blueprints/ include
+        #    *template stubs* (e.g. templates/tsconfig.json) that are
+        #    not valid JSON by design — they carry Jinja placeholders
+        #    such as `{# placeholder: ... #}` and are replaced during
+        #    `forge create`. Parsing them as JSON would fail on the
+        #    very syntax the templating layer is designed to consume,
+        #    so the hook must not see them. Fixtures that *are* meant
+        #    to be valid JSON continue to be linted under
+        #    tests/fixtures/blueprints/ (the exclusion is specifically
+        #    about the *templates* subtree).
+        exclude: ^(src/forge/blueprints/.*\.json$|tests/fixtures/blueprints/valid/templates/)
       - id: check-merge-conflict
         name: detect merge conflict markers
       - id: check-added-large-files

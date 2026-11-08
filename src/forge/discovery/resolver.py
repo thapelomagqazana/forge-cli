@@ -23,16 +23,33 @@ Policy summary (see ADR-0009)
   the loser is dropped from the catalogue.
 * **Malformed candidates:** skipped with a ``WARNING`` carrying the
   source label. One bad file never takes down the catalogue.
-* **Ordering:** the final list is sorted by blueprint id ascending.
-  Determinism is a feature — ``forge list`` output is diff-able in CI
-  and snapshot-testable.
+* **Ordering:** ``resolve`` returns candidates in arrival order;
+  ``to_metadata`` sorts by id ascending. Determinism is a feature —
+  ``forge list`` output is diff-able in CI and snapshot-testable.
 
-Parsing is delegated to the verification funnel
------------------------------------------------
-``_parse`` calls ``validate_blueprint_document`` (the schema-then-model
-funnel from ADR-0007 and ADR-0008) rather than re-implementing
-validation. Discovery cannot accept a document the rest of the system
-would reject, and schema changes propagate here with zero coordination.
+Parsing is delegated to the loader
+----------------------------------
+``_parse`` calls ``BlueprintLoader.load()`` rather than re-implementing
+YAML parsing, schema validation, and model construction. Two benefits
+follow directly:
+
+* **One pipeline.** Discovery and ``forge validate`` cannot disagree
+  about what a valid blueprint is, because they run the same phases
+  (ADR-0010). A future loader improvement — a BOM check, a stricter
+  YAML mode — lands in both commands with zero coordination.
+* **One error shape.** The loader returns ``Result[Blueprint,
+  list[ValidationError]]``; the resolver translates the ``Err`` branch
+  into a ``MalformedBlueprintError`` whose ``reason`` is the *first*
+  error's ``format()`` output. Users see the same message they would
+  see from ``forge validate``, not a second dialect invented here.
+
+The resolver passes ``check_files=False``. Discovery is a *metadata*
+operation: users want the catalogue even when a template has been
+deleted from one blueprint. "Missing template" is a real error for
+``forge create`` but a false positive for ``forge list`` — the
+blueprint is discoverable, just not renderable. Filesystem checks are
+the loader's option precisely so callers with different needs can
+choose.
 """
 
 from __future__ import annotations
@@ -40,13 +57,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-import yaml
-from pydantic import ValidationError
-
-from forge.core.exceptions import ForgeError
 from forge.discovery.errors import MalformedBlueprintError
 from forge.discovery.sources import Candidate
+from forge.loading import BlueprintLoader
+from forge.loading.result import Err
 from forge.models import Blueprint
 from forge.models.blueprint import BlueprintSource, DiscoveredBlueprint
 
@@ -77,28 +94,37 @@ class ResolvedCandidate:
     origin: BlueprintSource
 
 
+# The loader is stateless and safe to share; module-level construction
+# avoids re-instantiating it on every candidate and keeps the hot path
+# allocation-free.
+_LOADER = BlueprintLoader()
+
+
 def _parse(candidate: Candidate) -> ResolvedCandidate:
-    """Parse and validate a single candidate.
+    """Parse and validate a single candidate via the shared loader.
 
     Raises ``MalformedBlueprintError`` on any failure so the caller can
-    skip with a warning. All parsing errors — YAML syntax, non-mapping
-    root, schema violation, model validation failure — are funnelled
-    into a single exception type so the resolver has one branch, not
-    four.
+    skip with a warning. All failure modes — unreadable file, YAML
+    syntax, non-mapping root, schema violation, model validation — are
+    already folded into the loader's ``Result.error`` list, so this
+    function has one branch, not four.
 
-    Parsing flows through ``validate_blueprint_document`` deliberately:
-    discovery must not accept documents that the rest of the system
-    rejects. If we parsed here and validated later, a malformed local
-    blueprint would land in the catalogue and explode on first use —
-    which is exactly the failure mode "skip malformed" is meant to
-    prevent.
+    **Why stage to a temp file.** ``BlueprintLoader.load()`` expects a
+    path, because the pipeline's I/O boundary is "read a file." Sources
+    yield ``bytes`` because a future remote-registry source has no
+    path. The resolver bridges the two by staging the bytes into a
+    temporary directory. The cost is one file write per candidate
+    (~microseconds); the benefit is that discovery runs *exactly* the
+    same code path as ``forge validate``, so a discovery-accepted
+    blueprint cannot fail validation later.
+
+    **Why ``check_files=False``.** Discovery is metadata-only. A
+    blueprint with a missing template is still discoverable — the user
+    needs to see it in ``forge list`` so they can find and fix it.
+    Requiring templates to exist would make a single deleted file
+    silently remove a blueprint from the catalogue, which is the
+    opposite of what a discovery command is for.
     """
-    # Local import keeps the discovery module importable without
-    # pulling in jsonschema/pydantic at module load. The service is
-    # cheap to construct; this import only costs anything when resolve()
-    # is actually called.
-    from forge.verification import validate_blueprint_document
-
     label, raw, origin = candidate
 
     if not raw:
@@ -108,35 +134,33 @@ def _parse(candidate: Candidate) -> ResolvedCandidate:
         # message shape, not two different ones.
         raise MalformedBlueprintError(label, "file could not be read or is empty")
 
-    try:
-        document = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        raise MalformedBlueprintError(label, f"invalid YAML: {exc}") from exc
+    with TemporaryDirectory(prefix="forge-discovery-") as tmp:
+        staged = Path(tmp) / "blueprint.yaml"
+        try:
+            staged.write_bytes(raw)
+        except OSError as exc:
+            # Extremely rare (tmp dir unwritable) but possible in
+            # locked-down CI containers. Surfacing it as malformed
+            # rather than propagating preserves the resolver's
+            # "never crash on a bad candidate" invariant.
+            raise MalformedBlueprintError(
+                label, f"could not stage candidate for validation: {exc}"
+            ) from exc
 
-    if not isinstance(document, dict):
-        # ``safe_load`` returns ``None`` for empty documents and non-dict
-        # scalars for pathological input. Both are blueprint-invalid;
-        # catching them here gives a clearer message than the schema's
-        # "not an object" error would.
-        raise MalformedBlueprintError(
-            label, f"expected a mapping at document root, got {type(document).__name__}"
-        )
+        result = _LOADER.load(staged, check_files=False)
 
-    try:
-        blueprint = validate_blueprint_document(document, source=label)
-    except ValidationError as exc:
-        # Pydantic's native exception escapes only when the verification
-        # façade is bypassed. Catching it here means discovery is robust
-        # even if a future caller changes the façade's contract.
-        raise MalformedBlueprintError(label, f"model validation failed: {exc}") from exc
-    except ForgeError as exc:
-        # SchemaValidationError and ModelValidationError both derive from
-        # ForgeError. Their __str__ already includes structured pointers;
-        # we wrap rather than re-format so the reason string carries the
-        # full detail into the warning log.
-        raise MalformedBlueprintError(label, str(exc)) from exc
+    if isinstance(result, Err):
+        # The loader aggregates every error; the warning only needs the
+        # first to be actionable (the user fixes one thing, re-runs
+        # discovery, sees the next). Using ``format()`` gives the same
+        # ``source:line:col: path: message — hint: ...`` rendering that
+        # ``forge validate`` produces, so users do not have to learn a
+        # second error dialect for discovery warnings.
+        first = result.error[0] if result.error else None
+        reason = first.format() if first is not None else "unknown validation failure"
+        raise MalformedBlueprintError(label, reason)
 
-    return ResolvedCandidate(blueprint=blueprint, source_label=label, origin=origin)
+    return ResolvedCandidate(blueprint=result.value, source_label=label, origin=origin)
 
 
 def resolve(candidates: Iterable[Candidate]) -> list[ResolvedCandidate]:
@@ -197,6 +221,87 @@ def resolve(candidates: Iterable[Candidate]) -> list[ResolvedCandidate]:
             )
 
     return list(winners.values())
+
+
+def find(
+    candidates: Iterable[Candidate],
+    blueprint_id: str,
+) -> ResolvedCandidate | None:
+    """Return the winning candidate for ``blueprint_id``, or ``None``.
+
+    This is the *single-item* entry point used by
+    ``BlueprintDiscoveryService.load()``. It runs the same precedence
+    rules as ``resolve`` — including collision warnings, so users still
+    see "your local override is shadowing an official blueprint" even
+    when they only asked for one blueprint by name.
+
+    Why not "call ``resolve()`` and filter"? Because ``resolve()``
+    parses every candidate, and a ``load()`` for one blueprint only
+    needs the winner. A naive filter would pay O(N) parse cost for an
+    O(1) question. The current implementation walks candidates in
+    arrival order and keeps the *best-so-far* for the target id,
+    short-circuiting nothing (a later candidate could have higher
+    precedence) but also not parsing candidates for other ids. The
+    savings are real when a user-local directory contains many
+    blueprints and the user asks for one specific official blueprint.
+
+    Semantics match ``resolve`` exactly:
+        * higher precedence wins;
+        * ties go to the *first* candidate seen (which, given
+          ``default_sources`` orders official-before-local, means
+          official-first for same-precedence collisions — currently
+          impossible because the two sources have distinct precedence
+          values, but the tie rule is documented so a future source
+          with an equal precedence value has a defined outcome);
+        * malformed candidates are logged and skipped.
+    """
+    best: ResolvedCandidate | None = None
+
+    for candidate in candidates:
+        # Skip candidates that are not even *for* this id before paying
+        # the parse cost. A candidate's label is not guaranteed to
+        # encode its id (labels are ``bundled:<dir>`` or ``local:<path>``),
+        # so this is an optimisation, not a filter — the id check
+        # happens after parsing. The comment exists so a future reader
+        # does not "fix" the missing pre-filter by adding a fragile
+        # string match on the label.
+        try:
+            parsed = _parse(candidate)
+        except MalformedBlueprintError as exc:
+            log.warning("Skipping malformed blueprint: %s", exc)
+            continue
+
+        if parsed.blueprint.id != blueprint_id:
+            continue
+
+        if best is None:
+            best = parsed
+            continue
+
+        # Collision on the requested id. Same precedence rules as
+        # ``resolve``, same warning wording, so the log surface is
+        # consistent regardless of which entry point the user hit.
+        if _PRECEDENCE[parsed.origin] > _PRECEDENCE[best.origin]:
+            log.warning(
+                "Duplicate blueprint '%s': %s (%s) overrides %s (%s)",
+                parsed.blueprint.id,
+                parsed.source_label,
+                parsed.origin.value,
+                best.source_label,
+                best.origin.value,
+            )
+            best = parsed
+        else:
+            log.warning(
+                "Duplicate blueprint '%s': keeping %s (%s); ignoring %s (%s)",
+                parsed.blueprint.id,
+                best.source_label,
+                best.origin.value,
+                parsed.source_label,
+                parsed.origin.value,
+            )
+
+    return best
 
 
 def to_metadata(resolved: Iterable[ResolvedCandidate]) -> list[DiscoveredBlueprint]:
