@@ -1,0 +1,17 @@
+# Category: frontend. The only category whose blueprints are not
+# Python, so it is also the category most likely to be forgotten when
+# a future change adds a language-specific rule to the model. Kept
+# distinct from 12 so a frontend-specific regression reports a
+# filename containing "frontend".
+schema_version: "1.0.0"
+id: typescript.category.frontend
+name: Frontend Category
+version: 1.0.0
+description: A blueprint in the frontend category.
+category: frontend
+verification:
+  - id: placeholder
+    type: required_file
+    path: package.json
+compatibility:
+  min_forge_version: 1.0.0

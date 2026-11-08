@@ -1,0 +1,21 @@
+# A single string variable with no validation rules. Common in real
+# blueprints: a project name that the *blueprint author* wants to
+# constrain but the schema does not have a universal rule for.
+schema_version: "1.0.0"
+id: python.string.unconstrained
+name: Unconstrained String
+version: 1.2.3
+description: A blueprint whose only variable is a bare string.
+category: api
+variables:
+  - id: author
+    type: string
+    description: Author name shown in generated LICENSE.
+    required: true
+verification:
+  - id: readme
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0
+files: []

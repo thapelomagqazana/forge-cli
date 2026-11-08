@@ -17,6 +17,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0005](0005-stabilize-exit-codes-as-a-public-contract.md) | Stabilize exit codes as a public contract | Accepted | 2026-11-07 |
 | [0006](0006-dual-mode-input-handling-with-a-single-validation-funnel.md) | Dual-Mode Input Handling with a Single Validation Funnel | Accepted | 2026-11-07 |
 | [0007](0007-the-blueprint-json-schema-is-the-single-canonical-contract.md) | The Blueprint JSON Schema Is the Single Canonical Contract | Accepted | 2026-11-08 |
+| [0008](0008-pydantic-models-are-a-generated-parity-tested-projection-of-.md) | Pydantic Models Are a Generated, Parity-Tested Projection of the Canonical Schema | Accepted | 2026-11-08 |
 
 ## Creating a new ADR
 

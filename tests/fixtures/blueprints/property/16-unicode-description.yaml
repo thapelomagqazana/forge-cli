@@ -1,0 +1,24 @@
+# Non-ASCII in every free-text field. The schema constrains these
+# fields by length and presence only — blueprints are published
+# globally and the CLI must not require ASCII in user-visible text.
+# A regression that adds ASCII-only constraints to either engine will
+# fail this seed in the parity test with a clear filename.
+schema_version: "1.0.0"
+id: i18n.unicode
+name: Projet café — naïve façade
+version: 1.0.0
+description: Un modèle avec des caractères accentués, des tirets cadratins — et un emoji 🚀.
+category: other
+maintainer: "Zoë Ångström <zoe@example.com>"
+variables:
+  - id: greeting
+    type: string
+    description: Salutation affichée (ex. « Bonjour »).
+    required: true
+    default: "Bonjour"
+verification:
+  - id: placeholder
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

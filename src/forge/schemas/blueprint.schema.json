@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://forge.dev/schemas/blueprint-1.0.0.json",
-  "title": "Forge Blueprint",
+  "title": "Blueprint",
   "description": "Canonical structure for a Forge project blueprint. This document is the single source of truth for what a blueprint is; no other validator may redefine these rules. Schema version: 1.0.0.",
   "type": "object",
   "additionalProperties": false,
@@ -12,8 +12,6 @@
     "version",
     "description",
     "category",
-    "variables",
-    "files",
     "verification",
     "compatibility"
   ],
@@ -48,6 +46,7 @@
       "maxLength": 2000
     },
     "category": {
+      "title": "Category",
       "description": "Coarse classifier used for grouping in the selector.",
       "type": "string",
       "enum": ["api", "automation", "frontend", "library", "cli", "other"]
@@ -58,30 +57,31 @@
       "maxLength": 200
     },
     "variables": {
-      "description": "Ordered list of variables the blueprint exposes to the user. Order is preserved by the wizard.",
+      "description": "Ordered list of variables the blueprint exposes to the user. Order is preserved by the wizard. Optional; the model defaults it to an empty list, which is what 'a blueprint with no configurable options' means. Do not add this to `required`: `required` and `default` are mutually exclusive in JSON Schema — if a field is required, the default is never applied, and the two together are a contradiction.",
       "type": "array",
       "default": [],
       "items": { "$ref": "#/$defs/variable" }
     },
     "files": {
-      "description": "Static template-to-destination mappings applied unconditionally.",
+      "description": "Static template-to-destination mappings applied unconditionally. Optional; the model defaults it to an empty list. Same `required`/`default` caveat as `variables`.",
       "type": "array",
       "default": [],
       "items": { "$ref": "#/$defs/fileMapping" }
     },
     "conditional_files": {
-      "description": "Additional file mappings applied only when a condition expression evaluates true.",
+      "description": "Additional file mappings applied only when a condition expression evaluates true. Optional; the model defaults it to an empty list.",
       "type": "array",
       "default": [],
       "items": { "$ref": "#/$defs/conditionalFiles" }
     },
     "verification": {
-      "description": "Contract the generated project must satisfy after scaffolding.",
+      "description": "Contract the generated project must satisfy after scaffolding. Required, and non-empty: a blueprint that declares no verification cannot be trusted to produce a working project.",
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/verificationCheck" }
     },
     "compatibility": {
+      "title": "Compatibility",
       "description": "Minimum Forge CLI version required to consume this blueprint.",
       "type": "object",
       "additionalProperties": false,
@@ -96,6 +96,7 @@
   },
   "$defs": {
     "variable": {
+      "title": "VariableDefinition",
       "description": "A single blueprint variable. Declared as an ordered list entry so the wizard presents prompts in the author's intended order. The 'type' field is the discriminator: 'enum' requires a validation.enum list, 'boolean' forbids a validation block, and 'string' may use validation.pattern.",
       "type": "object",
       "additionalProperties": false,
@@ -108,11 +109,7 @@
           "minLength": 1,
           "maxLength": 64
         },
-        "type": {
-          "description": "Value type. 'enum' requires a validation.enum list; 'string' may optionally use validation.pattern; 'boolean' takes no validation.",
-          "type": "string",
-          "enum": ["string", "boolean", "enum"]
-        },
+        "type": { "$ref": "#/$defs/variableType" },
         "description": {
           "description": "Explanation shown to the user while prompting.",
           "type": "string",
@@ -126,26 +123,7 @@
         "default": {
           "description": "Optional default value. Its runtime type must match the declared variable type; that constraint is enforced semantically by the verification layer."
         },
-        "validation": {
-          "description": "Type-specific validation rules.",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "pattern": {
-              "description": "RE2-compatible regular expression the string value must match in full. Only meaningful when type is 'string'.",
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 500
-            },
-            "enum": {
-              "description": "Allowed values. Required when type is 'enum'.",
-              "type": "array",
-              "minItems": 1,
-              "uniqueItems": true,
-              "items": { "type": "string", "minLength": 1 }
-            }
-          }
-        }
+        "validation": { "$ref": "#/$defs/variableValidation" }
       },
       "allOf": [
         {
@@ -173,7 +151,35 @@
         }
       ]
     },
+    "variableType": {
+      "title": "VariableType",
+      "description": "Value type. 'enum' requires a validation.enum list; 'string' may optionally use validation.pattern; 'boolean' takes no validation.",
+      "type": "string",
+      "enum": ["string", "boolean", "enum"]
+    },
+    "variableValidation": {
+      "title": "VariableValidation",
+      "description": "Type-specific validation rules.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "description": "RE2-compatible regular expression the string value must match in full. Only meaningful when type is 'string'.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "enum": {
+          "description": "Allowed values. Required when type is 'enum'.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
     "fileMapping": {
+      "title": "FileEntry",
       "description": "A template-to-destination mapping. Applied unconditionally from the top-level 'files' array, or conditionally from within a 'conditionalFiles' entry. Both paths must be relative and must not escape the blueprint or project root.",
       "type": "object",
       "additionalProperties": false,
@@ -196,6 +202,7 @@
       }
     },
     "conditionalFiles": {
+      "title": "ConditionalFileEntry",
       "description": "A group of file mappings applied only when the 'condition' expression evaluates true at generation time. The condition is a simple boolean expression over variable ids (e.g. 'include_docker == true'); it is intentionally not a full expression language.",
       "type": "object",
       "additionalProperties": false,
@@ -215,6 +222,7 @@
       }
     },
     "verificationCheck": {
+      "title": "CheckDefinition",
       "description": "A single check the generated project must satisfy. The 'type' field is the discriminator: 'command' runs a shell command and requires the 'command' field; 'required_file' asserts a path exists and requires the 'path' field. Every blueprint must declare at least one check.",
       "type": "object",
       "additionalProperties": false,
@@ -226,11 +234,7 @@
           "pattern": "^[a-z][a-z0-9_]*$",
           "maxLength": 64
         },
-        "type": {
-          "description": "Kind of check. 'command' runs a shell command; 'required_file' asserts a path exists.",
-          "type": "string",
-          "enum": ["command", "required_file"]
-        },
+        "type": { "$ref": "#/$defs/checkType" },
         "command": {
           "description": "Shell command to run. Required when type == 'command'.",
           "type": "string",
@@ -253,20 +257,28 @@
       },
       "allOf": [
         {
-          "if": {
-            "properties": { "type": { "const": "command" } },
-            "required": ["type"]
-          },
+          "if":   { "properties": { "type": { "const": "command" } }, "required": ["type"] },
           "then": { "required": ["command"] }
         },
         {
-          "if": {
-            "properties": { "type": { "const": "required_file" } },
-            "required": ["type"]
-          },
+          "if":   { "properties": { "type": { "const": "required_file" } }, "required": ["type"] },
           "then": { "required": ["path"] }
+        },
+        {
+          "if":   { "properties": { "type": { "const": "command" } }, "required": ["type"] },
+          "then": { "not": { "required": ["path"] } }
+        },
+        {
+          "if":   { "properties": { "type": { "const": "required_file" } }, "required": ["type"] },
+          "then": { "not": { "required": ["command"] } }
         }
       ]
+    },
+    "checkType": {
+      "title": "CheckType",
+      "description": "Kind of check. 'command' runs a shell command; 'required_file' asserts a path exists.",
+      "type": "string",
+      "enum": ["command", "required_file"]
     }
   }
 }

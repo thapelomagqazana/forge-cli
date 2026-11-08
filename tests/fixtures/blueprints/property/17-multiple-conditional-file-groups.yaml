@@ -1,0 +1,39 @@
+# Multiple conditional-file groups. Each group is independently gated
+# on its own condition, so the schema models this as a list of lists
+# (groups of groups of mappings) rather than a single mapping. A model
+# that flattens or collapses the outer list would diverge here.
+schema_version: "1.0.0"
+id: python.conditional.multi
+name: Multiple Conditional Groups
+version: 1.0.0
+description: A blueprint with two independent conditional file groups.
+category: api
+variables:
+  - id: include_docker
+    type: boolean
+    description: Include Dockerfile and docker-compose.yml.
+    required: false
+    default: true
+  - id: include_ci
+    type: boolean
+    description: Include GitHub Actions workflow.
+    required: false
+    default: true
+verification:
+  - id: readme
+    type: required_file
+    path: README.md
+files: []
+conditional_files:
+  - condition: "include_docker == true"
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+      - source: templates/docker-compose.yml.j2
+        destination: docker-compose.yml
+  - condition: "include_ci == true"
+    files:
+      - source: templates/github-workflow.yml.j2
+        destination: .github/workflows/ci.yml
+compatibility:
+  min_forge_version: 1.0.0

@@ -11,9 +11,12 @@ consumers, one rulebook, one failure type per concern:
   function, not two call sites.
 
 * ``validate_blueprint_document`` — a parsed blueprint document
-  checked against the bundled JSON Schema (ADR-0007). Called by the
-  blueprint loader, tests, and any future importer. Shape lives in
-  the schema; this function only applies it.
+  checked against the bundled JSON Schema (ADR-0007) and then parsed
+  into the typed Pydantic model (ADR-0008). Returns the model, so
+  callers validate *and* obtain the typed representation in one step;
+  re-parsing after validation is a class of bug this design removes
+  by construction. Called by the blueprint loader, tests, and any
+  future importer.
 
 Why both live in one module
 ---------------------------
@@ -23,6 +26,29 @@ hierarchy they raise from (``ForgeError`` subclasses), and the set of
 callers who need to trust that "verification" is a single boundary.
 Splitting them across files would make the boundary a convention
 rather than a fact, and conventions erode under deadline pressure.
+
+Schema-then-model ordering
+--------------------------
+``validate_blueprint_document`` runs *schema first, model second*.
+The schema remains the referee (ADR-0007); the model is an ergonomic
+projection (ADR-0008). The ordering matters for two reasons:
+
+1. **Error attribution.** A document the schema rejects is a *user*
+   problem — a malformed blueprint. A document the schema accepts
+   but the model rejects is a *Forge* problem — a parity regression
+   between the schema and the generated models. These two failures
+   have different remedies and different exit codes
+   (``SchemaValidationError`` → 1, ``ModelValidationError`` → 5).
+   Running schema-first lets us distinguish them honestly. If we
+   ran model-first, a schema-invalid document that also happened to
+   trip a model rule would be attributed to Forge — sending the user
+   to file a bug report for their own mistake.
+
+2. **Parity is the model's job, not the user's.** The schema is the
+   source of truth; the model is *expected* to agree. If it does
+   not, that is a fact about Forge's packaging, not the document.
+   Surfacing it loudly as ``ModelValidationError`` is what makes the
+   "0 discrepancies" KPI enforceable in production as well as in CI.
 
 What this module is *not* responsible for
 -----------------------------------------
@@ -45,6 +71,11 @@ What this module is *not* responsible for
   function will continue to normalize shape — not reinterpret
   contents.
 
+* **Schema-driven field rules.** Shape lives in
+  ``forge.schemas.load_schema``. The functions here apply it; they
+  never encode it. Any PR that adds a shape rule to this module
+  instead of the schema is a regression by definition (ADR-0007).
+
 Design invariants
 -----------------
 * **Pure functions.** No I/O, no prompting, no rendering. That makes
@@ -52,8 +83,11 @@ Design invariants
   unambiguous about what they do.
 
 * **Typed failures only.** Every rejection raises a ``ForgeError``
-  subclass (``UserInputError`` or ``SchemaValidationError``).
-  Callers never see bare ``ValueError`` / ``KeyError``.
+  subclass (``UserInputError``, ``SchemaValidationError``, or
+  ``ModelValidationError``). Callers never see bare ``ValueError``,
+  ``KeyError``, or a stray ``pydantic.ValidationError``. This is
+  what makes the CLI error handler a simple ``match`` on the type
+  rather than a string-parsing exercise.
 
 * **Aggregated errors where the caller can act on them.** Schema
   validation collects *every* violation in one pass; missing-flag
@@ -61,33 +95,54 @@ Design invariants
   should be one edit, not a ping-pong loop.
 
 * **Precise pointers.** Every ``(json_pointer, message)`` pair in a
-  ``SchemaValidationError`` locates the *specific* offending value,
-  not its parent. ``jsonschema``'s default convention reports the
-  parent for two keyword families — ``required`` and
-  ``additionalProperties`` — and produces phantom ``if``-branch
-  artefacts when an ``allOf``/``if-then`` fails. The helpers below
-  translate the first into precise pointers and drop the second
-  entirely, so the caller never sees a pointer that does not
-  correspond to a real instance path.
+  ``SchemaValidationError`` or ``ModelValidationError`` locates the
+  *specific* offending value, not its parent. ``jsonschema``'s
+  default convention reports the parent for two keyword families —
+  ``required`` and ``additionalProperties`` — and produces phantom
+  ``if``-branch artefacts when an ``allOf``/``if-then`` fails. The
+  helpers below translate the first into precise pointers and drop
+  the second entirely, so the caller never sees a pointer that does
+  not correspond to a real instance path. Pydantic's error
+  locations are already precise; the ``_format_pydantic_errors``
+  helper only normalizes tuple → JSON Pointer, so both engines
+  speak one dialect.
 
 * **Schema is read once.** ``_build_validator`` caches the parsed
   schema via ``forge.schemas.load_schema`` (``lru_cache``), so
   validation is a dict lookup plus traversal — no per-call file read.
+  Likewise, ``_model_class`` resolves the ``Blueprint`` class once;
+  the model tree is imported lazily inside the function so that
+  ``validate_blueprint_inputs`` remains importable in contexts where
+  Pydantic has not yet been loaded (e.g., a future lightweight
+  subcommand).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jsonschema
 from jsonschema import Draft202012Validator
 
-from forge.core.exceptions import SchemaValidationError, UserInputError
+from forge.core.exceptions import (
+    ModelValidationError,
+    SchemaValidationError,
+    UserInputError,
+)
 from forge.schemas import load_schema
+
+if TYPE_CHECKING:
+    # ``Blueprint`` is imported only for typing here. The runtime import
+    # happens lazily inside ``validate_blueprint_document`` — see the
+    # module docstring's "Schema is read once" invariant for why we keep
+    # Pydantic off the import path until a caller actually validates a
+    # document. Callers that only validate *inputs* (the wizard's
+    # early-feedback path) never pay the model-import cost.
+    from forge.models import Blueprint
 
 
 # =============================================================================
@@ -215,7 +270,7 @@ def validate_blueprint_inputs(
 
 
 # =============================================================================
-# Document validation (parsed blueprint vs. bundled JSON Schema)
+# Document validation (parsed blueprint vs. bundled JSON Schema → Pydantic)
 # =============================================================================
 @lru_cache(maxsize=1)
 def _build_validator() -> Draft202012Validator:
@@ -233,6 +288,28 @@ def _build_validator() -> Draft202012Validator:
     call loudly, not the thousandth call subtly.
     """
     return Draft202012Validator(load_schema())
+
+
+@lru_cache(maxsize=1)
+def _model_class() -> type[Blueprint]:
+    """Resolve the ``Blueprint`` root model once, on first document validation.
+
+    The import is deferred to this function rather than placed at the
+    module top for a specific reason: ``validate_blueprint_inputs`` is
+    called from the interactive wizard's *real-time* per-keystroke
+    validation, and loading Pydantic + the generated model tree on
+    every keystroke would be measurable user-visible latency. Deferring
+    the import means the wizard's input path stays cheap until the
+    first document is actually validated — which happens once, after
+    the wizard has collected all answers.
+
+    ``lru_cache`` makes the deferral cost exactly one import per
+    process, so callers who *do* validate documents pay nothing on
+    subsequent calls beyond attribute lookup.
+    """
+    from forge.models import Blueprint
+
+    return Blueprint
 
 
 # The two ``jsonschema`` keywords whose ``absolute_path`` is the
@@ -291,12 +368,12 @@ def _is_phantom(error: jsonschema.ValidationError) -> bool:
     Combining them is the only filter that keeps both the real
     errors and the phantoms' absence.
 
-    A note on why the previous version of this filter failed: it
-    used the *caller's* recursion state (``parent_has_path``) to
-    decide whether an empty-path leaf was a phantom. That works when
-    the parent combinator has a non-empty path, but not when the
-    parent is the *document root* — a case where ``parent_has_path``
-    is ``False`` for a phantom whose ``absolute_path`` is also empty.
+    A note on why a caller-state-based filter would fail: it would
+    decide whether an empty-path leaf is a phantom by consulting the
+    parent's recursion state. That works when the parent combinator
+    has a non-empty path, but not when the parent is the *document
+    root* — a case where the parent's "has path" flag is ``False``
+    for a phantom whose ``absolute_path`` is also empty.
     ``schema_path`` sidesteps the caller entirely, reading the fact
     from the error itself.
     """
@@ -461,20 +538,102 @@ def _format_pointer(error: jsonschema.ValidationError) -> str:
     return "/" + "/".join(_escape_pointer_segment(segment) for segment in path)
 
 
+def _render_pointer(segments: Sequence[str | int]) -> str:
+    """Render a sequence of path segments as an RFC 6901 JSON Pointer.
+
+    Both ``_format_pointer`` (which handles ``jsonschema`` errors) and
+    ``_format_pydantic_errors`` (which handles ``pydantic`` errors) end
+    with the same operation: take a list of path segments — strings for
+    object keys, ints for array indices — and produce the pointer
+    string. Extracting that operation makes the two functions read as
+    parallel cases of one algorithm rather than as two slightly
+    different implementations that happen to agree today.
+
+    The empty-segments case returns ``""`` — the RFC 6901 root pointer
+    — which callers render as ``"/"`` in human-facing output. That
+    decision is documented in each caller's docstring; here it is just
+    an implementation detail.
+
+    Segment escaping is delegated to ``_escape_pointer_segment``, which
+    handles the RFC 6901 ``~`` → ``~0`` and ``/`` → ``~1`` rules and
+    converts integer indices to their decimal strings.
+    """
+    if not segments:
+        return ""
+    return "/" + "/".join(_escape_pointer_segment(segment) for segment in segments)
+
+
+def _format_pydantic_errors(exc: Any) -> tuple[tuple[str, str], ...]:
+    """Translate a ``pydantic.ValidationError`` into the funnel's pointer shape.
+
+    Pydantic reports locations as tuples like
+    ``('variables', 0, 'type')``; RFC 6901 JSON Pointers look like
+    ``/variables/0/type``. Translating here means the CLI handler,
+    log scrapers, and tests see **one** error dialect regardless of
+    which engine rejected the document. That is the entire reason
+    ``ModelValidationError`` and ``SchemaValidationError`` share a
+    base class.
+
+    Empty locations (root-model violations, e.g. a manually-raised
+    ``ValueError`` in a ``model_validator``) are rendered as ``""``,
+    the RFC 6901 root pointer, matching what ``_format_pointer``
+    returns for root-level schema violations. Consumers that render
+    the pointer as ``/`` in output get consistent results.
+
+    The ``if loc else ""`` branch that this function used to carry
+    inline now lives in ``_render_pointer``; see that function's
+    docstring for why it was extracted rather than converted to a
+    ternary. The extraction also keeps this function and
+    ``_format_pointer`` structurally parallel — a reader can see that
+    both implement "render a location as a pointer" and differ only in
+    the location shape their respective engines emit.
+
+    The ``exc`` parameter is annotated ``Any`` rather than
+    ``ValidationError`` because this module imports Pydantic types
+    only inside ``_model_class`` (see the "Schema is read once"
+    invariant). Importing ``pydantic.ValidationError`` at module
+    top would reintroduce the eager-load cost the deferred import
+    is designed to avoid. This function is called once per failed
+    document — it is not a hot path — so the ``Any`` type is a
+    deliberate, localized trade-off, not a general pattern.
+    """
+    formatted: list[tuple[str, str]] = []
+    for err in exc.errors():
+        loc = err.get("loc", ())
+        pointer = _render_pointer(loc)
+        formatted.append((pointer, err.get("msg", "<no message>")))
+    return tuple(formatted)
+
+
 def validate_blueprint_document(
     document: Mapping[str, Any],
     *,
     source: str = "<memory>",
-) -> None:
-    """Validate a parsed blueprint document against the bundled schema.
+) -> Blueprint:
+    """Validate a parsed blueprint document and return its typed model.
 
     This is the *only* entry point by which a blueprint document may be
-    checked for shape. Loaders, the CLI, tests, and future importers all
-    call this function — rule changes happen in the schema, never here.
+    checked for shape, and the *only* way callers should obtain a
+    ``Blueprint`` instance. Loaders, the CLI, tests, and future
+    importers all call this function — rule changes happen in the
+    schema, never here.
 
     The function **aggregates** every violation in one pass. Fixing an
     invalid blueprint should be one edit, not a ping-pong loop where
     each round reveals the next missing field.
+
+    The return value is the parsed ``Blueprint`` model rather than
+    ``None``. Returning the model serves two purposes:
+
+    * **No double-parse.** A caller that validated and then parsed
+      would be parsing the same document twice, once in the schema
+      validator and once in the model. Returning the model eliminates
+      that waste *and* the class of bug where the caller re-parses a
+      different dict than the one they validated.
+    * **Typed downstream contract.** Callers immediately have a
+      ``Blueprint`` in hand, so ``create.py``, the generation layer,
+      and the verification contract all operate on a typed tree
+      instead of re-receiving raw mappings.
 
     Args:
         document: A parsed blueprint (typically from YAML or JSON).
@@ -483,10 +642,17 @@ def validate_blueprint_document(
         source: A caller-supplied label used purely for error
             readability (usually a file path). Never inspected.
 
+    Returns:
+        The validated ``Blueprint`` model.
+
     Raises:
         SchemaValidationError: If the document does not validate. The
             exception carries ``(json_pointer, message)`` pairs sorted
-            by path, so output is deterministic across runs.
+            by path, so output is deterministic across runs. (Exit 1.)
+        ModelValidationError: If the schema accepts the document but
+            the Pydantic model rejects it. This is a **parity
+            regression** between the schema and the generated models
+            — a Forge bug, not a user mistake. (Exit 5.)
 
     Notes:
         * We do not check ``schema_version`` separately. The bundled
@@ -498,6 +664,11 @@ def validate_blueprint_document(
           cannot build a validator is a packaging bug, not a runtime
           condition; letting the exception propagate preserves the
           original traceback for the developer who must fix the wheel.
+        * We do catch ``pydantic.ValidationError`` and re-raise as
+          ``ModelValidationError``. A bare Pydantic error would be an
+          untyped leak out of this module's contract; wrapping it
+          gives callers a stable type to match on and preserves the
+          schema-vs-model attribution that makes exit codes honest.
     """
     validator = _build_validator()
 
@@ -517,6 +688,35 @@ def validate_blueprint_document(
 
     if formatted:
         raise SchemaValidationError(source=source, errors=tuple(formatted))
+
+    # Schema is the referee (ADR-0007) and has spoken: the document is
+    # structurally valid. Now project it into the typed model (ADR-0008).
+    # If the model disagrees, that is a bug in the model — not the
+    # document — and we surface it as such. The import is resolved here
+    # rather than at module top so the wizard's per-keystroke input
+    # validation never pays the Pydantic load cost (see ``_model_class``).
+    blueprint_cls = _model_class()
+    try:
+        return blueprint_cls.model_validate(document)
+    except Exception as exc:  # — narrowed immediately below
+        # Import locally so the exception name is available for the
+        # ``isinstance`` check without a top-of-module pydantic import.
+        from pydantic import ValidationError
+
+        if isinstance(exc, ValidationError):
+            raise ModelValidationError(
+                source=source,
+                errors=_format_pydantic_errors(exc),
+            ) from exc
+        # Any other exception is not a validation outcome we recognise
+        # — it is a genuine surprise (a bug in a ``model_validator``
+        # raising a non-ValueError exception, or a Pydantic internal
+        # failure). Letting it propagate preserves the original
+        # traceback and routes through the CLI's ``INTERNAL_ERROR``
+        # handler, which is the honest classification. Wrapping it as
+        # ``ModelValidationError`` would misattribute a programming
+        # error to a schema-parity issue and lose the stack.
+        raise
 
 
 # =============================================================================

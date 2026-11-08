@@ -1,0 +1,15 @@
+# A blueprint whose own version carries build metadata. SemVer permits
+# the `+suffix` form specifically for CI-injected build identifiers, so
+# a blueprint published from a CI release pipeline will use it.
+schema_version: "1.0.0"
+id: python.build.meta
+name: Build Metadata Blueprint
+version: 1.0.0+build.42
+description: A blueprint with SemVer build metadata.
+category: library
+verification:
+  - id: placeholder
+    type: required_file
+    path: README.md
+compatibility:
+  min_forge_version: 1.0.0

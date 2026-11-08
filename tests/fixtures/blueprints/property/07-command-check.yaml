@@ -1,0 +1,24 @@
+# A blueprint whose verification is entirely command-based. Exercises
+# the `type='command'` → `command` required rule. The parity test
+# asserts the seed is accepted and that removing `command` causes both
+# engines to reject; adding a `path` alongside a `command` is the
+# "wrong payload present" case the model is stricter about than the
+# schema, and the parity test is expected to catch that divergence if
+# the schema is ever loosened to permit it.
+schema_version: "1.0.0"
+id: python.command.check
+name: Command Check
+version: 1.0.0
+description: A blueprint verified entirely by running commands.
+category: automation
+verification:
+  - id: lint
+    type: command
+    command: "ruff check ."
+    timeout: 120
+  - id: tests
+    type: command
+    command: "pytest -q"
+    timeout: 600
+compatibility:
+  min_forge_version: 1.0.0

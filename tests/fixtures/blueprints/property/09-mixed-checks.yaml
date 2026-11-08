@@ -1,0 +1,28 @@
+# Both check types, alternating. The `required_file` checks come first
+# so that a hypothetical index-based bug in the model would surface
+# during the first two checks rather than the last two. The ordering
+# is not semantically meaningful — blueprints may declare checks in
+# any order — but it is diagnostically useful.
+schema_version: "1.0.0"
+id: python.mixed.checks
+name: Mixed Checks
+version: 1.0.0
+description: A blueprint with both check types interleaved.
+category: api
+verification:
+  - id: pyproject
+    type: required_file
+    path: pyproject.toml
+  - id: tests_pass
+    type: command
+    command: "pytest -q"
+    timeout: 300
+  - id: readme
+    type: required_file
+    path: README.md
+  - id: lint
+    type: command
+    command: "ruff check ."
+    timeout: 60
+compatibility:
+  min_forge_version: 1.0.0
