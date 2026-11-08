@@ -1,0 +1,26 @@
+schema_version: "1.0.0"
+id: sample.enumvalidation
+name: Enum Without Validation Blueprint
+version: 1.0.0
+description: >-
+  A valid blueprint with exactly one defect: an enum-typed variable
+  omits the `validation.enum` list.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables:
+  - id: target_environment
+    type: enum
+    description: Deployment environment for the generated config.
+    required: true
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml

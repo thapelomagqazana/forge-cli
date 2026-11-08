@@ -1,0 +1,27 @@
+schema_version: "1.0.0"
+id: sample.badtype
+name: Bad Variable Type Blueprint
+version: 1.0.0
+description: >-
+  A valid blueprint with exactly one defect: a variable declares
+  `type: integer`, which the v1 schema does not support.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables:
+  - id: port
+    type: integer
+    description: Port number the generated service listens on.
+    required: true
+    default: 8000
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml

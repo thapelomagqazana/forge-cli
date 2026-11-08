@@ -1,0 +1,21 @@
+schema_version: "1.0.0"
+id: sample.requiredfilemissingpath
+name: Required File Check Missing Path Blueprint
+version: 1.0.0
+description: >-
+  A valid blueprint with exactly one defect: a verification check
+  declares `type: required_file` but omits the `path` field.
+category: api
+
+compatibility:
+  min_forge_version: 1.0.0
+
+variables: []
+
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+verification:
+  - id: has_pyproject
+    type: required_file

@@ -1,24 +1,272 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://forge-cli.dev/schemas/blueprint.schema.json",
+  "$id": "https://forge.dev/schemas/blueprint-1.0.0.json",
   "title": "Forge Blueprint",
+  "description": "Canonical structure for a Forge project blueprint. This document is the single source of truth for what a blueprint is; no other validator may redefine these rules. Schema version: 1.0.0.",
   "type": "object",
-  "required": ["schema_version", "blueprint"],
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "version",
+    "description",
+    "category",
+    "variables",
+    "files",
+    "verification",
+    "compatibility"
+  ],
   "properties": {
     "schema_version": {
+      "description": "Version of this schema the document was authored against. Used by the loader to pick a compatible validator.",
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+      "const": "1.0.0"
     },
-    "blueprint": {
+    "id": {
+      "description": "Stable, dotted identifier used to reference the blueprint from the CLI (e.g. python.fastapi.api).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "name": {
+      "description": "Human-readable blueprint name shown in the interactive selector.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "version": {
+      "description": "Semantic version of the blueprint itself (independent of the schema).",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "description": {
+      "description": "One-paragraph explanation of what the blueprint generates.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "category": {
+      "description": "Coarse classifier used for grouping in the selector.",
+      "type": "string",
+      "enum": ["api", "automation", "frontend", "library", "cli", "other"]
+    },
+    "maintainer": {
+      "description": "Optional contact (handle or email) for the blueprint owner.",
+      "type": "string",
+      "maxLength": 200
+    },
+    "variables": {
+      "description": "Ordered list of variables the blueprint exposes to the user. Order is preserved by the wizard.",
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/variable" }
+    },
+    "files": {
+      "description": "Static template-to-destination mappings applied unconditionally.",
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/fileMapping" }
+    },
+    "conditional_files": {
+      "description": "Additional file mappings applied only when a condition expression evaluates true.",
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/conditionalFiles" }
+    },
+    "verification": {
+      "description": "Contract the generated project must satisfy after scaffolding.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/verificationCheck" }
+    },
+    "compatibility": {
+      "description": "Minimum Forge CLI version required to consume this blueprint.",
       "type": "object",
-      "required": ["id", "name", "version"],
+      "additionalProperties": false,
+      "required": ["min_forge_version"],
       "properties": {
-        "id": { "type": "string", "pattern": "^[a-z][a-z0-9.-]*$" },
-        "name": { "type": "string", "minLength": 1 },
-        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
-        "description": { "type": "string" },
-        "category": { "type": "string" }
+        "min_forge_version": {
+          "type": "string",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+        }
       }
+    }
+  },
+  "$defs": {
+    "variable": {
+      "description": "A single blueprint variable. Declared as an ordered list entry so the wizard presents prompts in the author's intended order. The 'type' field is the discriminator: 'enum' requires a validation.enum list, 'boolean' forbids a validation block, and 'string' may use validation.pattern.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "description", "required"],
+      "properties": {
+        "id": {
+          "description": "Variable identifier, referenced in templates and conditional expressions.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "type": {
+          "description": "Value type. 'enum' requires a validation.enum list; 'string' may optionally use validation.pattern; 'boolean' takes no validation.",
+          "type": "string",
+          "enum": ["string", "boolean", "enum"]
+        },
+        "description": {
+          "description": "Explanation shown to the user while prompting.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "required": {
+          "description": "Whether the wizard must collect a value. Defaults to true at the schema level.",
+          "type": "boolean"
+        },
+        "default": {
+          "description": "Optional default value. Its runtime type must match the declared variable type; that constraint is enforced semantically by the verification layer."
+        },
+        "validation": {
+          "description": "Type-specific validation rules.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pattern": {
+              "description": "RE2-compatible regular expression the string value must match in full. Only meaningful when type is 'string'.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "enum": {
+              "description": "Allowed values. Required when type is 'enum'.",
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "enum" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["validation"],
+            "properties": {
+              "validation": { "required": ["enum"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "boolean" } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "validation": { "not": {} }
+            }
+          }
+        }
+      ]
+    },
+    "fileMapping": {
+      "description": "A template-to-destination mapping. Applied unconditionally from the top-level 'files' array, or conditionally from within a 'conditionalFiles' entry. Both paths must be relative and must not escape the blueprint or project root.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "destination"],
+      "properties": {
+        "source": {
+          "description": "Path to the template file, relative to the blueprint root. Must stay within the blueprint directory (path traversal is rejected at load time).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400,
+          "pattern": "^(?!/)(?!.*\\.\\.(?:/|$)).+$"
+        },
+        "destination": {
+          "description": "Path in the generated project; may include {{variable}} interpolation. Must be relative.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400,
+          "pattern": "^(?!/)(?!.*\\.\\.(?:/|$)).+$"
+        }
+      }
+    },
+    "conditionalFiles": {
+      "description": "A group of file mappings applied only when the 'condition' expression evaluates true at generation time. The condition is a simple boolean expression over variable ids (e.g. 'include_docker == true'); it is intentionally not a full expression language.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition", "files"],
+      "properties": {
+        "condition": {
+          "description": "Simple boolean expression over variable ids, e.g. 'include_docker == true'.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/fileMapping" }
+        }
+      }
+    },
+    "verificationCheck": {
+      "description": "A single check the generated project must satisfy. The 'type' field is the discriminator: 'command' runs a shell command and requires the 'command' field; 'required_file' asserts a path exists and requires the 'path' field. Every blueprint must declare at least one check.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type"],
+      "properties": {
+        "id": {
+          "description": "Stable identifier for the check, used in reports.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "maxLength": 64
+        },
+        "type": {
+          "description": "Kind of check. 'command' runs a shell command; 'required_file' asserts a path exists.",
+          "type": "string",
+          "enum": ["command", "required_file"]
+        },
+        "command": {
+          "description": "Shell command to run. Required when type == 'command'.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        },
+        "path": {
+          "description": "Path to assert existence, relative to the project root. Required when type == 'required_file'.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        },
+        "timeout": {
+          "description": "Seconds before a command check is considered failed.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 60
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "command" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["command"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "required_file" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["path"] }
+        }
+      ]
     }
   }
 }

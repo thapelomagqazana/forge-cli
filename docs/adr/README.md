@@ -16,6 +16,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0004](0004-centralize-cli-output-and-error-handling.md) | Centralize CLI output and error handling | Accepted | 2026-11-07 |
 | [0005](0005-stabilize-exit-codes-as-a-public-contract.md) | Stabilize exit codes as a public contract | Accepted | 2026-11-07 |
 | [0006](0006-dual-mode-input-handling-with-a-single-validation-funnel.md) | Dual-Mode Input Handling with a Single Validation Funnel | Accepted | 2026-11-07 |
+| [0007](0007-the-blueprint-json-schema-is-the-single-canonical-contract.md) | The Blueprint JSON Schema Is the Single Canonical Contract | Accepted | 2026-11-08 |
 
 ## Creating a new ADR
 
