@@ -1,0 +1,19 @@
+# malformed/invalid_schema
+#
+# Parses as valid YAML, but fails schema validation because the
+# ``version`` field is "1.0" rather than "1.0.0". This is the
+# canonical "SemVer typo" case — the field is a string either way, so
+# only the schema's pattern catches it.
+
+schema_version: "1.0.0"
+id: malformed.invalid_schema
+name: Invalid Schema Blueprint
+version: "1.0"
+description: Fails schema validation because version is not SemVer.
+category: api
+compatibility:
+  min_forge_version: 1.0.0
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

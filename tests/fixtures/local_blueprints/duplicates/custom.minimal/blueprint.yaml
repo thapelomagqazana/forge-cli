@@ -1,0 +1,23 @@
+# duplicates/custom.minimal
+#
+# Same ``id`` as ``valid/custom.minimal``, different name and version.
+# Used by precedence tests to prove that when two sources offer the
+# same id, the higher-precedence source wins — and that the *winning
+# document*, not just the label, is what callers see.
+#
+# If a test loads both fixtures in one service, it must assert that
+# the version and name from the winning fixture appear in the
+# catalogue, not just the id (which would be identical either way).
+
+schema_version: "1.0.0"
+id: custom.minimal
+name: Duplicate-Marker Minimal Blueprint
+version: 9.9.9
+description: A duplicate of valid/custom.minimal with a distinct name and version to test precedence.
+category: api
+compatibility:
+  min_forge_version: 1.0.0
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

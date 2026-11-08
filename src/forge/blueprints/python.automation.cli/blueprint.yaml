@@ -1,0 +1,155 @@
+# ---------------------------------------------------------------------------
+# Forge official blueprint — python.automation.cli
+#
+# Scaffolds a small, production-shaped Python CLI automation tool:
+#   * Typer-based entry point with a typed root command
+#   * pydantic-settings config so env vars and flags share one source
+#   * pytest + CliRunner test scaffolding
+#   * optional shell-completion generation and a packaging hook
+#
+# Validated at load time against the canonical schema and the generated
+# Pydantic models, so field-shape mistakes fail CI rather than users.
+# ---------------------------------------------------------------------------
+schema_version: "1.0.0"
+
+id: python.automation.cli
+name: Python CLI Automation Tool
+version: 1.0.0
+description: >-
+  A small Typer-based automation CLI with typed settings, structured
+  logging, and a test harness ready for CI. Intended as a starting point
+  for internal tooling: batteries included, but nothing you would delete
+  on day two.
+
+category: cli
+maintainer: "@platform-team"
+
+compatibility:
+  min_forge_version: 1.0.0
+
+# ---------------------------------------------------------------------------
+# Variables — ordered; the wizard presents them top to bottom.
+# Every id is lower_snake_case (schema-enforced) and used verbatim in
+# templates as `{{variable_id}}`.
+# ---------------------------------------------------------------------------
+variables:
+  - id: command_name
+    type: string
+    description: >-
+      The executable name installed by the generated package (the string
+      users type after `pip install`). Lowercase, hyphen-safe.
+    required: true
+    default: automate
+    validation:
+      # Executable names must be filesystem- and shell-safe. We forbid
+      # leading digits and hyphens-in-a-row because both break tab
+      # completion on some shells and confuse argparse-style parsers.
+      pattern: "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+
+  - id: log_format
+    type: enum
+    description: Structured logging format emitted to stdout by default.
+    required: true
+    default: json
+    validation:
+      enum:
+        - json
+        - console
+        - plain
+
+  - id: include_completion
+    type: boolean
+    description: Generate shell-completion scripts and register them in the CLI entry point.
+    required: false
+    default: true
+
+# ---------------------------------------------------------------------------
+# Files — always applied. Destinations may interpolate `{{project}}` and
+# any variable id; templates live next to this manifest under templates/.
+# ---------------------------------------------------------------------------
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+  - source: templates/README.md.j2
+    destination: README.md
+  - source: templates/.gitignore
+    destination: .gitignore
+  - source: templates/src/{{project}}/__init__.py
+    destination: src/{{project}}/__init__.py
+  - source: templates/src/{{project}}/__main__.py
+    destination: src/{{project}}/__main__.py
+  - source: templates/src/{{project}}/cli.py.j2
+    destination: src/{{project}}/cli.py
+  - source: templates/src/{{project}}/settings.py.j2
+    destination: src/{{project}}/settings.py
+  - source: templates/src/{{project}}/logging.py.j2
+    destination: src/{{project}}/logging.py
+  - source: templates/tests/test_cli.py.j2
+    destination: tests/test_cli.py
+  - source: templates/tests/conftest.py
+    destination: tests/conftest.py
+
+# ---------------------------------------------------------------------------
+# Conditional files — applied only when the expression evaluates true.
+# Two independent branches here; the resolver evaluates each in order and
+# merges the resulting file lists. Expressions stay intentionally simple
+# (`<var_id> == <literal>`); anything richer belongs in a bespoke blueprint.
+# ---------------------------------------------------------------------------
+conditional_files:
+  # Shell completion is opt-in because it edits the user's shell rc files
+  # and generates a real artefact (`completions/`). Off by default for
+  # users who want a bare CLI.
+  - condition: include_completion == true
+    files:
+      - source: templates/src/{{project}}/completion.py.j2
+        destination: src/{{project}}/completion.py
+      - source: templates/completions/{{command_name}}.bash.j2
+        destination: completions/{{command_name}}.bash
+
+  # Console/plain log formats need a formatter module that the JSON path
+  # does not. Keeping it conditional avoids shipping unused code — a small
+  # but real technical-debt win.
+  - condition: log_format == console
+    files:
+      - source: templates/src/{{project}}/_formatters.py.j2
+        destination: src/{{project}}/_formatters.py
+
+  - condition: log_format == plain
+    files:
+      - source: templates/src/{{project}}/_formatters.py.j2
+        destination: src/{{project}}/_formatters.py
+
+# ---------------------------------------------------------------------------
+# Verification contract — every generated project must satisfy these
+# before `forge create` reports success. Structural checks first (cheap,
+# fail fast); behavioural checks afterwards (real import + real help text).
+# ---------------------------------------------------------------------------
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+
+  - id: has_entrypoint
+    type: required_file
+    path: src/{{project}}/cli.py
+
+  # Import proves the package installs cleanly and its dependencies are
+  # declared. This catches the most common scaffolding regression:
+  # a template that references a package missing from pyproject.
+  - id: imports_cleanly
+    type: command
+    command: python -c "import {{project}}"
+    timeout: 120
+
+  # `--help` proves the Typer app is wired to the console_scripts entry
+  # point. It is the cheapest behavioural test that a CLI actually *is*
+  # a CLI, and it runs in under a second on a cold cache.
+  - id: help_responds
+    type: command
+    command: "python -m {{project}} --help"
+    timeout: 60
+
+  - id: tests_pass
+    type: command
+    command: pytest -q
+    timeout: 300

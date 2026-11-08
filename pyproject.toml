@@ -66,21 +66,26 @@ classifiers = [
 #      "I resolved the conflict by reordering, and now everything is
 #      broken" incidents.
 dependencies = [
+    # ``click`` is a direct dependency because the CLI exposes
+    # ``click.testing.CliRunner`` in its test suite and the custom
+    # error handler inspects ``click.exceptions``. Depending on it
+    # *only* transitively via Typer would couple us to whatever
+    # version Typer chooses — a version we do not control. The
+    # explicit floor matches Typer's own; the ceiling matches the
+    # current 8.x line.
     "click>=8.1.0,<9.0",
     "httpx>=0.27.0,<1.0",
     "jinja2>=3.1.3,<4.0",
     # ``jsonschema`` 4.22+ is the minimum that ships a stable, public
     # ``Draft202012Validator`` with the ``iter_errors`` API our
     # verification funnel relies on, and that resolves the Draft
-    # 2020-12 meta-schema without extra deps. Pinning the floor
-    # tighter than 4.21 prevents silent regressions on older hosts.
+    # 2020-12 meta-schema without extra deps.
     "jsonschema>=4.22.0,<5.0",
     # ``pydantic`` 2.7+ is the minimum that ships the strict-mode
     # ``ConfigDict(extra="forbid", strict=True)`` behaviour our
     # generated models depend on, and that preserves the ``loc`` tuple
     # shapes ``_format_pydantic_errors`` relies on for JSON-Pointer
-    # translation. The floor matches the version the codegen tool
-    # targets when it emits ``pydantic_v2.BaseModel`` output.
+    # translation.
     "pydantic>=2.7.0,<3.0",
     "pydantic-settings>=2.2.0,<3.0",
     "pyyaml>=6.0.1,<7.0",
@@ -88,15 +93,17 @@ dependencies = [
     # stable; the ``unsafe_ask`` entry point used by
     # ``forge.cli.prompts`` raises ``KeyboardInterrupt`` and
     # ``EOFError`` on cancellation, which the prompt engine converts
-    # into ``PromptCancelledError`` — no other library behaviour is
-    # depended on.
+    # into ``PromptCancelledError``.
     "questionary>=2.0.1,<3.0",
     "rich>=13.7.0,<14.0",
+    # ``typer`` is the CLI framework. The floor is the version that
+    # stabilised ``registered_callback``/``registered_commands`` on
+    # ``Typer`` instances — the public-API surface the registry's
+    # single-command-vs-multi-command detection relies on
+    # (``forge.cli.registry._is_single_command_app``). Older Typer
+    # releases exposed those attributes only on private classes; the
+    # registry would silently mis-classify every command module.
     "typer>=0.12.0,<1.0",
-    # ``importlib-resources`` is stdlib on 3.9+, so no conditional
-    # dependency is required. ``jsonschema``, ``pydantic``, and
-    # ``questionary`` are the only additions relative to the previous
-    # version.
 ]
 
 # Development dependencies: installed with `uv sync --all-extras`.
@@ -107,10 +114,15 @@ dev = [
     # from the canonical JSON Schema (ADR-0008). It is a *dev* dep —
     # the generated file is committed, so the runtime wheel does not
     # need the tool. The floor is the oldest version whose CLI flags
-    # match ``_GENERATOR_ARGS`` in ``forge.models._generator``; if a
-    # future release changes flag names, that module is the only file
-    # to update.
-    "datamodel-code-generator>=0.25.0,<0.26",
+    # match ``_GENERATOR_ARGS`` in ``scripts/generate_models.py``;
+    # the ceiling is the current 0.x line, which is where the
+    # ``--output-model-type pydantic_v2.BaseModel`` flag landed.
+    # Widening the ceiling to ``<1.0`` would be premature: 0.x
+    # releases have historically renamed flags between minors, and
+    # the drift guard (``make models-check``) runs on every PR, so a
+    # silent CI break at the moment of a dependabot bump is the
+    # *preferred* failure mode — it is loud and immediate.
+    "datamodel-code-generator>=0.25.0,<0.27",
     "hypothesis>=6.100,<7.0",
     "mypy>=1.10,<2.0",
     "pip-audit>=2.7.0,<3.0",
@@ -156,29 +168,50 @@ version-file = "src/forge/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/forge"]
 
-# Ship the canonical JSON Schema as a package resource (ADR-0007).
-# Hatchling's ``packages`` directive ships ``*.py`` files by default;
-# non-Python package-internal files must be declared explicitly, or they
-# will be absent from the installed wheel, causing
-# ``importlib.resources.files("forge.schemas")`` to raise
-# ``FileNotFoundError`` at runtime — even though the same code works
-# from an editable install (where the file is read directly from the
-# source tree). That divergence is the classic "works on my machine,
-# breaks for users" packaging bug, and it would be fatal here because
-# the schema is the canonical contract (ADR-0007): the shipped wheel
-# must contain it, or the CLI cannot validate any blueprint.
-#
 # ``artifacts`` ships files verbatim regardless of Hatchling's language
-# heuristics. The glob (rather than a single filename) anticipates a
-# future v2 schema shipped alongside v1 during migration: adding a
-# schema becomes a data change, not a config change.
+# heuristics. Hatchling's ``packages`` directive ships ``*.py`` files by
+# default; non-Python package-internal files must be declared explicitly,
+# or they will be absent from the installed wheel — causing
+# ``importlib.resources.files(...)`` to raise ``FileNotFoundError`` at
+# runtime even though the same code works from an editable install
+# (where the file is read directly from the source tree). That
+# divergence is the classic "works on my machine, breaks for users"
+# packaging bug.
 #
-# Do *not* replace this with ``shared-data``: that directive places
-# files under the wheel's ``share/`` tree, which is *outside* the
+# Two independent resource trees must ship:
+#
+#   1. ``src/forge/schemas/*.json`` — the canonical JSON Schema
+#      (ADR-0007). Without it the CLI cannot validate any blueprint.
+#      The glob (rather than a single filename) anticipates a future
+#      v2 schema shipped alongside v1 during migration.
+#
+#   2. ``src/forge/blueprints/**`` — the official blueprint manifests
+#      and their templates (ADR-0009). Without them
+#      ``BlueprintDiscoveryService`` finds zero official blueprints
+#      and every ``forge create <official.id>`` fails with "not
+#      installed" — a failure that is impossible to diagnose from the
+#      user's side because editable installs and wheels *do not*
+#      behave the same way here. The ``**`` recursive glob ships
+#      ``blueprint.yaml`` *and* every file under ``templates/``, which
+#      the generation layer reads as raw bytes (it must not depend on
+#      Hatchling understanding what "template" means).
+#
+# ``artifacts`` is chosen over ``shared-data`` because ``shared-data``
+# places files under the wheel's ``share/`` tree, *outside* the
 # importable package and unreachable via ``importlib.resources``. An
-# earlier revision of this file used ``shared-data`` and silently
-# shipped a duplicate copy of the schema that no code path could read.
-artifacts = ["src/forge/schemas/*.json"]
+# earlier revision of this file used ``shared-data`` for the schema and
+# silently shipped a duplicate copy that no code path could read; the
+# same mistake with blueprints would be worse because it would ship
+# a wheel that *appears* to contain blueprints (`pip show -f` lists
+# them) but discovery would never see them.
+artifacts = [
+    "src/forge/schemas/*.json",
+    "src/forge/blueprints/**/*.yaml",
+    "src/forge/blueprints/**/*.j2",
+    "src/forge/blueprints/**/*.md",
+    "src/forge/blueprints/**/.gitignore",
+    "src/forge/blueprints/**/.dockerignore",
+]
 
 # ``force-include`` is reserved for assets that live *outside* the
 # package directory and must appear *inside* it in the installed wheel.
@@ -270,27 +303,25 @@ ignore = [
 # with the script role.
 "scripts/**/*.py" = ["T201", "SIM108"]
 
-# ``forge.models._generator`` is a developer tool, not library code.
-# It legitimately prints to stdout/stderr (its whole job is to
-# communicate regeneration results to a human running ``make models``),
-# and it shells out to ``datamodel-code-generator`` for the reasons
-# documented in that module. Relaxing only the rules that conflict
-# with the tool's role keeps the rest of the package under the strict
-# ruleset.
-"src/forge/models/_generator.py" = ["T201", "S603", "S607"]
-
 [tool.ruff.lint.isort]
 known-first-party = ["forge"]
+# Ordering here does not affect correctness — Ruff matches the *set*
+# of names, not the sequence — but keeping the list alphabetical makes
+# it scannable when a new third-party import is introduced. ``typer``
+# is listed explicitly (rather than being inferred via ``click``) so
+# that ``from typer import ...`` sorts into the third-party group in
+# every file without requiring an inline noqa.
 known-third-party = [
-    "typer",
-    "rich",
+    "click",
+    "httpx",
+    "jinja2",
+    "jsonschema",
     "pydantic",
     "pydantic_settings",
-    "jinja2",
-    "yaml",
-    "jsonschema",
-    "httpx",
     "questionary",
+    "rich",
+    "typer",
+    "yaml",
 ]
 
 [tool.ruff.format]
@@ -373,7 +404,7 @@ addopts = [
     "--strict-config",
     "--cov=src/forge",
     "--cov-report=term-missing",
-    "--cov-report=xml",
+    "--cov-report=xml:coverage.xml",
     "--cov-fail-under=90",
 ]
 testpaths = ["tests"]
@@ -445,5 +476,11 @@ exclude_lines = [
     "class .*\\bProtocol\\):",
 ]
 
-[tool.coverage.xml]
-output = "coverage.xml"
+# The XML report path is set via ``--cov-report=xml:coverage.xml`` in
+# ``[tool.pytest.ini_options].addopts`` so that the filename lives next
+# to the flag that produces it. The previous ``[tool.coverage.xml]``
+# block was dead: pytest-cov does not consult coverage's TOML for the
+# XML output filename — it derives it from the ``--cov-report`` value,
+# and an unconfigured default is ``coverage.xml`` in the CWD. Keeping
+# the block would have been a comment that lied about what configures
+# what; the addopts value is the actual source of truth.

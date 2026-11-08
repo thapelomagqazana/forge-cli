@@ -1,0 +1,202 @@
+# ---------------------------------------------------------------------------
+# Forge official blueprint — typescript.frontend.react
+#
+# Scaffolds a modern, production-shaped React + TypeScript app:
+#   * Vite build tooling with strict tsconfig
+#   * React Router with one real route (health page) so the app boots
+#   * vitest + @testing-library/react test scaffolding
+#   * optional ESLint + Prettier, optional Dockerfile
+#
+# Validated at load time against the canonical schema and generated
+# Pydantic models. This file is the schema's third regression fixture:
+# if a future schema change breaks multi-branch conditionals or
+# destination interpolation, CI fails here first.
+# ---------------------------------------------------------------------------
+schema_version: "1.0.0"
+
+id: typescript.frontend.react
+name: TypeScript React Frontend
+version: 1.0.0
+description: >-
+  A Vite + React + TypeScript starter with strict compiler settings,
+  React Router, and a vitest harness wired to Testing Library. Ships
+  opinionated defaults that pass `tsc --noEmit` and `vitest run` on a
+  clean checkout, so the generated project is CI-ready from minute one.
+
+category: frontend
+maintainer: "@platform-team"
+
+compatibility:
+  min_forge_version: 1.0.0
+
+# ---------------------------------------------------------------------------
+# Variables — ordered; the wizard presents them top to bottom. All ids
+# are lower_snake_case (schema-enforced) because templates reference them
+# as `{{variable_id}}`.
+# ---------------------------------------------------------------------------
+variables:
+  - id: package_scope
+    type: string
+    description: >-
+      npm scope prefix for the package name (without the leading @).
+      Used in package.json ("name": "@<scope>/<project>") and import
+      aliases. Leave as the default for a scoped package, or override
+      with your org's scope.
+    required: true
+    default: app
+    validation:
+      # npm scope rules: lowercase, digits, hyphens, must start with a
+      # letter or digit, no consecutive hyphens. Mirrors npm's own
+      # validation so errors surface in the wizard, not at `npm install`.
+      pattern: "^[a-z0-9][a-z0-9]*(-[a-z0-9]+)*$"
+
+  - id: router
+    type: enum
+    description: Client-side routing strategy for the generated app shell.
+    required: true
+    default: react-router
+    validation:
+      enum:
+        - react-router
+        - none
+
+  - id: styling
+    type: enum
+    description: Styling approach wired into the app shell and build config.
+    required: true
+    default: css-modules
+    validation:
+      enum:
+        - css-modules
+        - tailwind
+        - vanilla-css
+
+  - id: include_tests
+    type: boolean
+    description: >-
+      Include vitest + Testing Library scaffolding and a health-page test.
+      Disable for a truly minimal shell with no test dependencies.
+    required: false
+    default: true
+
+  - id: include_lint
+    type: boolean
+    description: >-
+      Include ESLint (flat config) + Prettier + a `lint` script wired to CI.
+    required: false
+    default: true
+
+# ---------------------------------------------------------------------------
+# Files — always applied. Destinations may interpolate `{{project}}` and
+# any variable id; templates live next to this manifest under templates/.
+# ---------------------------------------------------------------------------
+files:
+  - source: templates/package.json.j2
+    destination: package.json
+  - source: templates/tsconfig.json
+    destination: tsconfig.json
+  - source: templates/tsconfig.node.json
+    destination: tsconfig.node.json
+  - source: templates/vite.config.ts.j2
+    destination: vite.config.ts
+  - source: templates/index.html.j2
+    destination: index.html
+  - source: templates/.gitignore
+    destination: .gitignore
+  - source: templates/README.md.j2
+    destination: README.md
+  - source: templates/src/main.tsx.j2
+    destination: src/main.tsx
+  - source: templates/src/App.tsx.j2
+    destination: src/App.tsx
+  - source: templates/src/routes/Health.tsx
+    destination: src/routes/Health.tsx
+  - source: templates/src/styles/global.css
+    destination: src/styles/global.css
+
+# ---------------------------------------------------------------------------
+# Conditional files — applied only when the expression evaluates true.
+# Branches here are independent; the resolver evaluates each in order and
+# merges the file lists. Overlapping destinations are a bug in the
+# blueprint, not the resolver — keep destinations unique per branch.
+# ---------------------------------------------------------------------------
+conditional_files:
+  # Routing: the app shell imports a router only when requested. The
+  # main.tsx template handles both shapes via an inline conditional, so
+  # no destination collides here.
+  - condition: router == react-router
+    files:
+      - source: templates/src/router.tsx.j2
+        destination: src/router.tsx
+
+  # Styling: each choice contributes its own toolchain config. Destinations
+  # are disjoint, so users can switch choices without file conflicts.
+  - condition: styling == tailwind
+    files:
+      - source: templates/tailwind.config.ts
+        destination: tailwind.config.ts
+      - source: templates/postcss.config.js
+        destination: postcss.config.js
+      - source: templates/src/styles/tailwind.css
+        destination: src/styles/tailwind.css
+
+  - condition: styling == css-modules
+    files:
+      - source: templates/src/styles/App.module.css
+        destination: src/styles/App.module.css
+
+  # Tests: opt-out because the harness pulls in vitest, jsdom, and
+  # Testing Library — meaningful dependency weight for a throwaway shell.
+  - condition: include_tests == true
+    files:
+      - source: templates/vitest.config.ts
+        destination: vitest.config.ts
+      - source: templates/src/setupTests.ts
+        destination: src/setupTests.ts
+      - source: templates/src/routes/Health.test.tsx.j2
+        destination: src/routes/Health.test.tsx
+
+  # Lint: separate branch from tests so users can keep one and drop the
+  # other. ESLint flat config lives at the repo root and is referenced by
+  # the generated package.json scripts.
+  - condition: include_lint == true
+    files:
+      - source: templates/eslint.config.js
+        destination: eslint.config.js
+      - source: templates/.prettierrc.json
+        destination: .prettierrc.json
+
+# ---------------------------------------------------------------------------
+# Verification contract — every generated project must satisfy these
+# before `forge create` reports success. Structural checks first (cheap);
+# behavioural checks afterwards (real typecheck and test run).
+#
+# Note: `npm install` is deliberately *not* run by verification — the
+# contract asserts the generated project is well-formed, not that the
+# user's npm registry is reachable. Install is the user's first step.
+# ---------------------------------------------------------------------------
+verification:
+  - id: has_package_json
+    type: required_file
+    path: package.json
+
+  - id: has_entry
+    type: required_file
+    path: src/main.tsx
+
+  # `tsc --noEmit` is the canonical proof that a TypeScript project is
+  # internally consistent: types resolve, imports resolve, strict flags
+  # are honoured. It requires node_modules, so the wizard runs
+  # `npm install` as a post-scaffold step and then executes this check.
+  - id: typechecks
+    type: command
+    command: npx tsc --noEmit
+    timeout: 300
+
+  # Only assert the test harness when the user opted into it. The
+  # blueprint template ensures `test` is defined conditionally, so a
+  # project with include_tests=false has no test script to call.
+  - id: tests_pass
+    type: command
+    command: npm test -- --run
+    timeout: 600

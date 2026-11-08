@@ -20,6 +20,23 @@ progress, diagnostics). A script that pipes ``forge list --json`` to
 in. ``print_error`` and ``print_warning`` go to stderr for exactly this
 reason.
 
+Warning vs. error
+-----------------
+A **warning** says: the command produced its product, but something
+about the result deserves the user's attention (e.g. "no blueprints
+match the given filters" — the command answered the question, the
+answer was empty). A warning does not imply a non-zero exit.
+
+An **error** says: the command could not produce its product (e.g. "no
+blueprints are installed" when the user asked to list them). An error
+typically implies a non-zero exit, because the product the user asked
+for does not exist.
+
+Both are rendered to stderr, because both are commentary, but they use
+different prefixes (``⚠`` vs. ``✗``) so a user scanning output — or a
+script that greps for ``✗`` — can distinguish "the command told me
+something" from "the command failed."
+
 Why a single module?
 --------------------
 If every command calls ``typer.echo`` or ``print`` directly, the CLI's
@@ -38,7 +55,7 @@ Design principles
    additive. ``NO_COLOR`` and ``FORCE_COLOR`` are honoured.
 3. **One console instance.** Rich's ``Console`` handles TTY detection,
    colour, width, and ``--no-color`` internally. We do not reimplement
-   any of it — we just use one instance.
+   any of it — we just use one instance per stream.
 4. **No exceptions leak.** These helpers do not raise. If Rich fails
    (e.g., a broken pipe), the helper catches the failure and falls back
    to ``typer.echo`` so the CLI never crashes because of a formatting
@@ -140,6 +157,21 @@ def print_warning(message: str) -> None:
     for the same reason as errors: the product stream must not be
     polluted.
 
+    The distinction from ``print_error`` is deliberate and load-bearing:
+
+    * A warning does not imply a non-zero exit. The command succeeded;
+      it just has something to say about the result.
+    * The prefix (``⚠``) differs from the error prefix (``✗``) so a
+      user — or a script grepping for failures — can tell them apart.
+    * A script that pipes ``forge list --json | jq`` gets JSON on
+      stdout; if the result set is empty (a *valid* outcome), a
+      warning goes to stderr and the pipeline still succeeds.
+
+    Mixing warnings and errors into one helper would force callers to
+    decide between "prefix this with the alarming symbol" and "use the
+    wrong exit code" — both wrong, and both would drift into
+    workarounds.
+
     Args:
         message: The message to print. Rendered as ``⚠ <message>``.
     """
@@ -186,14 +218,6 @@ def print_cancelled(message: str = "Cancelled.") -> None:
     commentary stream), uses dim formatting (the message is
     informational, not alarming), and has no prefix (there is
     nothing to prefix — the message is self-evident).
-
-    The helper does not add a leading newline. Earlier versions did,
-    on the theory that a cancellation always follows a prompt and a
-    blank line separates them. That theory is wrong for wizards that
-    cancel at *any* step (a section header, a menu, a confirmation):
-    a leading blank line is noise in most cases and impossible for
-    the caller to suppress in the rest. Layout the caller cannot
-    remove is layout that fights the caller.
 
     Args:
         message: The message to print. Defaults to ``"Cancelled."``.
@@ -276,18 +300,19 @@ def print_hint(message: str) -> None:
 # Why bother: ``ui.section("Project setup")`` reads like a method on a
 # UI namespace, which it is; ``ui.print_section("Project setup")``
 # reads like a function on a printer, which it is not. Command code
-# (the wizard in particular) reads better with the short form, and
-# re-exports are zero-cost — a caller that prefers the long form gets
-# the same object.
+# (the wizard in particular, and ``forge list``) reads better with the
+# short form, and re-exports are zero-cost — a caller that prefers the
+# long form gets the same object.
 #
-# The aliases are added to ``__all__`` so linters do not flag them as
-# unused and so ``from forge.cli.ui import *`` (in a test, say)
-# exposes both spellings. If the team prefers one spelling, deleting
-# the other is a one-line change; both are tested.
+# Both spellings are in ``__all__`` so linters do not flag them as
+# unused and so ``from forge.cli.ui import *`` exposes both. If the
+# team ever prefers one spelling, deleting the other is a one-line
+# change; both are already used in the codebase.
 section = print_section
 info = print_info
 success = print_success
 warning = print_warning
+warn = print_warning
 error = print_error
 hint = print_hint
 cancelled = print_cancelled
@@ -336,5 +361,6 @@ __all__ = [
     "section",
     "success",
     "typer_echo_safe",
+    "warn",
     "warning",
 ]

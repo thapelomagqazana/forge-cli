@@ -1,0 +1,12 @@
+# malformed/invalid_yaml
+#
+# A manifest that cannot be parsed by yaml.safe_load. The exact syntax
+# error (a mapping key followed by another mapping key on the same
+# line, without quotes) is a common hand-editing mistake that the
+# YAML grammar rejects. The resolver must catch this via
+# yaml.YAMLError and wrap it in MalformedBlueprintError.
+
+schema_version: "1.0.0"
+id: malformed.invalid_yaml
+name: "not: a valid: yaml"
+version: 1.0.0
