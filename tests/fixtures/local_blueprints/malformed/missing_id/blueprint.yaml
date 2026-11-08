@@ -1,0 +1,18 @@
+# malformed/missing_id
+#
+# Parses as valid YAML, but fails schema validation because the
+# required ``id`` field is absent. This is the "did I forget a field?"
+# case — a plausible authoring mistake that the schema catches before
+# the blueprint reaches the wizard.
+
+schema_version: "1.0.0"
+name: Missing ID Blueprint
+version: 1.0.0
+description: Fails schema validation because id is absent.
+category: api
+compatibility:
+  min_forge_version: 1.0.0
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

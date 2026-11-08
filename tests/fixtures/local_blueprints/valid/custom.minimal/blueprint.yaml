@@ -1,0 +1,22 @@
+# valid/custom.minimal
+#
+# The smallest manifest that passes schema and model validation:
+# required fields only, no variables, one required_file check.
+# Tests that only need "a real local blueprint that loads" copy this
+# directory into tmp_path and point a LocalDirectorySource at it —
+# keeping the fixture minimal means a schema change that breaks it is
+# a change the *schema* introduced, not something a test happened to
+# depend on.
+
+schema_version: "1.0.0"
+id: custom.minimal
+name: Minimal Custom Blueprint
+version: 1.0.0
+description: A minimal local blueprint used as a discovery fixture.
+category: api
+compatibility:
+  min_forge_version: 1.0.0
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

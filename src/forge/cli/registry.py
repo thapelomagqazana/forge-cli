@@ -2,16 +2,17 @@
 
 This module is the single place that knows *how* to find commands. It
 scans the ``forge.cli.commands`` package for modules that follow the
-command module contract, and registers each one with the root
-``Typer`` application.
+command module contract, and registers each one with the root ``Typer``
+application.
 
 It is also the public seam the interactive ``create`` wizard uses to
 enumerate and load blueprints. The wizard must not reach into the
 blueprint loader's internals — it calls ``list_blueprints()`` for the
 selection menu and ``get_blueprint()`` for per-variable prompts. Both
-go through the same cache the rest of the CLI uses, so a blueprint
-that appears in the menu is guaranteed to be loadable by the command
-that consumes it.
+delegate to ``forge.discovery.BlueprintDiscoveryService``, so the same
+precedence rules (local overrides official, malformed skipped with
+warnings) apply whether the caller is the wizard, the non-interactive
+path, or ``forge list``.
 
 The contract
 ------------
@@ -84,26 +85,38 @@ that are not related to *command* discovery:
 
 Both are exposed as public functions here — ``list_blueprints()`` and
 ``get_blueprint()`` — rather than as private helpers or direct imports
-of the underlying loader. The reasons:
+of the discovery service. The reasons:
 
 - **Single source of truth.** The wizard, the non-interactive path,
-  and any future web entry point all resolve blueprints through the
-  same functions. A blueprint that appears in the menu is guaranteed
-  to be loadable by the command that consumes it.
-- **Testability.** A test can ``monkeypatch.setattr(registry,
-  "_load_blueprint_index", ...)`` and exercise both the wizard and
-  the non-interactive path against a fixture index, with no
-  filesystem dependency.
-- **Stability.** The wizard's menu is sorted (see
-  ``list_blueprints``). Snapshot tests and human users both benefit
-  from an order that does not reshuffle between runs.
+  ``forge list``, and any future web entry point all resolve blueprints
+  through the same service. A blueprint that appears in the menu is
+  guaranteed to be loadable by the command that consumes it.
+- **Testability.** A test can monkeypatch
+  ``_make_discovery_service`` to return a fixture service, and exercise
+  both the wizard and the non-interactive path with no filesystem
+  dependency.
+- **Stability.** ``list_blueprints`` returns IDs in sorted order (the
+  service guarantees this for the full catalogue; the registry
+  re-sorts defensively because it is a public contract). Snapshot
+  tests and human users both benefit from an order that does not
+  reshuffle between runs.
 
 Delegation, not duplication
 ---------------------------
-The blueprint index is owned by the loader module, not by the
-registry. ``_load_blueprint_index`` below is a thin, mockable seam
-that delegates to the loader. If the loader's API changes, only this
-seam changes — the wizard and the tests keep working.
+Blueprint discovery is owned by ``forge.discovery``, not by the
+registry. ``_make_discovery_service`` below is a thin, mockable seam
+that returns a fresh service per call. It exists so tests can
+substitute a fixture service without touching the real filesystem, and
+so a future config file (e.g. ``--blueprint-dir``) can override the
+default ``.forge/blueprints`` location without changing any call site
+outside this module.
+
+**No caching in this module.** The service deliberately re-resolves on
+every call so user edits are picked up immediately (see ADR-0009).
+Adding a cache here would create two sources of truth and a
+cache-invalidation bug waiting to happen. This module is a *facade*,
+not a cache — it calls through on every invocation, and the service
+decides whether the call is cheap.
 
 Type-checking notes
 -------------------
@@ -116,11 +129,13 @@ weakening it:
   ``Callable[..., Any] | None``. The runtime check inside that
   function narrows the type at the call site; see the function's
   docstring.
-- ``_load_blueprint_index`` references ``forge.blueprints.load_index``,
-  which is a *forward declaration* — the loader is a separate task.
-  Two scoped ``# type: ignore`` comments (one per error) mark the
-  forward-declared reference; see the function's docstring for the
-  removal condition.
+- ``get_blueprint`` constructs a ``BlueprintEntry`` whose
+  ``variables`` field is ``tuple[Any, ...]``. The discovery service
+  returns ``Blueprint`` objects with a typed ``variables`` list; the
+  ``tuple(...)`` conversion keeps the entry immutable and the ``Any``
+  in the field type keeps the registry decoupled from the model
+  layer's concrete ``VariableDefinition`` class (which the loader may
+  change without forcing a registry release).
 """
 
 from __future__ import annotations
@@ -128,12 +143,15 @@ from __future__ import annotations
 import importlib
 import logging
 import pkgutil
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Final
 
 import typer
+
+from forge.core.exceptions import BlueprintError
+from forge.discovery import BlueprintDiscoveryService
 
 logger = logging.getLogger(__name__)
 
@@ -194,22 +212,23 @@ class SkippedCommand:
 class BlueprintEntry:
     """A loaded blueprint, as exposed to the command layer.
 
-    Kept separate from the loader's internal blueprint type so the
-    registry's public contract does not leak the loader's internals.
-    The wizard only needs ``id`` and ``variables``; the command layer
-    only needs ``id``. Everything else is an implementation detail of
-    the loader that callers should not depend on.
+    Kept separate from the discovery service's internal ``Blueprint``
+    model so the registry's public contract does not leak the model
+    layer's internals. The wizard only needs ``id`` and ``variables``;
+    the command layer only needs ``id``. Everything else is an
+    implementation detail that callers should not depend on.
 
     Attributes:
-        id: The blueprint's canonical ID (e.g., ``"python.fastapi.api"``).
+        id: The blueprint's canonical ID (e.g.,
+            ``"python.fastapi.api"``).
         display_name: Human-readable name for the selection menu.
             Falls back to ``id`` when the blueprint does not declare
             one, so the wizard never has to special-case.
         variables: The blueprint's declared variable descriptors. The
-            wizard iterates this list to prompt for each variable;
-            the command layer passes it to the validator. Kept as a
-            tuple for immutability — a caught ``BlueprintEntry`` is
-            safe to pass across threads and store in fixtures.
+            wizard iterates this list to prompt for each variable; the
+            command layer passes it to the validator. Kept as a tuple
+            for immutability — a caught ``BlueprintEntry`` is safe to
+            pass across threads and store in fixtures.
     """
 
     id: str
@@ -400,6 +419,35 @@ def _register_single_command(
     root_app.command(command_name)(registered_callback.callback)
 
 
+def _command_name_collides(
+    root_app: typer.Typer,
+    command_name: str,
+) -> bool:
+    """Return ``True`` iff ``command_name`` is already mounted on ``root_app``.
+
+    Checks both registration shapes:
+
+    - ``registered_commands`` covers single-command apps mounted as
+      *leaf commands* (see ``_register_single_command``).
+    - ``registered_groups`` covers multi-command apps mounted as
+      *sub-Typers* (see ``add_typer``).
+
+    A name collision in either shape would cause one module to shadow
+    the other at dispatch time, so both are checked. Extracted into a
+    helper so the strict and non-strict branches in ``_register_one``
+    cannot drift apart — the collision rule lives in exactly one place.
+
+    Implemented with two ``any(...)`` expressions, not a loop.
+    ``any`` short-circuits on the first match, so the runtime cost is
+    identical to the loop it replaces. The expression form also
+    removes the `return True`/`return False` pair, which is where
+    accidental `return None` bugs in collision checks typically hide.
+    """
+    return any(cmd.name == command_name for cmd in root_app.registered_commands) or any(
+        group.name == command_name for group in root_app.registered_groups
+    )
+
+
 def _register_one(
     root_app: typer.Typer,
     full_name: str,
@@ -458,36 +506,18 @@ def _register_one(
 
     # Detect duplicate registrations. Two modules mounting the same
     # command name is a bug that would cause one to silently shadow
-    # the other at dispatch time.
-    #
-    # The check covers both registration shapes: a single-command
-    # app is registered as a *command* on ``root_app`` (visible via
-    # ``root_app.registered_commands``), while a multi-command app is
-    # registered as a *group* (visible via
-    # ``root_app.registered_groups``). A name collision in either
-    # shape is a bug, so the loop checks both.
-    for registered in root_app.registered_groups:
-        if registered.name == command_name:
-            reason = f"command name {command_name!r} is already registered " f"by another module"
-            if strict:
-                raise RuntimeError(
-                    f"Command module {full_name!r} would shadow an "
-                    f"existing command {command_name!r}. Rename the "
-                    f"command or remove the duplicate module."
-                )
-            logger.warning("Skipping command module %r: %s", full_name, reason)
-            return SkippedCommand(module_name=short_name, reason=reason)
-    for registered_cmd in root_app.registered_commands:
-        if registered_cmd.name == command_name:
-            reason = f"command name {command_name!r} is already registered " f"by another module"
-            if strict:
-                raise RuntimeError(
-                    f"Command module {full_name!r} would shadow an "
-                    f"existing command {command_name!r}. Rename the "
-                    f"command or remove the duplicate module."
-                )
-            logger.warning("Skipping command module %r: %s", full_name, reason)
-            return SkippedCommand(module_name=short_name, reason=reason)
+    # the other at dispatch time. See ``_command_name_collides`` for
+    # which shapes are covered and why.
+    if _command_name_collides(root_app, command_name):
+        reason = f"command name {command_name!r} is already registered " f"by another module"
+        if strict:
+            raise RuntimeError(
+                f"Command module {full_name!r} would shadow an "
+                f"existing command {command_name!r}. Rename the "
+                f"command or remove the duplicate module."
+            )
+        logger.warning("Skipping command module %r: %s", full_name, reason)
+        return SkippedCommand(module_name=short_name, reason=reason)
 
     # -------------------------------------------------------------------------
     # Registration path — single-command vs. multi-command
@@ -556,95 +586,54 @@ def register_commands(
 # Blueprint access — public seam for the interactive create wizard
 # -----------------------------------------------------------------------------
 # The functions below are the *only* supported way for the command
-# layer to enumerate and load blueprints. They delegate to the
-# blueprint loader via ``_load_blueprint_index``, a thin seam kept in
-# this module so tests can substitute a fixture index without touching
-# the loader (which is tested separately, in its own module).
+# layer to enumerate and load blueprints. They delegate to
+# ``forge.discovery.BlueprintDiscoveryService`` via
+# ``_make_discovery_service``, a thin seam kept in this module so
+# tests can substitute a fixture service without touching the real
+# filesystem.
 #
 # Design choice: no caching in this module.
 # -----------------------------------------
-# The loader already caches the index (parsing blueprint.yaml files is
-# expensive; re-parsing them on every prompt would be wasteful). Adding
+# The service deliberately re-resolves on every call so user edits are
+# picked up immediately (see ADR-0009's "cache policy" section). Adding
 # a second cache here would create two sources of truth and a
 # cache-invalidation bug waiting to happen. This module is a *facade*,
-# not a cache — it calls through on every invocation, and the loader
+# not a cache — it calls through on every invocation, and the service
 # decides whether the call is cheap.
-def _load_blueprint_index() -> Mapping[str, Any]:
-    """Load the blueprint index (a mapping of ID → blueprint object).
+#
+# Design choice: seam, not direct import.
+# ---------------------------------------
+# Tests substitute ``_make_discovery_service`` to exercise the wizard
+# and non-interactive paths against a fixture catalogue. The real
+# service is tested separately in ``forge.discovery``'s own test
+# suite. Keeping the seam here means a future config file (e.g.
+# ``--blueprint-dir``) can override the default ``.forge/blueprints``
+# location without changing any call site outside this module.
+def _make_discovery_service() -> BlueprintDiscoveryService:
+    """Construct a fresh discovery service.
 
-    Kept as a separate function — not an inline import — so tests can
-    substitute a fixture index with ``monkeypatch.setattr``. The
-    loader's own tests exercise the real filesystem; the registry's
-    tests exercise the seam. This is the difference between "the
-    loader reads the filesystem" (true, tested elsewhere) and "the
-    wizard can list blueprints" (the wizard's concern, tested here).
+    Kept as a function — not an inline call — so tests can substitute
+    a fixture service with ``monkeypatch.setattr``. The service's own
+    tests exercise the real filesystem; the registry's tests exercise
+    the seam. This is the difference between "discovery reads the
+    filesystem" (true, tested elsewhere) and "the wizard can list
+    blueprints" (the wizard's concern, tested here).
 
-    Why the two ``# type: ignore`` comments
-    ----------------------------------------
-    ``forge.blueprints.load_index`` is a *separate task* in the WBS.
-    The module ``forge.blueprints`` exists today (it holds the
-    blueprint data directories), but does not yet expose
-    ``load_index``. That is a forward declaration of the seam, not a
-    typo: the registry is written against the *interface* the loader
-    will provide, so the loader can land without changing this
-    module.
+    Returning a *fresh* service per call (rather than a module-level
+    singleton) is deliberate: it means a test that patches
+    ``_make_discovery_service`` cannot accidentally leak state into a
+    test that does not patch it, and it matches the service's
+    documented no-caching policy.
 
-    Two narrow ``type: ignore`` comments make the forward declaration
-    explicit to ``mypy``, one per error:
-
-    - ``attr-defined`` on the import — the symbol does not exist on
-      the module *yet*.
-    - ``no-any-return`` on the return — because ``load_index`` is
-      unknown to ``mypy``, its return type is inferred as ``Any``,
-      and the declared return type here is ``Mapping[str, Any]``.
-
-    Both ignores are scoped to the two lines that reference the
-    missing symbol. They are *not* module-wide, and they are *not*
-    configured in ``pyproject.toml`` — a package-level
-    ``ignore_missing_imports`` would hide future *typos* in the
-    loader's own API once it lands, which is the opposite of what
-    we want. A single-line ignore fails loudly when the code moves
-    on; a package-level override fails silently forever.
-
-    Both ignores are removed when the loader task lands. The
-    docstring's mention of "forward declaration" is the removal
-    note — grep for it to find every place that needs updating.
-
-    Why not a ``Protocol``
-    ----------------------
-    A ``Protocol`` describing ``load_index``'s signature would also
-    satisfy ``mypy``, but it requires *defining* the signature here
-    (or in ``forge.blueprints``), which is more code than the loader
-    itself will need. The two ignores are the minimum change; the
-    ``Protocol`` becomes a natural cleanup once the loader's return
-    type is concrete and worth formalizing.
-
-    Why not a ``try/except ImportError`` fallback
-    ---------------------------------------------
-    Returning an empty mapping on ``ImportError`` would make the
-    registry silently produce an empty blueprint menu when the
-    installation is broken — a plausible-looking state that is
-    actually a bug. The loud ``ImportError`` (exit 5) tells the user
-    that something is wrong with the install, which is what
-    ``--debug`` and the generic internal-error message are for. A
-    dead end disguised as a valid state is the worst failure mode.
+    When ``--blueprint-dir`` lands as a CLI flag, this is the single
+    function that grows a parameter — every caller downstream of the
+    registry stays unchanged.
 
     Returns:
-        A mapping of blueprint ID to the loader's blueprint object.
-
-    Raises:
-        ImportError: If the loader module is not importable. This is a
-            packaging error, not a user error, so it propagates.
+        A ``BlueprintDiscoveryService`` configured with the default
+        local root.
     """
-    # Forward declaration of the loader's entry point; see the
-    # docstring's "Why the two ``# type: ignore`` comments" section.
-    # ``attr-defined``: the symbol is not on the module yet.
-    from forge.blueprints import load_index  # type: ignore[attr-defined]
-
-    # ``no-any-return``: ``load_index`` is unknown to ``mypy``, so its
-    # return is inferred as ``Any``; the declared return type is
-    # ``Mapping[str, Any]``.
-    return load_index()  # type: ignore[no-any-return]
+    return BlueprintDiscoveryService()
 
 
 def list_blueprints() -> list[str]:
@@ -657,15 +646,21 @@ def list_blueprints() -> list[str]:
     - Snapshot tests can assert on exact output without flakiness.
     - The first item is stable, so the default selection is stable.
 
+    The service already returns a catalogue sorted by id (see
+    ADR-0009); the registry re-sorts defensively because it is a
+    public contract, and a future service change that drops the sort
+    should not silently reshuffle the wizard.
+
     An empty list is a valid return value — it means the installation
-    has no blueprints. The wizard treats that as an ``UserInputError``
+    has no blueprints. The wizard treats that as a ``UserInputError``
     with a clear hint, not a crash.
 
     Returns:
         A sorted list of blueprint IDs (e.g., ``["python.fastapi.api",
-        "typescript.react.app"]``).
+        "typescript.frontend.react"]``).
     """
-    return sorted(_load_blueprint_index().keys())
+    catalogue = _make_discovery_service().discover()
+    return sorted(bp.id for bp in catalogue)
 
 
 def get_blueprint(blueprint_id: str) -> BlueprintEntry:
@@ -688,31 +683,40 @@ def get_blueprint(blueprint_id: str) -> BlueprintEntry:
 
     Raises:
         BlueprintError: If the blueprint ID is not present in the
-            index. The error is domain-level (exit code 2), so the CLI
-            handler renders it as "the blueprint is missing or
+            catalogue. The error is domain-level (exit code 2), so the
+            CLI handler renders it as "the blueprint is missing or
             malformed" without any special-casing here.
     """
-    from forge.core.exceptions import BlueprintError
-
-    index = _load_blueprint_index()
-    blueprint = index.get(blueprint_id)
-    if blueprint is None:
-        available = ", ".join(sorted(index.keys())) or "(none installed)"
+    service = _make_discovery_service()
+    try:
+        blueprint = service.load(blueprint_id)
+    except Exception as exc:
+        # The service raises ``DiscoveryError`` for a missing id; we
+        # translate it to a ``BlueprintError`` with a richer message
+        # (the list of available ids) so the CLI handler's output is
+        # the same whether the user mistyped the id in a flag or
+        # selected a stale entry from the wizard menu. Translating
+        # here, rather than in the handler, keeps the "what error
+        # shape does the CLI see?" question answerable in one place.
+        available = ", ".join(list_blueprints()) or "(none installed)"
         raise BlueprintError(
             f"Blueprint {blueprint_id!r} is not installed.",
             hint=f"Available blueprints: {available}.",
-        )
+        ) from exc
 
-    # The loader's blueprint object exposes ``variables`` as an
-    # iterable of descriptors, and optionally a ``display_name``.
-    # ``getattr`` with a fallback keeps the registry forward-
-    # compatible: a loader that adds ``display_name`` later will not
-    # require a change here, and one that never adds it still works.
-    variables = tuple(getattr(blueprint, "variables", ()))
-    display_name = getattr(blueprint, "display_name", None) or blueprint_id
+    # The model exposes ``variables`` as a list of typed
+    # ``VariableDefinition`` objects. The registry's ``BlueprintEntry``
+    # keeps them as ``tuple[Any, ...]`` so the registry is not coupled
+    # to the model layer's concrete variable class — a future schema
+    # change to ``VariableDefinition`` should not force a registry
+    # release. Callers (the wizard, the validator) already treat the
+    # descriptors structurally; typing them precisely would add a
+    # dependency without adding safety.
+    variables: tuple[Any, ...] = tuple(blueprint.variables)
+    display_name = blueprint.name or blueprint.id
 
     return BlueprintEntry(
-        id=blueprint_id,
+        id=blueprint.id,
         display_name=display_name,
         variables=variables,
     )

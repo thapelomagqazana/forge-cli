@@ -16,13 +16,7 @@ Exit code contract
 The exit codes are **part of the public CLI contract**. A script
 that runs ``forge create`` and branches on ``$?`` is depending on
 the *meaning* of each code. Changing any of them is a breaking
-change and requires a major version bump (``0.x`` → ``1.0`` is
-exempt from this rule per Semantic Versioning, but the codes are
-still expected to be stable within ``0.x``).
-
-The full contract lives in ``docs/reference/exit-codes.md``. The
-table below is the authoritative summary; if the two ever
-disagree, the doc file wins (and the disagreement is a bug).
+change and requires a major version bump.
 
 +-------+----------------------+-------------------------------------------+
 | Code  | Name                 | When it is returned                       |
@@ -50,16 +44,9 @@ The codes are chosen so that the **first digit** encodes the
 severity:
 
 - ``0`` — success.
-- ``1`` to ``3`` — the user can fix this without help (bad input,
-  missing blueprint, filesystem collision).
+- ``1`` to ``3`` — the user can fix this without help.
 - ``4`` — the project was generated but is not verified.
 - ``5`` — the tool is broken. Report it.
-
-A script that wants "did the command succeed?" branches on
-``== 0``. A script that wants "was it the user's fault?" branches on
-``in (1, 2, 3)``. A script that wants "was it a bug?" branches on
-``== 5``. This is a common Unix convention, and it is the reason
-the codes are not just ``1`` and ``2``.
 
 The ``hint`` attribute
 ----------------------
@@ -67,141 +54,92 @@ Every ``ForgeError`` can carry an optional ``hint`` — a one-line
 remediation suggestion. The handler renders the hint on a separate,
 dimmed line, so the user sees the *problem* and the *fix* together.
 
-A hint is not required, but it is strongly encouraged. An error
-message without a hint is a dead end: the user knows something
-failed, but not what to do about it. A hint turns a dead end into a
-signpost.
-
 Why the enum lives here, not in ``cli/``
 ----------------------------------------
 The exit code is a **domain decision**, not a CLI decision. Every
 ``ForgeError`` subclass declares its ``exit_code``; the CLI *uses*
-the code (the classifier reads ``exc.exit_code`` and exits with it).
-The decision belongs in ``core/``; the use belongs in ``cli/``.
+the code. The decision belongs in ``core/``; the use belongs in
+``cli/``. See ``docs/adr/0005-stabilize-exit-codes-as-a-public-contract.md``.
 
-If the enum lived in ``cli/exit_codes.py``, then
-``core/exceptions.py`` would import from ``cli/`` — a violation of
-the inward dependency rule. The domain would depend on the CLI,
-which means the domain could not be tested without the CLI, and
-could not be reused in a future web interface.
+Hierarchy at a glance
+---------------------
+::
 
-See ``docs/adr/0005-stabilize-exit-codes-as-a-public-contract.md``
-for the full reasoning.
+    ForgeError (Exception)
+    ├── UserInputError                 (1)
+    │   ├── MissingRequiredFlagsError  (1)
+    │   └── PromptCancelledError       (1)
+    ├── BlueprintError                 (2)
+    ├── DiscoveryError                 (2)
+    │   └── MalformedBlueprintError    (2)
+    ├── FilesystemConflictError        (3)
+    ├── VerificationError              (4)
+    └── StructuredError                (5)
+        ├── SchemaValidationError      (1)   <- user's blueprint
+        └── ModelValidationError       (5)   <- Forge bug
 
-Why the handler raises ``SystemExit``, not ``typer.Exit``
---------------------------------------------------------
-The handler is called from ``main()``, *after* Typer's dispatch
-has finished. ``typer.Exit`` is only special *inside* a Typer
-command. Outside Typer, it propagates into ``sys.exit(main())``,
-which treats it as an uncaught exception, prints a traceback, and
-exits 1 — not the declared code.
+Two design rules follow from this tree:
 
-``SystemExit`` is the exception ``sys.exit`` actually expects. The
-handler raises it directly, so the process exits with the correct
-code, no traceback.
+* **Exit codes are inherited and rarely overridden.** ``DiscoveryError``
+  and ``BlueprintError`` both resolve to 2 because "we could not load
+  the blueprint you asked for" is the same user-facing problem whether
+  the loader rejected it or discovery could not find it. Two exit codes
+  for the same recovery would confuse scripts.
 
-See ``docs/adr/0005-stabilize-exit-codes-as-a-public-contract.md``
-for the full reasoning.
-
-Dual-mode input handling (create command)
------------------------------------------
-The ``create`` command supports two input modes: interactive (a
-wizard that asks the user questions) and non-interactive (flags and
-defaults, suitable for CI). Two failure modes exist *only* when both
-modes are supported, and both are represented here as
-``UserInputError`` subclasses:
-
-- ``MissingRequiredFlagsError`` — non-interactive mode, one or more
-  required flags absent. Aggregates *all* missing flags into a single
-  message so the caller fixes everything in one pass instead of a
-  one-error-at-a-time loop.
-- ``PromptCancelledError`` — interactive mode, the user pressed
-  Ctrl+C or sent EOF at a prompt. Treated as a clean, non-buggy exit.
-
-Both inherit ``ExitCode.USER_ERROR`` (1). They are *not* given their
-own exit codes because doing so would be a breaking change to the
-public contract (ADR-0005) — and conceptually, both are "the user
-needs to do something differently," which is exactly what code 1
-means.
-
-Schema validation (blueprint documents)
----------------------------------------
-Two failure types describe "the blueprint document does not match
-the canonical schema":
-
-- ``SchemaValidationError`` — raised by
-  ``forge.verification.validate_blueprint_document`` when the parsed
-  document fails *JSON Schema* validation (ADR-0007). This is the
-  authoritative rejection: the schema is the referee, so if it
-  refuses the document, that is the failure surfaced.
-- ``ModelValidationError`` — raised by the *same* function only when
-  the schema accepts the document but the generated Pydantic
-  projection rejects it (ADR-0008). This indicates a **parity
-  regression** between the schema and the models, not bad user
-  input; the message says so explicitly and points contributors at
-  ``make models-check``.
-
-Both carry *structured* error paths — a tuple of
-``(json_pointer, message)`` pairs, with pointers following RFC 6901.
-That makes them consumable by three audiences without string
-parsing:
-
-- **Humans** — ``__str__`` renders one bullet per violation.
-- **Scripts** — iterate ``exc.errors`` directly and branch on the
-  pointer, not the prose.
-- **Tests** — assert ``("/id", ...)`` is in ``exc.errors`` rather
-  than regex-matching a message that may be reworded tomorrow.
-
-They share a common base, ``StructuredError``, so handlers can catch
-either without repeating the ``(errors)`` accessor contract. The
-base is deliberately not part of the public ``__all__``; callers
-should catch the concrete subclasses they can act on.
-
-Exit codes for schema vs. model failures
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- ``SchemaValidationError`` → ``ExitCode.USER_ERROR`` (1). A
-  malformed blueprint shipped by the *user* is a user error; a
-  malformed schema shipped by *Forge itself* is a packaging bug and
-  is caught earlier (during schema construction) as an
-  ``INTERNAL_ERROR``. The distinction is preserved by construction:
-  the schema-construction path never routes through
-  ``SchemaValidationError``.
-- ``ModelValidationError`` → ``ExitCode.INTERNAL_ERROR`` (5). A
-  schema-valid document that the model rejects is a **Forge bug** —
-  the user did nothing wrong. Reporting it as a user error would
-  send them chasing a mistake they did not make. Exit 5 is the
-  documented "report this" signal, and it is the honest answer here.
+* **``StructuredError`` breaks the base's exit code on purpose.** Its
+  subclasses carry *structured* violations rather than a message; the
+  exit code depends on whether the violation is the user's fault
+  (schema → 1) or Forge's fault (model → 5). The subclass override is
+  load-bearing, not decorative.
 
 Mutable structured errors, not frozen dataclasses
 -------------------------------------------------
-``StructuredError`` and its subclasses are **plain dataclasses**
-(``slots=True`` only — no ``frozen=True``). This is deliberate.
+``MissingRequiredFlagsError``, ``PromptCancelledError``,
+``MalformedBlueprintError``, ``StructuredError``,
+``SchemaValidationError``, and ``ModelValidationError`` are **plain
+dataclasses** (``slots=True`` only — no ``frozen=True``). This is
+deliberate.
 
 Python's exception machinery requires ``__traceback__`` to be a
 settable attribute: ``contextlib``, ``unittest``, and every
 traceback-preserving library set it after catching. A frozen
 dataclass forbids that assignment, so catching a ``frozen`` exception
-inside a ``with`` block triggers
+inside a ``with`` block triggers::
 
     TypeError: super(type, obj): obj must be an instance or subtype of type
 
-from ``contextlib.__exit__`` when it tries to reattach the
-traceback. That is a Python-version-specific landmine (the exact
-line moved between 3.11 and 3.12) and it is *not* a bug in the
-calling code — it is the price of combining ``frozen=True`` with
+from ``contextlib.__exit__`` when it tries to reattach the traceback.
+That is a Python-version-specific landmine and it is *not* a bug in
+the calling code — it is the price of combining ``frozen=True`` with
 ``Exception``.
 
-The "value object" property that ``frozen=True`` would provide is
-not worth that cost. Exceptions are *events*, not values: their
-identity is their traceback, not their fields. Mutating a caught
-error's ``errors`` tuple is a code smell, but it is the same code
-smell as mutating any caught exception's ``args`` — not something
-the type system needs to prevent at the cost of breaking traceback
-preservation.
+The "value object" property that ``frozen=True`` would provide is not
+worth that cost. Exceptions are *events*, not values: their identity
+is their traceback, not their fields. ``slots=True`` is kept because
+it reduces per-instance memory without interfering with exception
+machinery.
 
-``slots=True`` is kept. It reduces the per-instance memory footprint
-without interfering with exception machinery, and structured errors
-can be constructed hundreds of times per CI run.
+The ``hint`` field on dataclass subclasses
+------------------------------------------
+``hint`` is a **field** with a default on
+``MissingRequiredFlagsError`` and ``PromptCancelledError``, not a
+class attribute. This is load-bearing: the dataclass-generated
+``__init__`` accepts only declared fields, so a class attribute
+``hint = "..."`` would silently reject the ``hint="..."`` keyword
+that ``ForgeError.__init__`` documents as public API. Declaring it
+as a field with a default:
+
+* Accepts the keyword override (public API contract preserved).
+* Preserves the class-level default behaviour (a caller who omits
+  ``hint`` still gets the remediation line).
+* Keeps the dataclass ``__init__`` signature self-documenting.
+
+For subclasses that do not need per-instance hint overrides
+(``MalformedBlueprintError``, ``StructuredError`` and its concrete
+subclasses), ``hint`` stays a class attribute. That is correct: a
+caller who wants to override those hints is outside the current
+contract, and adding a field would widen the surface without a
+use case.
 
 Stability
 ---------
@@ -210,32 +148,28 @@ version bump:
 
 - The ``ExitCode`` values (``0`` through ``5``).
 - The ``ForgeError`` attributes (``exit_code``, ``hint``).
-- The subclass names (``UserInputError``, ``BlueprintError``,
-  ``FilesystemConflictError``, ``VerificationError``,
-  ``SchemaValidationError``, ``ModelValidationError``).
+- The subclass names in ``__all__``.
 - The constructor signature
   (``message: str, *, hint: str | None = None``) for message-only
   subclasses.
+- The dual-mode constructor signatures:
+  ``MissingRequiredFlagsError(command, missing, *, hint=None)`` and
+  ``PromptCancelledError(prompt=None, *, hint=None)``. ``hint`` is
+  keyword-only for both; positional ``hint`` arguments are not part
+  of the contract.
 - The structured-error constructor signature
   (``source: str, errors: tuple[tuple[str, str], ...]``).
 - The ``.errors`` attribute shape on structured errors
   (``tuple[tuple[str, str], ...]``).
 
-Adding a new subclass is a non-breaking change. Removing or
-renaming one is breaking. Adding a new attribute to ``ForgeError``
-is non-breaking (as long as it has a default). Removing one is
-breaking.
-
-The ``MissingRequiredFlagsError``, ``PromptCancelledError``,
-``SchemaValidationError``, and ``ModelValidationError`` subclasses
-are covered by the same stability guarantees as the four original
-subclasses.
+Adding a new subclass is non-breaking. Removing or renaming one is
+breaking. Adding a new attribute to ``ForgeError`` is non-breaking
+(as long as it has a default). Removing one is breaking.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 
@@ -247,21 +181,13 @@ class ExitCode(IntEnum):
 
     Each member maps to a distinct failure mode. The codes are
     **stable within a minor version**; changing them requires a major
-    version bump. See the module docstring for the full table and the
-    severity rule.
+    version bump.
 
     ``IntEnum`` is used (rather than ``Enum``) so the values compare
-    equal to plain integers. This matters for two reasons:
-
-    1. ``sys.exit(ExitCode.SUCCESS)`` works — Python's ``sys.exit``
-       accepts an int or ``None``, and an ``IntEnum`` member *is* an
-       ``int``.
-    2. ``result.exit_code == 0`` works in tests — pytest's
-       ``CliRunner`` returns a plain ``int``, and comparing an
-       ``IntEnum`` member to an ``int`` is well-defined.
-
-    With a plain ``Enum``, both of those would require an explicit
-    ``.value`` access, which is easy to forget.
+    equal to plain integers. ``sys.exit(ExitCode.SUCCESS)`` works, and
+    ``result.exit_code == 0`` works in tests — with a plain ``Enum``,
+    both would require an explicit ``.value`` access that is easy to
+    forget.
     """
 
     SUCCESS = 0
@@ -286,19 +212,15 @@ class ForgeError(Exception):
     is a valid exception for cases that do not fit one of the
     subclasses yet — it defaults to ``ExitCode.INTERNAL_ERROR``
     (exit 5), which is the correct code for "we did not anticipate
-    this failure mode." When a new failure mode is recognized, add a
-    subclass with a more specific exit code.
+    this failure mode."
 
     Attributes:
-        exit_code: The shell exit code to use when this error is the
-            reason the process exits. **Class-level** — subclasses
-            override it (e.g., ``exit_code = ExitCode.USER_ERROR``).
-            Read by ``forge.cli.errors.handle_exception``.
-        hint: Optional remediation hint shown to the user.
-            **Instance-level** — set via the constructor. ``None``
+        exit_code: **Class-level.** Subclasses override it
+            (e.g., ``exit_code = ExitCode.USER_ERROR``). Read by
+            ``forge.cli.errors.handle_exception``.
+        hint: **Instance-level.** Set via the constructor. ``None``
             means "no hint." A subclass may set a class-level default
-            hint, but the constructor's ``hint=None`` does not
-            clobber it (see ``__init__`` below).
+            hint; the constructor's ``hint=None`` does not clobber it.
     """
 
     exit_code: ExitCode = ExitCode.INTERNAL_ERROR
@@ -310,70 +232,39 @@ class ForgeError(Exception):
         Args:
             message: A one-line description of what went wrong.
                 Rendered as the first line of the error output.
-                Should be imperative and actionable ("project name
-                is required"), not vague ("an error occurred").
-            hint: An optional one-line remediation suggestion.
-                Rendered on a separate, dimmed line. Should tell the
-                user *what to do next* ("pass --name my-project"),
-                not what they did wrong (the message already says
-                that).
+                Should be imperative and actionable
+                ("project name is required"), not vague
+                ("an error occurred").
+            hint: An optional one-line remediation suggestion. Should
+                tell the user *what to do next* ("pass --name
+                my-project"), not what they did wrong (the message
+                already says that).
 
-        The ``hint`` parameter is keyword-only (``*``) to prevent the
-        common mistake of passing it positionally:
-        ``ForgeError("msg", "hint")`` — which would silently pass the
-        hint as a positional argument and be rejected. Keyword-only
-        forces ``ForgeError("msg", hint="hint")``, which is
-        self-documenting.
+        ``hint`` is keyword-only to prevent the common mistake of
+        passing it positionally.
         """
         super().__init__(message)
         # Only assign if the caller actually passed a hint. This keeps
-        # the class-level default (``None``) in place when the caller
-        # does not pass one, so ``is None`` checks and ``if exc.hint:``
-        # both work correctly. If we assigned unconditionally, a
-        # subclass that set a class-level default hint would be
+        # a class-level default hint in place when the caller does not
+        # pass one — a subclass that sets a default would otherwise be
         # clobbered by ``None``.
         if hint is not None:
             self.hint = hint
 
 
 # -----------------------------------------------------------------------------
-# Subclasses
+# Message-only subclasses
 # -----------------------------------------------------------------------------
-# Each subclass declares a distinct exit code. The handler dispatches
-# on the type; it does not parse the message. Adding a subclass is the
-# only supported way to add a new exit code.
-#
-# Each subclass docstring follows the same structure:
-#
-# - **Exit code:** the code it declares, and the enum member it uses.
-# - **When raised:** the failures that produce this subclass.
-# - **What the user should do:** the remediation, in one sentence.
-# - **Examples:** concrete commands that would raise it.
-#
-# The structure is deliberate: a reader can scan the four labels
-# without reading prose, and a contributor adding a new subclass has
-# a template to copy.
 class UserInputError(ForgeError):
     """Invalid input from the user.
 
     **Exit code:** ``ExitCode.USER_ERROR`` (1).
 
-    **When raised:** A missing required flag, an invalid value for a
-    flag (e.g., a project name that does not match the pattern), a
-    cancellation initiated by the user (Ctrl+C is handled separately
-    by the handler, but a "user said no" prompt rejection is a
-    ``UserInputError``).
+    **When raised:** A missing required flag, an invalid value, a
+    "user said no" prompt rejection.
 
     **What the user should do:** Re-run the command with valid input.
-    The message and hint will tell them what is wrong and how to fix
-    it.
-
-    **Examples:**
-
-    - ``forge create python.fastapi.api`` without ``--name``.
-    - ``forge create python.fastapi.api --name "My Project"``
-      (uppercase and spaces).
-    - A ``--path`` that does not exist.
+    The message and hint say what is wrong and how to fix it.
     """
 
     exit_code = ExitCode.USER_ERROR
@@ -385,21 +276,38 @@ class BlueprintError(ForgeError):
     **Exit code:** ``ExitCode.BLUEPRINT_ERROR`` (2).
 
     **When raised:** The requested blueprint ID is not in the
-    registry, the blueprint's ``blueprint.yaml`` does not validate
-    against the schema, the blueprint's ``min_forge_version`` is
-    newer than the installed Forge.
+    catalogue, the manifest does not validate against the schema, or
+    the blueprint's ``min_forge_version`` is newer than the installed
+    Forge.
 
-    **What the user should do:** Choose a different blueprint,
-    upgrade Forge, or fix the blueprint. The hint will tell them
-    which.
-
-    **Examples:**
-
-    - ``forge create nonexistent.blueprint --name my-api``.
-    - ``forge create python.fastapi.api --name my-api`` when the
-      blueprint requires Forge 2.0.0 but 1.0.0 is installed.
+    **What the user should do:** Choose a different blueprint, upgrade
+    Forge, or fix the blueprint. The hint tells them which.
     """
 
+    exit_code = ExitCode.BLUEPRINT_ERROR
+
+
+class DiscoveryError(ForgeError):
+    """Blueprint discovery could not satisfy a lookup.
+
+    **Exit code:** ``ExitCode.BLUEPRINT_ERROR`` (2), inherited. Two
+    exit codes for "the blueprint you asked for cannot be loaded"
+    would confuse scripts: whether the loader rejected the manifest
+    or discovery could not find it, the recovery is the same (choose
+    a different blueprint, or fix the local one).
+
+    **When raised:** ``BlueprintDiscoveryService.load(id)`` when no
+    source yields a blueprint with the requested id.
+
+    **What the user should do:** Run ``forge list`` to see available
+    blueprints, or fix the local override that shadowed the requested
+    id.
+    """
+
+    # Deliberately redeclared rather than inherited from a nonexistent
+    # intermediate: the parent is ``ForgeError`` (which defaults to
+    # INTERNAL_ERROR), so we must be explicit here — silently
+    # inheriting INTERNAL_ERROR would be a real bug.
     exit_code = ExitCode.BLUEPRINT_ERROR
 
 
@@ -410,19 +318,10 @@ class FilesystemConflictError(ForgeError):
 
     **When raised:** The target directory already exists and
     ``--overwrite`` was not passed; a template path escapes the
-    staging directory; a permission error prevents writing to the
-    target.
+    staging directory; a permission error prevents writing.
 
     **What the user should do:** Choose a different ``--output``,
-    pass ``--overwrite`` (if they are certain), or fix permissions.
-    The hint will tell them which.
-
-    **Examples:**
-
-    - ``forge create python.fastapi.api --name my-api`` when
-      ``./my-api`` already exists.
-    - ``forge create ... --output /root`` when the user does not
-      have write permission on ``/root``.
+    pass ``--overwrite`` (if certain), or fix permissions.
     """
 
     exit_code = ExitCode.FILESYSTEM_CONFLICT
@@ -437,13 +336,7 @@ class VerificationError(ForgeError):
     fails, the linter reports errors, the Docker build fails.
 
     **What the user should do:** Address the failed checks. The hint
-    will tell them which check failed and how to inspect the
-    diagnostic (e.g., ``forge verify --check tests``).
-
-    **Examples:**
-
-    - ``forge verify`` after the tests fail.
-    - ``forge verify --check lint`` when ``ruff`` reports errors.
+    tells them which check failed and how to inspect the diagnostic.
     """
 
     exit_code = ExitCode.VERIFICATION_FAILED
@@ -454,154 +347,180 @@ class VerificationError(ForgeError):
 # -----------------------------------------------------------------------------
 # These subclasses exist specifically to give the interactive and
 # non-interactive paths of the ``create`` command distinct, testable
-# failure types. They both map to ``ExitCode.USER_ERROR`` (1) because
-# the user can resolve both without help — one by passing flags, the
-# other by re-running the wizard.
+# failure types. Both map to ``ExitCode.USER_ERROR`` (1) because the
+# user can resolve both without help — one by passing flags, the other
+# by re-running the wizard.
 #
 # Keeping them as separate types (rather than raising bare
 # ``UserInputError``) is not cosmetic: the CLI error handler can render
 # each with a mode-appropriate hint, and tests can assert on the
-# specific failure path (``pytest.raises(MissingRequiredFlagsError)``)
-# rather than string-matching a message. That's the difference between
-# a contract and a suggestion.
+# specific failure path rather than string-matching a message. That is
+# the difference between a contract and a suggestion.
+#
+# Field ordering note
+# -------------------
+# Both classes declare ``hint`` as a dataclass field with a default.
+# Dataclass requires fields with defaults to appear *after* fields
+# without, so ``hint`` is always last. This ordering also reads
+# naturally: the primary arguments first, the optional override last.
+# The keyword-only marker in the docstrings reflects how callers
+# should use it, even though dataclasses do not enforce keyword-only
+# by default. Callers who pass it positionally get a working call —
+# that is a deliberate concession to dataclass mechanics, not a
+# contract decision; the documented signature uses ``*``.
+@dataclass(slots=True)
 class MissingRequiredFlagsError(UserInputError):
     """Non-interactive mode: required flags were not supplied.
 
-    **Exit code:** ``ExitCode.USER_ERROR`` (1), inherited from
-    ``UserInputError``.
+    **Exit code:** ``ExitCode.USER_ERROR`` (1), inherited.
 
     **When raised:** ``forge create`` is run without a TTY (stdin is
     not a terminal) and one or more required flags are absent.
-    Non-interactive mode cannot prompt, so the only correct behavior
-    is to fail fast and explain.
 
     **What the user should do:** Pass the missing flags, or re-run in
-    an interactive terminal. The message lists *every* missing flag,
-    not just the first one found, so the caller fixes everything in a
-    single edit instead of a painful one-error-at-a-time loop.
-
-    **Examples:**
-
-    - ``forge create python.fastapi.api --no-interactive``
-      (missing ``--name``).
-    - ``echo "" | forge create`` (stdin is a pipe, not a TTY; all
-      required flags missing).
+    an interactive terminal. The message lists *every* missing flag
+    so the caller fixes everything in a single edit.
 
     Attributes:
-        command: The command name (e.g., ``"create"``). Used in the
-            error message and by callers that want to add
-            command-specific guidance.
+        command: The command name (e.g., ``"create"``).
         missing: The missing flag names, without the ``--`` prefix,
-            in stable declaration order. Stored as a tuple so the
-            instance stays hashable and immutable — a caught error
-            should not be mutable state.
+            in stable declaration order. Materialized to a tuple in
+            ``__post_init__``.
+        hint: A one-line remediation suggestion. Defaults to the
+            class-level value ("Pass the missing flags, or re-run in
+            an interactive terminal."). Raisers with better context
+            may override it.
     """
 
-    # Class-level hint so the user always sees a remediation line,
-    # even when the raiser does not pass one. The constructor's
-    # ``hint=None`` default will not clobber this (see ForgeError.__init__).
-    hint = "Pass the missing flags, or re-run in an interactive terminal."
+    command: str
+    missing: tuple[str, ...]
+    hint: str | None = field(
+        default="Pass the missing flags, or re-run in an interactive terminal."
+    )
 
-    def __init__(
-        self,
-        command: str,
-        missing: Sequence[str],
-        *,
-        hint: str | None = None,
-    ) -> None:
-        """Initialize the error with the aggregate list of missing flags.
+    def __post_init__(self) -> None:
+        """Normalise ``missing`` and initialise ``Exception.args``.
 
-        Args:
-            command: The command name (e.g., ``"create"``). Rendered
-                in the message so the user knows which command needs
-                fixing.
-            missing: The missing flag names, without the ``--``
-                prefix. Passed as any sequence so callers can
-                forward a list comprehension directly; normalized to
-                an immutable tuple here so the instance is safe to
-                pass across threads and store in test fixtures.
-            hint: Override the default hint. Most callers should not
-                pass this — the class-level hint is already correct
-                for every known caller.
+        Two responsibilities, both load-bearing:
 
-        The ``missing`` parameter is positional-only in spirit (no
-        keyword marker before it) because constructing the error is
-        always a two-argument operation: ``(command, missing)``. The
-        ``hint`` is keyword-only for the same reason as in
-        ``ForgeError``.
+        1. **Normalise ``missing`` to a tuple.** The public type is
+           ``tuple[str, ...]``, but callers habitually pass a list
+           comprehension or a generator. Materializing here makes the
+           attribute safe to read in handlers, loggers, and tests. A
+           generator passed directly would be consumed once, which is
+           a subtle footgun the dataclass cannot express in its type.
+
+        2. **Compose the message and feed it to ``Exception.args``.**
+           Dataclasses generate ``__init__`` for us, so the base
+           ``Exception.__init__`` is never called on the normal path.
+           Without this, ``str(exc)`` would return an empty string and
+           pickle round-trips would lose the message.
+
+        The message is built *after* normalisation so it reflects the
+        canonical tuple, not the caller's input — a caller that passed
+        a duplicate flag gets one rendered instance, not two.
         """
-        # Normalize to a tuple so the public attribute is stable.
-        # A caller that passes a generator (e.g., ``(f for f in ...)``)
-        # would otherwise be able to consume it exactly once, which is
-        # a subtle footgun. Materializing here makes the attribute
-        # safe to read in error handlers, loggers, and tests.
-        self.command = command
-        self.missing: tuple[str, ...] = tuple(missing)
+        self.missing = tuple(self.missing)
 
-        # Render the flags with the ``--`` prefix and join with
-        # commas so the message is copy-pasteable. Using ", " as the
-        # separator (rather than "and") keeps the message short even
-        # with many missing flags and reads naturally in CI logs.
         formatted = ", ".join(f"--{flag}" for flag in self.missing)
         message = f"Missing required option(s) for non-interactive mode: " f"{formatted}."
+        Exception.__init__(self, message)
 
-        super().__init__(message, hint=hint)
 
-
+@dataclass(slots=True)
 class PromptCancelledError(UserInputError):
     """Interactive mode: the user aborted a prompt.
 
-    **Exit code:** ``ExitCode.USER_ERROR`` (1), inherited from
-    ``UserInputError``.
+    **Exit code:** ``ExitCode.USER_ERROR`` (1), inherited.
 
     **When raised:** The user pressed Ctrl+C or sent EOF at a
-    questionary prompt. This is a *clean* cancellation, not a bug:
-    the user exercised their right to stop, so the process should
-    exit quietly with a short message and no traceback.
+    questionary prompt. This is a *clean* cancellation: the process
+    should exit quietly with a short message and no traceback.
 
     **What the user should do:** Re-run the command when ready. The
     hint reminds them that ``--no-interactive`` plus flags is
     available if they prefer.
 
-    **Examples:**
-
-    - ``forge create python.fastapi.api`` (interactive), user hits
-      Ctrl+C at the project-name prompt.
-
     Attributes:
         prompt: The prompt message that was interrupted, if known.
-            Included in the error message so the user can see *where*
-            they cancelled, which matters for multi-step wizards.
-            ``None`` means "the interruption happened at a step we
-            cannot identify" (e.g., between prompts).
+            Included in the message so the user can see *where* they
+            cancelled. ``None`` means "cannot identify the step."
+        hint: A one-line remediation suggestion. Defaults to the
+            class-level value ("Re-run when ready, or use
+            --no-interactive ..."). Raisers with better context may
+            override it.
     """
 
-    hint = "Re-run when ready, or use --no-interactive with explicit flags " "for scriptable usage."
+    prompt: str | None = None
+    hint: str | None = field(
+        default=(
+            "Re-run when ready, or use --no-interactive with explicit "
+            "flags for scriptable usage."
+        )
+    )
 
-    def __init__(
-        self,
-        prompt: str | None = None,
-        *,
-        hint: str | None = None,
-    ) -> None:
-        """Initialize the cancellation error.
+    def __post_init__(self) -> None:
+        """Compose the message and initialise ``Exception.args``.
 
-        Args:
-            prompt: The prompt message that was interrupted. Optional
-                because the interruption may occur between prompts
-                (e.g., during a select menu that has no single
-                message). When provided, the message includes it so
-                the user knows which step they stopped at.
-            hint: Override the default hint. Most callers should not
-                pass this — the class-level hint already covers both
-                "re-run" and "switch to non-interactive."
+        The message varies based on whether ``prompt`` is provided:
+        with a prompt, it names the step; without, it stays generic.
+        Both forms end in "cancelled by user" so log scrapers and
+        tests keying on that phrase work uniformly.
         """
-        self.prompt = prompt
-        if prompt:
-            message = f"Interactive prompt cancelled by user at '{prompt}'."
+        if self.prompt:
+            message = f"Interactive prompt cancelled by user at " f"'{self.prompt}'."
         else:
             message = "Interactive prompt cancelled by user."
-        super().__init__(message, hint=hint)
+        Exception.__init__(self, message)
+
+
+# -----------------------------------------------------------------------------
+# Discovery-specific structured subclass
+# -----------------------------------------------------------------------------
+@dataclass(slots=True)
+class MalformedBlueprintError(DiscoveryError):
+    """A candidate blueprint could not be parsed or validated.
+
+    **Exit code:** ``ExitCode.BLUEPRINT_ERROR`` (2), inherited from
+    ``DiscoveryError``.
+
+    **When raised:** ``forge.discovery.resolver._parse`` when a
+    candidate file is unreadable, is invalid YAML, is not a mapping at
+    the document root, fails schema validation, or fails model
+    validation. The resolver catches this error and skips the
+    candidate with a warning; it is almost never seen by end users
+    directly — that is, until *every* candidate for a requested id is
+    malformed, at which point the aggregate surfaces as
+    ``DiscoveryError`` from ``load()``.
+
+    **What the user should do:** Fix the named file. The ``reason``
+    string carries the underlying failure so the message is
+    self-contained; no separate logging lookup is needed.
+
+    Attributes:
+        source_label: The candidate's provenance label, in the
+            resolver's format (e.g.,
+            ``"local:/home/u/.forge/blueprints/x/blueprint.yaml"``).
+            Lets the user find the offending file directly.
+        reason: The underlying failure, in human-readable form. May
+            embed a nested exception's ``__str__``; that is
+            intentional, because the wrap preserves the causal chain
+            while keeping the field greppable.
+    """
+
+    source_label: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        """Compose ``<label>: <reason>`` and set ``Exception.args``.
+
+        The format is stable and parseable: tests assert on the label
+        prefix to verify *which* candidate was skipped, and on the
+        reason substring to verify *why*. Keeping the two components
+        as separate fields means the assertion does not depend on the
+        message template, which may change independently.
+        """
+        Exception.__init__(self, f"{self.source_label}: {self.reason}")
 
 
 # -----------------------------------------------------------------------------
@@ -609,64 +528,26 @@ class PromptCancelledError(UserInputError):
 # -----------------------------------------------------------------------------
 # Unlike every other subclass in this module, the two errors below are
 # not message-only: they carry a tuple of ``(json_pointer, message)``
-# pairs so callers can *act* on violations without parsing prose. The
-# decision to give them a distinct shape was deliberate — they are the
-# sole failure types of the document validator, and that validator is
-# called from CI, from the loader, and from tests. Each of those
-# audiences wants to enumerate violations, not read a paragraph.
+# pairs so callers can *act* on violations without parsing prose. They
+# share a base, ``StructuredError``, so the ``.errors`` accessor
+# contract is documented once and the CLI handler can render both
+# uniformly.
 #
-# They share a base, ``StructuredError``, so that:
-#   * The ``.errors`` accessor contract is documented once.
-#   * A future third structured error is not tempted to redefine the
-#     shape differently (which would fragment the handler).
-#   * The CLI handler can catch ``StructuredError`` to render
-#     violations uniformly, then fall back to ``ForgeError`` for the
-#     rest.
-#
-# Why a plain dataclass (``slots=True`` but NOT ``frozen=True``):
-# * **Exception machinery owns ``__traceback__``.** ``contextlib``,
-#   ``unittest``, ``traceback.print_exc``, and every framework that
-#   preserves tracebacks assigns to ``exc.__traceback__`` after
-#   catching. A frozen dataclass forbids that assignment, so
-#   catching a frozen exception inside a ``with`` block raises
-#   ``TypeError: super(type, obj): obj must be an instance or
-#   subtype of type`` from ``contextlib.__exit__`` — a
-#   Python-version-specific failure that has nothing to do with the
-#   calling code. The failure appeared in this project's test suite
-#   the first time a ``SchemaValidationError`` was caught by a
-#   ``pytest.raises`` context manager. It is not fixable from the
-#   caller's side; it is the price of ``frozen=True`` on an
-#   ``Exception``.
-# * **The value-object property was oversold.** ``frozen=True``
-#   gives hashability and immutability, which are useful for
-#   *values* — but an exception's identity is its traceback, not its
-#   fields. Two identical ``SchemaValidationError`` instances from
-#   two different call sites are genuinely *not* the same failure;
-#   the source location is part of the meaning. Hashability on an
-#   exception is closer to a bug than a feature.
-# * **``slots=True`` still pays off.** It reduces per-instance
-#   memory without interfering with exception machinery, and
-#   structured errors can be constructed hundreds of times per CI
-#   run.
-#
-# Why the base is *not* exported in ``__all__``:
-# * The two concrete subclasses are the vocabulary. Callers should
-#   catch the specific one they can act on (schema → user error;
-#   model → report a bug). ``StructuredError`` exists for the handler
-#   to share rendering code and is documented here as the common
-#   ancestor, but it is not a supported catch target.
+# Why the base is *not* exported in ``__all__``: the two concrete
+# subclasses are the vocabulary. Callers should catch the specific one
+# they can act on (schema → fix the blueprint; model → report a bug).
+# ``StructuredError`` exists for the handler to share rendering code.
 @dataclass(slots=True)
 class StructuredError(ForgeError):
     """Base for errors carrying RFC 6901 JSON-Pointer-tagged violations.
 
-    Not part of the public surface (see module docstring). Subclass to
-    give a specific failure mode its own exit code and message while
-    keeping the ``.errors`` shape uniform.
+    Not part of the public surface. Subclass to give a specific
+    failure mode its own exit code and message while keeping the
+    ``.errors`` shape uniform.
 
     Deliberately *not* frozen: Python's exception machinery assigns to
     ``__traceback__`` after catching, and a frozen dataclass forbids
-    that assignment. See the block comment above this class for the
-    full reasoning.
+    that assignment (see module docstring).
 
     Attributes:
         source: A caller-supplied label (usually a file path) used to
@@ -674,52 +555,28 @@ class StructuredError(ForgeError):
         errors: A tuple of ``(json_pointer, message)`` pairs, sorted
             by pointer for deterministic output. Empty pointers
             (``""``) refer to the document root. Pointers follow
-            RFC 6901 (``~`` → ``~0``, ``/`` → ``~1``).
+            RFC 6901.
     """
 
-    # The exit code is *class-level*, not a dataclass field — this is
-    # load-bearing. ``ForgeError`` declares
-    # ``exit_code = ExitCode.INTERNAL_ERROR`` as its default; if a
-    # subclass does not override it, failures silently report as an
-    # internal error (exit 5) instead of the intended code. The bug is
-    # invisible at the call site (``raise XError(...)`` works either
-    # way) and only surfaces at the CLI boundary, where
-    # ``handle_exception`` dispatches on ``exc.exit_code`` — a
-    # ``match`` statement that would fall through to the wrong branch.
-    #
-    # Because ``exit_code`` is *not* annotated with a type, the
-    # dataclass machinery does not treat it as a field: it stays a
-    # plain class attribute, is inherited by instances via normal
-    # attribute lookup, and is not part of the generated ``__init__``
-    # signature. Callers therefore cannot override the exit code at
-    # construction time — which is correct: the exit code is a
-    # *contract*, not a parameter.
+    # Exit code is class-level, not a dataclass field, because it is a
+    # *contract* (subclasses override to give meaning), not a
+    # per-instance parameter. This distinction is load-bearing: if it
+    # were a field, callers could pass ``exit_code=0`` and bypass the
+    # contract silently.
     exit_code = ExitCode.INTERNAL_ERROR
 
     source: str
     errors: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
-        """Initialize ``Exception.args`` so ``str()`` and pickling work.
+        """Initialise ``Exception.args`` so ``str()`` and pickling work.
 
         ``Exception.__init__`` is normally called in ``__init__``, but
         a dataclass generates ``__init__`` for us. We call the base
         initializer here with the message that ``__str__`` will
         render, so ``repr(exc)`` and pickle round-trips behave as
         callers expect from an exception.
-
-        Why not ``object.__setattr__`` inside ``__init__``? Because
-        the dataclass fields (``source``, ``errors``) are the state;
-        ``Exception.args`` is a *derived* view, not state. Computing
-        it once in ``__post_init__`` is the idiomatic way to bridge
-        the two worlds.
         """
-        # ``Exception.__init__`` assigns ``self.args``. Even though
-        # the dataclass declares ``slots=True``, ``Exception.args``
-        # is a slot on ``BaseException``, not on this dataclass, so
-        # the assignment goes through ``BaseException.__init__``
-        # cleanly. This is the documented way to mix dataclasses with
-        # Exception.
         Exception.__init__(self, self.__str__())
 
     def __str__(self) -> str:
@@ -727,12 +584,10 @@ class StructuredError(ForgeError):
 
         Two audiences are served by the same string:
 
-        * Humans reading a terminal see ``• /variables/0/type: 'integer'
-          is not one of ['string', 'boolean', 'enum']``.
+        * Humans see ``• /variables/0/type: ...``.
         * Log scrapers keyed on the leading ``•`` can split on it.
 
         Scripts should use ``errors`` directly, not parse this string.
-        The message format is stable but not contractual.
         """
         if not self.errors:
             return f"Blueprint '{self.source}' failed validation."
@@ -743,48 +598,34 @@ class StructuredError(ForgeError):
         return "\n".join(lines)
 
 
+@dataclass(slots=True)
 class SchemaValidationError(StructuredError):
     """A blueprint document did not conform to the bundled JSON Schema.
 
-    **Exit code:** ``ExitCode.USER_ERROR`` (1). A blueprint that the
-    user authored and shipped invalidly is a user error. A schema that
-    Forge itself ships brokenly is caught earlier, during validator
-    construction, and propagates as a plain ``jsonschema`` exception
-    with the ``INTERNAL_ERROR`` exit code — the two failure modes are
-    distinguished by construction, not by string matching.
+    **Exit code:** ``ExitCode.USER_ERROR`` (1). A blueprint the user
+    authored and shipped invalidly is a user error. A broken *bundled*
+    schema is a packaging bug caught earlier, at validator
+    construction — the two failure modes are distinguished by
+    construction, not by string matching.
 
     **When raised:**
-    ``forge.verification.validate_blueprint_document`` when the parsed
-    document does not conform to the schema. Also raised by any future
-    importer that routes through that function — which is every
-    importer, by design.
+    ``forge.verification.validate_blueprint_document`` when the
+    parsed document does not conform to the schema.
 
     **What the user should do:** Fix the reported violations. The
     ``errors`` tuple names every offending JSON Pointer; the hint
     points at ``SCHEMA_REFERENCE.md`` for field-level guidance.
-
-    **Examples:**
-
-    - A blueprint missing ``id``.
-    - A blueprint with an unknown top-level field.
-    - A blueprint whose ``version`` is ``1.0`` rather than ``1.0.0``.
-    - A blueprint whose variable declares ``type: integer``.
     """
 
-    # Inherit the dataclass shape from StructuredError; override only
-    # the exit code and hint. ``dataclass`` is not re-applied: the
-    # parent already generated ``__init__``, ``__eq__``, and
-    # ``__slots__``. Re-decorating here would double-register the
-    # fields and, because both parents declare ``exit_code`` as a
-    # *non-field* class attribute, the child override would still win
-    # — but it would also re-run the dataclass machinery against an
-    # already-slotted base, which is fragile across Python versions.
-    # The class attribute alone is the correct, minimal override.
+    # Override the base's exit code and hint. Both are class-level
+    # because they are contract, not state. Overriding via a field
+    # here would widen the constructor signature without a current
+    # use case; the class-attribute form is intentional.
     exit_code = ExitCode.USER_ERROR
     hint = "See docs/reference/SCHEMA_REFERENCE.md for field-level guidance."
 
     def __str__(self) -> str:
-        """Render with a "schema validation" prefix for disambiguation.
+        """Render with a "schema validation" prefix.
 
         The base ``StructuredError.__str__`` says "failed validation",
         which is correct for both subclasses but does not tell the
@@ -801,45 +642,29 @@ class SchemaValidationError(StructuredError):
         return "\n".join(lines)
 
 
+@dataclass(slots=True)
 class ModelValidationError(StructuredError):
     """A schema-valid blueprint document failed Pydantic validation.
 
-    **Exit code:** ``ExitCode.INTERNAL_ERROR`` (5). This is deliberate
-    and load-bearing: a document that satisfies the canonical schema
-    but is rejected by the generated Pydantic models is a **Forge
-    bug**, not a user mistake. The two engines are required to agree
-    (ADR-0008), enforced by a Hypothesis parity test and by
-    ``make models-check``. If this error is raised, that enforcement
-    has failed somewhere, and the user needs to report it rather than
-    chase a phantom input error.
+    **Exit code:** ``ExitCode.INTERNAL_ERROR`` (5). A document that
+    satisfies the canonical schema but is rejected by the generated
+    Pydantic models is a **Forge bug**, not a user mistake. The two
+    engines are required to agree (ADR-0008), enforced by a Hypothesis
+    parity test and by ``make models-check``. If this error is
+    raised, that enforcement has failed somewhere.
 
     **When raised:**
     ``forge.verification.validate_blueprint_document`` after schema
-    validation succeeds but ``Blueprint.model_validate`` fails. The
-    schema is the referee (ADR-0007), so by the time this error is
-    raised, the document is *known* to be valid; the model is the one
-    that is wrong.
+    validation succeeds but ``Blueprint.model_validate`` fails.
 
-    **What the user should do:** Report it — this is not their fault.
-    The message names the parity regression, and the hint points at
-    the regeneration check that should have caught it.
-
-    **Examples:**
-
-    - A schema rule was added but the models were not regenerated
-      (``make models`` was skipped).
-    - A hand-tuned region in ``forge.models.blueprint`` was edited in
-      a way that over-rejects documents the schema accepts.
-
-    Why this is a subclass of ``ForgeError`` and not of
-    ``BlueprintError``: ``BlueprintError`` exits 2, which reads to a
-    script as "the user supplied a bad blueprint, retry with a
-    different one." That is the wrong advice here — the blueprint is
-    fine, Forge is broken. Exit 5 is the honest signal.
+    **What the user should do:** Report it. The message names the
+    parity regression, and the hint points at the regeneration check.
     """
 
     exit_code = ExitCode.INTERNAL_ERROR
-    hint = "This is a Forge bug, not an input error. Run `make models-check` and report the diff."
+    hint = (
+        "This is a Forge bug, not an input error. " "Run `make models-check` and report the diff."
+    )
 
     def __str__(self) -> str:
         """Render with a "model validation" prefix and a bug-report footer.
@@ -849,11 +674,10 @@ class ModelValidationError(StructuredError):
         the blueprint); model errors end with "report it" (fix Forge).
         """
         if not self.errors:
-            head = (
+            return (
                 f"Blueprint '{self.source}' passed schema validation but "
                 f"failed model validation — this is a Forge bug."
             )
-            return head
         lines = [
             f"Blueprint '{self.source}' passed schema validation but "
             f"failed model validation — this is a Forge bug:"
@@ -867,21 +691,20 @@ class ModelValidationError(StructuredError):
 # -----------------------------------------------------------------------------
 # Public re-exports
 # -----------------------------------------------------------------------------
-# Every name in this module is part of the public API except the
-# ``_``-prefixed implementation details (there are none). The
-# ``__all__`` list is the contract: adding to it is non-breaking,
-# removing from it is breaking.
+# Adding to ``__all__`` is non-breaking; removing from it is breaking.
 #
 # ``StructuredError`` is deliberately *not* in ``__all__``. It is a
 # documented common ancestor, not a catch target: callers should catch
 # ``SchemaValidationError`` (actionable: fix the blueprint) or
 # ``ModelValidationError`` (actionable: report a bug) — never the base,
-# because the correct response to the two differs.
+# because the correct response differs.
 __all__ = [
     "BlueprintError",
+    "DiscoveryError",
     "ExitCode",
     "FilesystemConflictError",
     "ForgeError",
+    "MalformedBlueprintError",
     "MissingRequiredFlagsError",
     "ModelValidationError",
     "PromptCancelledError",

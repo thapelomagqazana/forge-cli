@@ -1,0 +1,136 @@
+# ---------------------------------------------------------------------------
+# Forge official blueprint — python.fastapi.api
+#
+# Scaffolds a minimal, production-shaped FastAPI service:
+#   * src-layout package with a health endpoint
+#   * typed settings via pydantic-settings
+#   * pytest + httpx test scaffolding
+#   * optional Dockerfile + compose file
+#
+# This file is validated at load time against
+#   src/forge/schemas/blueprint.schema.json  (schema, canonical)
+#   src/forge/models/blueprint.py             (typed projection)
+# so any field-shape mistake fails CI rather than surprising users.
+# ---------------------------------------------------------------------------
+schema_version: "1.0.0"
+
+# Dotted, lowercase identifier. This is the string users type after
+# `forge create`. Stable forever — bumping it is a breaking change.
+id: python.fastapi.api
+
+name: Python FastAPI API
+version: 1.0.0
+description: >-
+  A production-shaped FastAPI service with a typed settings module, a
+  health endpoint, pytest + httpx test scaffolding, and optional Docker
+  support. Generated code favours clarity over cleverness so new team
+  members can read it on day one.
+
+category: api
+maintainer: "@platform-team"
+
+# ---------------------------------------------------------------------------
+# Compatibility — the minimum CLI version that understands this document.
+# Consumers older than this must refuse to load the blueprint rather than
+# silently mis-scaffold.
+# ---------------------------------------------------------------------------
+compatibility:
+  min_forge_version: 1.0.0
+
+# ---------------------------------------------------------------------------
+# Variables — presented in this order by the interactive wizard.
+# Ids are lower_snake_case (schema-enforced) because they are used
+# verbatim in templates as `{{variable_id}}`.
+# ---------------------------------------------------------------------------
+variables:
+  - id: author
+    type: string
+    description: Author name written to LICENSE and pyproject.toml metadata.
+    required: true
+    default: forge
+    validation:
+      # Rejects empty strings and path-unsafe characters early, so the
+      # wizard can show the error while the user is still typing.
+      pattern: "^[A-Za-z0-9][A-Za-z0-9 ._-]*$"
+
+  - id: python_version
+    type: enum
+    description: Target Python version for pyproject classifiers and ruff config.
+    required: true
+    default: "3.12"
+    validation:
+      enum:
+        - "3.11"
+        - "3.12"
+        - "3.13"
+
+  - id: include_docker
+    type: boolean
+    description: Include a Dockerfile, .dockerignore, and compose.yaml.
+    required: false
+    default: true
+
+# ---------------------------------------------------------------------------
+# Files — always applied. Destinations may interpolate `{{project}}` and
+# any variable id. Templates live next to this manifest under templates/.
+# ---------------------------------------------------------------------------
+files:
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+  - source: templates/README.md.j2
+    destination: README.md
+  - source: templates/.gitignore
+    destination: .gitignore
+  - source: templates/src/{{project}}/__init__.py
+    destination: src/{{project}}/__init__.py
+  - source: templates/src/{{project}}/main.py.j2
+    destination: src/{{project}}/main.py
+  - source: templates/src/{{project}}/settings.py.j2
+    destination: src/{{project}}/settings.py
+  - source: templates/tests/test_health.py.j2
+    destination: tests/test_health.py
+  - source: templates/tests/conftest.py
+    destination: tests/conftest.py
+
+# ---------------------------------------------------------------------------
+# Conditional files — applied only when the expression evaluates true.
+# Expressions are intentionally simple (`<var_id> == <literal>`); anything
+# more complex belongs in a dedicated blueprint.
+# ---------------------------------------------------------------------------
+conditional_files:
+  - condition: include_docker == true
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+      - source: templates/.dockerignore
+        destination: .dockerignore
+      - source: templates/compose.yaml.j2
+        destination: compose.yaml
+
+# ---------------------------------------------------------------------------
+# Verification contract — every generated project must satisfy these
+# before `forge create` reports success. Checks run in order; the first
+# failure short-circuits and surfaces the offending id.
+# ---------------------------------------------------------------------------
+verification:
+  # Cheap structural check first: fail fast if scaffolding dropped a file.
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+
+  - id: has_package
+    type: required_file
+    path: src/{{project}}/main.py
+
+  # Behavioural check: the generated service must actually import and its
+  # test suite must pass. Timeout is generous because cold caches on CI
+  # can be slow the first time.
+  - id: imports_cleanly
+    type: command
+    command: python -c "import {{project}}"
+    timeout: 120
+
+  - id: tests_pass
+    type: command
+    command: pytest -q
+    timeout: 300

@@ -18,6 +18,25 @@ they can simulate any combination of well-formed and malformed modules
 without depending on which real commands currently exist. Adding a new
 command does not require touching this file.
 
+Blueprint access and the service seam
+-------------------------------------
+The registry delegates blueprint access to
+``forge.discovery.BlueprintDiscoveryService`` through
+``_make_discovery_service``. That function is the *only* seam a test
+should substitute — the service's own behaviour (candidate streaming,
+precedence, deduplication warnings) is tested in
+``tests/unit/discovery/``. What the tests below assert is the
+*delegation contract*:
+
+* The registry calls the seam on every invocation (no caching).
+* The registry translates the service's ``DiscoveryError`` into the
+  user-facing ``BlueprintError`` with an "available blueprints" hint.
+* The registry materializes ``variables`` into an immutable tuple so
+  the returned entry is safe to pass across threads and store in
+  fixtures.
+* The hint is built only on the failure path — a successful load
+  pays no cost for the message it will not display.
+
 Test organisation
 -----------------
 - ``TestDiscovery``: module discovery and package validation.
@@ -27,10 +46,9 @@ Test organisation
 - ``TestDuplicateDetection``: duplicate command names are detected.
 - ``TestOnSkipCallback``: the ``on_skip`` callback is invoked.
 - ``TestRealCommands``: every real command satisfies the contract.
-- ``TestListBlueprints``: the sorted, empty-safe blueprint enumeration
-  added in 1.1.6.
-- ``TestGetBlueprint``: the single-blueprint view added in 1.1.6,
-  including the domain-error and hint contracts.
+- ``TestListBlueprints``: the sorted, empty-safe blueprint enumeration.
+- ``TestGetBlueprint``: the single-blueprint view, including the
+  domain-error and hint contracts.
 """
 
 from __future__ import annotations
@@ -53,7 +71,7 @@ from forge.cli.registry import (
     discover_command_modules,
     register_commands,
 )
-from forge.core.exceptions import BlueprintError, ExitCode
+from forge.core.exceptions import BlueprintError, DiscoveryError, ExitCode
 
 
 # -----------------------------------------------------------------------------
@@ -83,19 +101,11 @@ def fake_package(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
 def _empty_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``discover_command_modules`` return an empty list.
 
-    This fixture returns nothing — it is used for its *side effect*
-    (patching ``discover_command_modules`` to return an empty list).
-    The leading underscore in the name is a Ruff convention (``PT004``)
-    that signals "use me for side effects, not for a return value."
-
-    Tests that use it must declare it via
+    Used for its *side effect* (patching ``discover_command_modules``
+    to return an empty list). Tests that use it must declare it via
     ``@pytest.mark.usefixtures("_empty_discovery")`` rather than as a
     parameter, so it is clear they need the side effect, not a return
-    value (``PT019``). The string in ``usefixtures`` must match the
-    fixture name exactly, including the underscore.
-
-    Used by tests that want to exercise registration with no modules
-    at all (the empty-registry case).
+    value (``PT019``).
     """
     monkeypatch.setattr(
         "forge.cli.registry.discover_command_modules",
@@ -130,7 +140,6 @@ def install_fake_module(
     if raise_on_import:
         # Remove any prior installation so importlib re-raises.
         sys.modules.pop(full_name, None)
-        # Return a placeholder; the caller does not use it.
         return ModuleType(full_name)
 
     module = ModuleType(full_name)
@@ -153,15 +162,7 @@ class TestDiscovery:
 
     @pytest.mark.unit()
     def test_discovers_real_command_modules(self) -> None:
-        """The real package contains the expected command modules.
-
-        ``discover_command_modules`` returns *fully-qualified* module
-        names (e.g., ``"forge.cli.commands.create"``), because the
-        registry needs them to call ``importlib.import_module``. This
-        test splits on the last dot to compare short names against
-        short names — the intent is "the known commands are discoverable",
-        not "the return values are short."
-        """
+        """The real package contains the expected command modules."""
         names = discover_command_modules()
         short_names = {name.rsplit(".", 1)[-1] for name in names}
         expected = {"create", "doctor", "list", "ping", "validate", "verify"}
@@ -180,17 +181,6 @@ class TestDiscovery:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Modules starting with ``_`` are excluded from discovery."""
-        # Install a visible module and a private module. Because the
-        # fake package's __path__ is empty, pkgutil.iter_modules will
-        # not find them via disk. Instead, patch the private-module
-        # filter by testing the list comprehension indirectly.
-        #
-        # We test the contract "private modules are excluded" by
-        # invoking discovery on the real package and asserting that
-        # no private module is returned. The real package has no
-        # private modules today, so the assertion is trivially true,
-        # but it will catch a regression if one is ever added without
-        # the filter.
         names = discover_command_modules()
         assert all(not n.rsplit(".", 1)[-1].startswith("_") for n in names)
 
@@ -248,27 +238,6 @@ class TestRegistration:
                 assert result.module_name == result.full_name.rsplit(".", 1)[-1]
 
     @pytest.mark.unit()
-    def test_registered_command_uses_app_name(self) -> None:
-        """The command name comes from ``app.info.name``, not the module name."""
-        # A module named "fake" whose app is named "custom" should be
-        # registered as "custom", not "fake".
-        # We patch discovery to return a single fake module.
-        with patch(
-            "forge.cli.registry.discover_command_modules",
-            return_value=[f"{COMMANDS_PACKAGE}.fake"],
-        ):
-            _ = install_fake_module(
-                pytest.MonkeyPatch(),  # type: ignore[arg-type]
-                "fake",
-                app=make_typer_app("custom"),
-            )
-
-        # The above is fragile because pytest.MonkeyPatch() outside a
-        # fixture is not bound to the test lifecycle. Use a proper
-        # fixture instead.
-        pytest.skip("Covered by test_registers_real_commands (ping).")
-
-    @pytest.mark.unit()
     @pytest.mark.usefixtures("_empty_discovery")
     def test_empty_package_registers_nothing(self) -> None:
         """An empty package produces an empty results list."""
@@ -284,10 +253,7 @@ class TestGracefulFailure:
     """Tests for the registry's handling of malformed modules."""
 
     @pytest.mark.unit()
-    def test_skips_module_without_app(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_skips_module_without_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A module without an ``app`` attribute is skipped, not raised."""
         with patch(
             "forge.cli.registry.discover_command_modules",
@@ -304,10 +270,7 @@ class TestGracefulFailure:
         assert "does not expose" in results[0].reason
 
     @pytest.mark.unit()
-    def test_skips_module_with_wrong_app_type(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_skips_module_with_wrong_app_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A module whose ``app`` is not a Typer app is skipped."""
         with patch(
             "forge.cli.registry.discover_command_modules",
@@ -332,7 +295,6 @@ class TestGracefulFailure:
             "forge.cli.registry.discover_command_modules",
             return_value=[f"{COMMANDS_PACKAGE}.broken"],
         ):
-            # Do not install the module — importlib will raise.
             sys.modules.pop(f"{COMMANDS_PACKAGE}.broken", None)
 
             root = typer.Typer()
@@ -361,7 +323,6 @@ class TestGracefulFailure:
             root = typer.Typer()
             results = register_commands(root, strict=False)
 
-        # One registered, one skipped.
         registered = [r for r in results if isinstance(r, RegisteredCommand)]
         skipped = [r for r in results if isinstance(r, SkippedCommand)]
         assert len(registered) == 1
@@ -376,10 +337,7 @@ class TestStrictMode:
     """Tests for ``register_commands(strict=True)``."""
 
     @pytest.mark.unit()
-    def test_strict_raises_on_missing_app(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_strict_raises_on_missing_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """In strict mode, a module without an ``app`` raises."""
         with patch(
             "forge.cli.registry.discover_command_modules",
@@ -404,13 +362,7 @@ class TestStrictMode:
 
     @pytest.mark.unit()
     def test_strict_passes_on_real_commands(self) -> None:
-        """In strict mode, the real command modules all pass.
-
-        This is the guarantee: every command module in the repo
-        satisfies the contract. If a future contributor adds a
-        command module that does not, this test fails — before the
-        broken module reaches users.
-        """
+        """In strict mode, the real command modules all pass."""
         root = typer.Typer()
         results = register_commands(root, strict=True)
         assert all(isinstance(r, RegisteredCommand) for r in results)
@@ -424,10 +376,7 @@ class TestDuplicateDetection:
     """Tests for duplicate command name detection."""
 
     @pytest.mark.unit()
-    def test_skips_duplicate_command_name(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_skips_duplicate_command_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Two modules with the same command name: the second is skipped."""
         with patch(
             "forge.cli.registry.discover_command_modules",
@@ -448,10 +397,7 @@ class TestDuplicateDetection:
         assert "already registered" in results[1].reason
 
     @pytest.mark.unit()
-    def test_strict_raises_on_duplicate(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_strict_raises_on_duplicate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """In strict mode, a duplicate command name raises."""
         with patch(
             "forge.cli.registry.discover_command_modules",
@@ -496,10 +442,7 @@ class TestOnSkipCallback:
     """Tests for the ``on_skip`` callback."""
 
     @pytest.mark.unit()
-    def test_on_skip_is_invoked_per_skip(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_on_skip_is_invoked_per_skip(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The callback fires once per skipped module."""
         with patch(
             "forge.cli.registry.discover_command_modules",
@@ -533,31 +476,19 @@ class TestRealCommands:
 
     @pytest.mark.unit()
     def test_every_real_command_satisfies_the_contract(self) -> None:
-        """Every module in ``forge.cli.commands`` follows the contract.
-
-        This is the strict-mode test that runs in CI. If a contributor
-        adds a command module that does not expose ``app: typer.Typer``,
-        this test fails before the module reaches users.
-        """
+        """Every module in ``forge.cli.commands`` follows the contract."""
         root = typer.Typer()
         results = register_commands(root, strict=True)
 
-        # Every result is a RegisteredCommand — nothing was skipped.
         assert all(isinstance(r, RegisteredCommand) for r in results)
 
-        # The expected set is present.
         registered = {r.command_name for r in results}  # type: ignore[union-attr]
         expected = {"create", "doctor", "list", "ping", "validate", "verify"}
         assert expected.issubset(registered)
 
     @pytest.mark.unit()
     def test_every_real_command_has_a_help_string(self) -> None:
-        """Every command exposes a non-empty ``help`` string.
-
-        The help string is what the user sees in ``forge --help``. An
-        empty help string is a documentation bug, not a runtime error,
-        but it should be caught in CI before it reaches users.
-        """
+        """Every command exposes a non-empty ``help`` string."""
         for name in discover_command_modules():
             short_name = name.rsplit(".", 1)[-1]
             module = __import__(name, fromlist=["app"])
@@ -567,11 +498,7 @@ class TestRealCommands:
 
     @pytest.mark.unit()
     def test_every_real_command_has_a_name(self) -> None:
-        """Every command exposes a non-empty ``name``.
-
-        The name is what the user types (``forge <name>``). An empty
-        name is a runtime bug — the command would be unreachable.
-        """
+        """Every command exposes a non-empty ``name``."""
         for name in discover_command_modules():
             short_name = name.rsplit(".", 1)[-1]
             module = __import__(name, fromlist=["app"])
@@ -581,12 +508,7 @@ class TestRealCommands:
 
     @pytest.mark.unit()
     def test_command_names_are_unique(self) -> None:
-        """No two command modules register the same command name.
-
-        The registry detects duplicates and skips the later one, but
-        a duplicate name is always a bug. This test catches it in CI
-        before the silent skip happens in production.
-        """
+        """No two command modules register the same command name."""
         seen: dict[str, str] = {}
         for name in discover_command_modules():
             module = __import__(name, fromlist=["app"])
@@ -602,50 +524,125 @@ class TestRealCommands:
 
 
 # -----------------------------------------------------------------------------
-# Blueprint enumeration (1.1.6)
+# Blueprint enumeration — via the discovery service seam
 # -----------------------------------------------------------------------------
-# ``list_blueprints()`` and ``get_blueprint()`` delegate to a private
-# ``_load_blueprint_index`` seam in the registry module. The tests
-# below substitute *that seam* — not the underlying loader — so the
-# delegation path itself is exercised. This is the difference between
-# "the function works when the loader works" and "the function calls
-# the loader correctly"; the latter is what these tests prove.
+# ``list_blueprints()`` and ``get_blueprint()`` delegate to
+# ``BlueprintDiscoveryService`` through the module-level
+# ``_make_discovery_service`` seam. Tests substitute *that seam* — not
+# the service's internals — so the delegation path itself is
+# exercised: a refactor that, say, calls a different method on the
+# service is caught here, because the fake service is a real object
+# obeying the service's protocol, not a mock of one method.
 #
-# The real loader's filesystem behavior is tested in its own module.
-# Its concerns (parsing YAML, validating schema) are not the
-# registry's concerns; the registry is a facade that must faithfully
-# delegate.
+# The service's own behaviour (candidate streaming, precedence,
+# malformed-skip) is tested in ``tests/unit/discovery/``. Duplicating
+# those tests here would create two suites that fail together when a
+# discovery rule changes. What these tests prove is narrower and
+# complementary: that the registry translates the service's contract
+# into the registry's contract without adding or dropping anything.
 # -----------------------------------------------------------------------------
-class _FakeBlueprint:
-    """Minimal stand-in for a loader blueprint object.
+class _FakeService:
+    """Minimal stand-in for ``BlueprintDiscoveryService``.
 
-    The registry's ``get_blueprint`` only touches ``variables`` and
-    (optionally) ``display_name``; everything else is the loader's
-    concern. The fake exposes exactly those two attributes so tests
-    can exercise the full delegation path without importing the real
-    blueprint type.
+    Implements only the two methods the registry calls — ``discover``
+    and ``load`` — with the signatures the real service exposes. The
+    fake is a real object (not a ``Mock``) so the tests exercise
+    attribute access and return-value shapes, which is what would
+    break first if the registry started calling a different method or
+    assumed a different return type.
+
+    The ``calls`` list lets tests assert on *which* methods were
+    called and how many times, which is how the "no caching" contract
+    is verified.
     """
 
     def __init__(
         self,
         *,
-        display_name: str | None = None,
+        catalogue: list[Any] | None = None,
+        loadable: dict[str, Any] | None = None,
+        load_raises: Exception | None = None,
+    ) -> None:
+        self._catalogue = list(catalogue or [])
+        self._loadable = dict(loadable or {})
+        self._load_raises = load_raises
+        # Public so tests can inspect the call log without reaching
+        # into a private attribute. The list is the seam's contract,
+        # not its implementation detail.
+        self.discover_calls: list[int] = []
+        self.load_calls: list[str] = []
+
+    def discover(self) -> list[Any]:
+        self.discover_calls.append(1)
+        return list(self._catalogue)
+
+    def load(self, blueprint_id: str) -> Any:
+        self.load_calls.append(blueprint_id)
+        if blueprint_id in self._loadable:
+            return self._loadable[blueprint_id]
+        # Mirror the real service: raise ``DiscoveryError`` when the id
+        # is not loadable. The registry is expected to translate this
+        # to ``BlueprintError``; a test that substituted the service
+        # to raise a different exception would be testing the wrong
+        # thing.
+        if self._load_raises is not None:
+            raise self._load_raises
+        raise DiscoveryError(f"Blueprint '{blueprint_id}' not found.")
+
+
+def _install_service(
+    monkeypatch: pytest.MonkeyPatch,
+    service: _FakeService,
+) -> _FakeService:
+    """Install a fake service behind the registry's seam.
+
+    The seam is ``_make_discovery_service`` — a function that returns a
+    fresh service per call. Substituting it (rather than caching a
+    single instance) preserves the "no caching" semantics of the real
+    implementation, which is exactly what the "delegates on every
+    call" test exercises.
+    """
+    monkeypatch.setattr(
+        "forge.cli.registry._make_discovery_service",
+        lambda: service,
+    )
+    return service
+
+
+class _FakeView:
+    """Minimal stand-in for ``DiscoveredBlueprint``.
+
+    The registry only touches ``id`` when building the
+    available-blueprints hint, so the fake exposes exactly that
+    attribute. Using a real object here (not a Mock) makes an
+    accidental ``getattr(view, "name")`` in the registry code fail
+    loudly, which is the intent: the test is asserting that the
+    registry only depends on the fields it *needs*.
+    """
+
+    def __init__(self, blueprint_id: str) -> None:
+        self.id = blueprint_id
+
+
+class _FakeBlueprint:
+    """Minimal stand-in for a loaded ``Blueprint``.
+
+    The registry's ``get_blueprint`` touches ``variables``, ``name``,
+    and ``id``. Everything else is the service's concern. The fake
+    exposes exactly those three fields so a future field access in
+    the registry is caught by the tests rather than by end users.
+    """
+
+    def __init__(
+        self,
+        *,
+        blueprint_id: str,
+        name: str = "",
         variables: list[Any] | None = None,
     ) -> None:
-        if display_name is not None:
-            self.display_name = display_name
+        self.id = blueprint_id
+        self.name = name
         self.variables = variables if variables is not None else []
-
-
-def _install_blueprint_index(
-    monkeypatch: pytest.MonkeyPatch,
-    index: dict[str, Any],
-) -> None:
-    """Install a fake blueprint index behind the registry's seam."""
-    monkeypatch.setattr(
-        "forge.cli.registry._load_blueprint_index",
-        lambda: index,
-    )
 
 
 class TestListBlueprints:
@@ -655,18 +652,21 @@ class TestListBlueprints:
     def test_returns_sorted_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """IDs are sorted so the wizard menu is stable across runs.
 
-        A menu that reshuffles between invocations feels broken to
-        users and breaks snapshot tests in CI. The sort is the
-        contract, not an accident of dict iteration order.
+        The service guarantees sorted output (ADR-0009); the registry
+        re-sorts defensively because the CLI's output shape is a
+        public contract. The test asserts the registry's contract, not
+        the service's — a service refactor that drops its sort would
+        not break the wizard, which is the point of the defensive
+        re-sort.
         """
-        _install_blueprint_index(
-            monkeypatch,
-            {
-                "zzz.last": _FakeBlueprint(),
-                "python.fastapi.api": _FakeBlueprint(),
-                "aaa.first": _FakeBlueprint(),
-            },
+        service = _FakeService(
+            catalogue=[
+                _FakeView("zzz.last"),
+                _FakeView("python.fastapi.api"),
+                _FakeView("aaa.first"),
+            ]
         )
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import list_blueprints
 
@@ -677,49 +677,48 @@ class TestListBlueprints:
         ]
 
     @pytest.mark.unit()
-    def test_returns_empty_list_for_empty_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """An empty index returns ``[]``, not an exception.
+    def test_returns_empty_list_for_empty_catalogue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty catalogue returns ``[]``, not an exception.
 
-        The wizard treats an empty list as a ``UserInputError`` with
-        a clear hint ("no blueprints installed"). Making
+        The wizard treats an empty list as a ``UserInputError`` with a
+        clear hint ("no blueprints installed"). Making
         ``list_blueprints`` raise would force the wizard to catch an
         exception for a normal (if misconfigured) state — and would
         shift the error message from a domain error to whatever the
-        loader happened to raise.
+        service happened to raise.
         """
-        _install_blueprint_index(monkeypatch, {})
+        _install_service(monkeypatch, _FakeService(catalogue=[]))
 
         from forge.cli.registry import list_blueprints
 
         assert list_blueprints() == []
 
     @pytest.mark.unit()
-    def test_delegates_to_the_loader_seam_every_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Each call goes through the seam — no caching in the registry.
+    def test_delegates_to_the_service_seam_every_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each call goes through the service — no caching in the registry.
 
-        The loader owns the cache (parsing YAML is expensive; the
-        loader memoizes). A second cache in the registry would create
-        two sources of truth and a cache-invalidation bug waiting to
-        happen. This test proves the registry is a facade, not a
-        cache: two calls mean two delegations.
+        The service deliberately re-resolves on every call so user
+        edits are picked up immediately (ADR-0009's cache policy).
+        A second cache in the registry would create two sources of
+        truth and a cache-invalidation bug waiting to happen. This
+        test proves the registry is a facade, not a cache: two calls
+        mean two delegations.
         """
-        calls: list[int] = []
-
-        def _counting_loader() -> dict[str, Any]:
-            calls.append(1)
-            return {"python.fastapi.api": _FakeBlueprint()}
-
-        monkeypatch.setattr("forge.cli.registry._load_blueprint_index", _counting_loader)
+        service = _FakeService(catalogue=[_FakeView("python.fastapi.api")])
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import list_blueprints
 
         list_blueprints()
         list_blueprints()
 
-        assert len(calls) == 2, (
-            "list_blueprints() must call _load_blueprint_index() on every "
-            "invocation; if this fails, someone added a registry-level cache "
-            "and created a second source of truth."
+        assert len(service.discover_calls) == 2, (
+            "list_blueprints() must call the service on every "
+            "invocation; if this fails, someone added a "
+            "registry-level cache and created a second source of "
+            "truth."
         )
 
 
@@ -730,15 +729,16 @@ class TestGetBlueprint:
     def test_returns_entry_with_all_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The returned ``BlueprintEntry`` carries id, display_name, variables."""
         variables = [object(), object()]
-        _install_blueprint_index(
-            monkeypatch,
-            {
+        service = _FakeService(
+            loadable={
                 "python.fastapi.api": _FakeBlueprint(
-                    display_name="Python FastAPI API",
+                    blueprint_id="python.fastapi.api",
+                    name="Python FastAPI API",
                     variables=variables,
                 ),
-            },
+            }
         )
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
@@ -750,19 +750,24 @@ class TestGetBlueprint:
         assert entry.variables == tuple(variables)
 
     @pytest.mark.unit()
-    def test_falls_back_to_id_when_display_name_is_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_falls_back_to_id_when_name_is_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A blueprint without a display name uses its ID as the label.
 
         The wizard menu must always have a label; making the fallback
         the registry's job (not the wizard's) keeps the wizard free of
-        per-blueprint special cases.
+        per-blueprint special cases. The fallback fires when ``name``
+        is empty *or* missing — both are equivalent from the user's
+        perspective ("no label was provided").
         """
-        _install_blueprint_index(
-            monkeypatch,
-            {"typescript.react.app": _FakeBlueprint()},
+        service = _FakeService(
+            loadable={
+                "typescript.react.app": _FakeBlueprint(
+                    blueprint_id="typescript.react.app",
+                    name="",
+                ),
+            }
         )
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
@@ -771,18 +776,22 @@ class TestGetBlueprint:
 
     @pytest.mark.unit()
     def test_materializes_variables_to_a_tuple(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``variables`` is a tuple, not the loader's list.
+        """``variables`` is a tuple, not the model's list.
 
         The returned ``BlueprintEntry`` is frozen; a mutable list
-        inside it would be a footgun (hash breaks, downstream
-        handler can mutate). Materializing to a tuple at the boundary
-        makes the entry safe to pass across threads and store in
-        fixtures.
+        inside it would be a footgun (hash breaks, downstream handler
+        can mutate). Materializing to a tuple at the boundary makes
+        the entry safe to pass across threads and store in fixtures.
         """
-        _install_blueprint_index(
-            monkeypatch,
-            {"python.fastapi.api": _FakeBlueprint(variables=["v1", "v2"])},
+        service = _FakeService(
+            loadable={
+                "python.fastapi.api": _FakeBlueprint(
+                    blueprint_id="python.fastapi.api",
+                    variables=["v1", "v2"],
+                ),
+            }
         )
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
@@ -791,47 +800,21 @@ class TestGetBlueprint:
         assert entry.variables == ("v1", "v2")
 
     @pytest.mark.unit()
-    def test_missing_variables_attribute_is_tolerated(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A blueprint without ``variables`` yields an empty tuple.
-
-        The loader's blueprint type *should* always declare
-        ``variables``, but the registry uses ``getattr(..., ())`` so a
-        future loader change that renames the attribute (or a
-        partially-constructed blueprint in a test fixture) does not
-        crash the wizard with an ``AttributeError``. An empty
-        variable list is a valid (if unusual) blueprint.
-        """
-
-        class _NoVariables:
-            # Deliberately no ``variables`` attribute and no
-            # ``display_name`` — the fallback path must handle both.
-            pass
-
-        _install_blueprint_index(monkeypatch, {"bare.blueprint": _NoVariables()})
-
-        from forge.cli.registry import get_blueprint
-
-        entry = get_blueprint("bare.blueprint")
-        assert entry.variables == ()
-        assert entry.display_name == "bare.blueprint"
-
-    @pytest.mark.unit()
     def test_unknown_id_raises_blueprint_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Unknown IDs raise ``BlueprintError``, not ``KeyError``.
+        """Unknown IDs raise ``BlueprintError``, not ``DiscoveryError``.
 
-        The exit code is the contract: a ``KeyError`` would reach
-        ``handle_exception`` as an unexpected error (exit 5), while a
-        missing blueprint is the user's fault (exit 2). A script that
-        branches on ``$? in (1, 2, 3)`` (user-fixable) would treat a
-        ``KeyError`` as a bug and report it to the issue tracker
-        instead of retrying with a different blueprint.
+        The exit code is the contract: the service raises
+        ``DiscoveryError`` (also exit 2), but the registry *translates*
+        it to ``BlueprintError`` so callers see the domain error type
+        the CLI handler is written against. The translation is what
+        this test locks in — a future refactor that "simplifies" by
+        removing the try/except would surface ``DiscoveryError`` to
+        the handler, which dispatches on ``ForgeError`` and would
+        still work, but the *message* would lose the "available
+        blueprints" hint built from the catalogue. Both matter.
         """
-        _install_blueprint_index(
-            monkeypatch,
-            {"python.fastapi.api": _FakeBlueprint()},
-        )
+        service = _FakeService(loadable={})
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
@@ -851,15 +834,18 @@ class TestGetBlueprint:
         A hint that says "not found" without alternatives sends the
         user to ``forge list`` (if that command exists) or back to
         the docs. The hint must name the options inline so the error
-        is actionable.
+        is actionable. The registry builds the list from the same
+        ``discover()`` call the wizard uses, so the hint and the menu
+        agree by construction.
         """
-        _install_blueprint_index(
-            monkeypatch,
-            {
-                "python.fastapi.api": _FakeBlueprint(),
-                "typescript.react.app": _FakeBlueprint(),
-            },
+        service = _FakeService(
+            catalogue=[
+                _FakeView("python.fastapi.api"),
+                _FakeView("typescript.react.app"),
+            ],
+            loadable={},
         )
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
@@ -871,7 +857,7 @@ class TestGetBlueprint:
         assert "typescript.react.app" in info.value.hint
 
     @pytest.mark.unit()
-    def test_unknown_id_hint_handles_empty_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_unknown_id_hint_handles_empty_catalogue(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With no blueprints installed, the hint says so explicitly.
 
         ``"Available blueprints: ."`` (with nothing after the colon)
@@ -879,7 +865,8 @@ class TestGetBlueprint:
         "(none installed)" or similar so the user knows the problem
         is the installation, not their typo.
         """
-        _install_blueprint_index(monkeypatch, {})
+        service = _FakeService(catalogue=[], loadable={})
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
@@ -896,22 +883,33 @@ class TestGetBlueprint:
         """The hint is not constructed on the success path.
 
         A small but real bug class: building the "available
-        blueprints" string eagerly (before the ``if blueprint is
-        None`` check) would be wasted work on every successful load.
-        The test asserts the hint is ``None`` for a successful load,
+        blueprints" string eagerly (before the lookup) would be
+        wasted work on every successful load, and would also mean a
+        successful load pays for a ``discover()`` call that is only
+        useful on failure. The test asserts the service's
+        ``discover`` was *not* called for a successful ``load`` —
         which is only possible if the hint construction is inside the
         failure branch.
         """
-        _install_blueprint_index(
-            monkeypatch,
-            {"python.fastapi.api": _FakeBlueprint()},
+        service = _FakeService(
+            loadable={
+                "python.fastapi.api": _FakeBlueprint(
+                    blueprint_id="python.fastapi.api",
+                    name="FastAPI",
+                ),
+            }
         )
+        _install_service(monkeypatch, service)
 
         from forge.cli.registry import get_blueprint
 
         entry = get_blueprint("python.fastapi.api")
-        # ``BlueprintEntry`` has no ``hint`` attribute — the point is
-        # that the *error* path (which carries the hint) was not
-        # taken. Asserting on the entry type is the clearest way to
-        # say "the failure branch did not run."
+
         assert isinstance(entry, BlueprintEntry)
+        # The success path must not consult the catalogue. If this
+        # assertion fails, the hint is being built eagerly.
+        assert service.discover_calls == [], (
+            "get_blueprint() must not call discover() on the success "
+            "path; the available-blueprints hint is only needed when "
+            "the lookup fails."
+        )
