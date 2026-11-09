@@ -44,6 +44,15 @@ opaque ``JSONDecodeError`` exceptions against human output. Passing
 the flag directly removes that class of bug entirely: if a test
 wants JSON mode, the call site says so.
 
+Why every call goes through ``_exit_code``
+------------------------------------------
+``validate`` raises ``typer.Exit`` on every exit path — the mechanism
+Typer documents for exit codes under ``standalone_mode=False``. The
+helper ``tests.unit.cli._validate_helpers._exit_code`` unwraps that
+raise into an ``int`` so the test bodies can assert on the exit code
+as a value. Every test in this file that invokes ``validate`` goes
+through it, directly or via ``_invoke_json``.
+
 Assertion discipline: parse, then assert
 ----------------------------------------
 Every test parses the emitted string with ``json.loads`` **before**
@@ -97,8 +106,8 @@ What is *not* covered here
   after those validators pass.
 
 Exit codes are asserted only where they interact with the JSON
-envelope (a payload is *data*, but the process still returns 0 or
-1). The full exit-code contract is tested in
+envelope (a payload is *data*, but the process still exits 0 or 1).
+The full exit-code contract is tested in
 ``test_validate_exit_codes.py``.
 """
 
@@ -113,6 +122,7 @@ import pytest
 from forge.cli.commands.validate import validate
 from forge.cli.schemas.validate_output import ValidateOutput
 from forge.core.exceptions import ExitCode
+from tests.unit.cli._validate_helpers import _exit_code
 
 # -----------------------------------------------------------------------------
 # Fixtures — two blueprints with known, small outcomes
@@ -168,8 +178,12 @@ def _write_blueprint(directory: Path, body: str) -> Path:
 def _invoke_json(path: Path, capsys: pytest.CaptureFixture[str]) -> tuple[dict[str, Any], int]:
     """Run ``validate --json``; return ``(parsed_envelope, exit_code)``.
 
-    Centralises two invariants every JSON test needs:
+    Centralises three invariants every JSON test needs:
 
+    * **Exit code.** ``validate`` raises ``typer.Exit`` on every exit
+      path; the helper unwraps it into an ``int`` so tests can assert
+      on the code as a value. See
+      ``tests/unit/cli/_validate_helpers.py`` for the reasoning.
     * **stdout is a single parseable document.** A test cannot pass
       against output that is not valid JSON, so the parse happens
       once here rather than being re-asserted in every test.
@@ -181,11 +195,11 @@ def _invoke_json(path: Path, capsys: pytest.CaptureFixture[str]) -> tuple[dict[s
       failure at the *call site* of every JSON test, not a
       mystery in one.
 
-    Returns the parsed payload and the callback's exit code, so each
+    Returns the parsed payload and the command's exit code, so each
     test can assert on the fields it cares about without re-running
     the command.
     """
-    code = validate(path=path, json=True)
+    code = _exit_code(lambda: validate(path=path, json=True))
     captured = capsys.readouterr()
 
     assert captured.out.strip(), (
@@ -447,10 +461,10 @@ class TestDeterminism:
         """Same input, two invocations, identical bytes on stdout."""
         manifest = _write_blueprint(tmp_path / "bp", _TWO_VIOLATIONS)
 
-        validate(path=manifest, json=True)
+        _exit_code(lambda: validate(path=manifest, json=True))
         first = capsys.readouterr()
 
-        validate(path=manifest, json=True)
+        _exit_code(lambda: validate(path=manifest, json=True))
         second = capsys.readouterr()
 
         assert first.out == second.out
@@ -486,7 +500,7 @@ class TestModeIndependence:
         """
         manifest = _write_blueprint(tmp_path / "bp", _TWO_VIOLATIONS)
 
-        validate(path=manifest, json=True)
+        _exit_code(lambda: validate(path=manifest, json=True))
         captured = capsys.readouterr()
 
         # The output is parseable (this would raise if not).
@@ -509,7 +523,7 @@ class TestModeIndependence:
         """
         manifest = _write_blueprint(tmp_path / "bp", _TWO_VIOLATIONS)
 
-        validate(path=manifest, json=False)
+        _exit_code(lambda: validate(path=manifest, json=False))
         captured = capsys.readouterr()
 
         # Human output is not valid JSON (``json.loads`` raises).
@@ -558,6 +572,11 @@ class TestContractVersion:
         DTO but not in the command, or vice versa), the command's
         serialised version would disagree with what the DTO advertises
         to its own tests. This assertion catches that drift cheaply.
+
+        This test does not invoke ``validate``; it only constructs a
+        ``ValidateOutput``. It therefore stays untouched by the
+        exit-code mechanism change — it has never asserted on an exit
+        code and never will.
         """
         output = ValidateOutput(valid=True, source="<test>")
         assert output.schema_version == "1.0.0"

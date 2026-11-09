@@ -69,6 +69,23 @@ Non-obvious decisions
    internal error" and exits 5. That split is the exit-code contract
    in code: 0/1/2 are user-facing, 5 is "report a bug".
 
+* **Usage errors map to ``ExitCode.BLUEPRINT_ERROR`` (2), not
+   ``USER_ERROR`` (1).** The two constants have distinct semantic
+   scopes in ADR-0013: ``USER_ERROR`` (1) means "the tool ran, and
+   the *user's input* is invalid" — a malformed blueprint, a bad
+   value in a flag that got past Typer. ``BLUEPRINT_ERROR`` (2)
+   means "the invocation itself was wrong, or the blueprint is
+   missing/malformed at a level the tool could not even reach." A
+   usage error is unambiguously the second: Typer rejected the
+   command line before the command body ran, so the user's *input*
+   (their blueprint) was never examined. Collapsing it to 1 would
+   tell a CI job that the blueprint was examined and found invalid,
+   which is false; collapsing it to 2 tells the job "the invocation
+   was wrong", which is what happened. The numeric value (2) also
+   matches Typer's own default for usage errors, so the enum keeps
+   the "no magic numbers" rule while remaining consistent with the
+   tool that raised the exception.
+
 * **Usage errors are classified by *class name*, not by class
    identity.** Typer vendors a private copy of Click under
    ``typer._click``. Its ``UsageError`` is *not* the same class as
@@ -148,7 +165,7 @@ from forge.core.version import get_version
 # set.
 _USAGE_ERROR_CLASS_NAMES: Final[frozenset[str]] = frozenset(
     {
-        "UsageError",  # click.exceptions.UsageError
+        "UsageError",  # click.exceptions.UsageError — generic usage problem
         "BadParameter",  # click.exceptions.BadParameter — invalid value
         "NoSuchOption",  # click.exceptions.NoSuchOption — unknown --flag
         "MissingParameter",  # click.exceptions.MissingParameter — required not provided
@@ -380,8 +397,9 @@ def main(argv: list[str] | None = None) -> NoReturn:
     #      Propagate unchanged.
     #   3. Anything else — check the class name against
     #      ``_USAGE_ERROR_CLASS_NAMES``; if it matches, convert to
-    #      ``SystemExit(2)``. Otherwise hand to ``handle_exception``,
-    #      which classifies it as an internal error (exit 5).
+    #      ``SystemExit(ExitCode.BLUEPRINT_ERROR)`` (2). Otherwise
+    #      hand to ``handle_exception``, which classifies it as an
+    #      internal error (exit 5).
     #
     # The ``typer.Exit`` clause must come *before* the
     # ``_USAGE_ERROR_CLASS_NAMES`` check because ``typer.Exit`` is a
@@ -412,7 +430,36 @@ def main(argv: list[str] | None = None) -> NoReturn:
         # standalone-imported classes, and for any future Typer
         # release that switches from one to the other.
         if type(exc).__name__ in _USAGE_ERROR_CLASS_NAMES:
-            raise SystemExit(ExitCode.USER_ERROR) from exc
+            # ``ExitCode.BLUEPRINT_ERROR`` — not ``USER_ERROR`` — is
+            # the correct value here. See the module docstring's
+            # "Usage errors map to ExitCode.BLUEPRINT_ERROR (2), not
+            # USER_ERROR (1)" section for the full reasoning. Short
+            # version:
+            #
+            #   * ``USER_ERROR`` (1) means "the tool ran and the
+            #     user's *input* is invalid" — a malformed blueprint
+            #     the loader examined and rejected. That is a
+            #     distinct failure mode with a distinct remediation
+            #     (edit the blueprint).
+            #   * ``BLUEPRINT_ERROR`` (2) means "the invocation
+            #     itself was wrong" — Typer rejected the command
+            #     line before the command body ran, so the user's
+            #     blueprint was never examined. That is what a
+            #     usage error is: a *calling* mistake, not an
+            #     *input* mistake.
+            #
+            # Collapsing usage errors into 1 would tell a CI job that
+            # the blueprint was examined and found invalid, which is
+            # false. A caller that branches on ``$?`` needs to be
+            # able to tell "fix your blueprint" (1) from "fix your
+            # command line" (2). The whole four-value vocabulary
+            # exists to keep that distinction.
+            #
+            # The numeric value (2) also matches Typer's own default
+            # for usage errors, so the enum keeps the "no magic
+            # numbers" rule while remaining consistent with the tool
+            # that raised the exception.
+            raise SystemExit(ExitCode.BLUEPRINT_ERROR) from exc
         # Not a clean exit. Delegate to the central handler, which
         # renders the generic "unexpected internal error" message and
         # exits with ``ExitCode.INTERNAL_ERROR`` — or re-raises under

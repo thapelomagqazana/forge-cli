@@ -28,6 +28,21 @@ Every one of those is a pure function of the path — no TTY, no
 environment, no `sys.argv` — which is exactly what makes them fast
 and deterministic.
 
+Why every call goes through ``_exit_code``
+------------------------------------------
+``validate`` raises ``typer.Exit`` on every exit path — the mechanism
+Typer documents for exit codes under ``standalone_mode=False``. The
+helper ``tests.unit.cli._validate_helpers._exit_code`` unwraps that
+raise into an ``int`` so the test bodies can continue to assert on
+the exit code as a value. Every test that asserts on the code, or
+that merely wants to swallow the raise, uses it.
+
+The one exception is ``test_loader_exception_under_debug_is_reraised``,
+which deliberately uses ``pytest.raises`` because its subject *is*
+the mechanism — "under ``--debug``, the exception propagates
+unchanged, and its type and message are preserved". Wrapping that in
+``_exit_code`` would hide what the test is asserting.
+
 Assertion discipline: whitespace-insensitive matching
 -----------------------------------------------------
 The `ui` layer (or any future emit layer) may wrap long messages at
@@ -73,6 +88,7 @@ import pytest
 
 from forge.cli.commands.validate import _resolve_manifest, validate
 from forge.core.exceptions import ExitCode
+from tests.unit.cli._validate_helpers import _exit_code
 
 # -----------------------------------------------------------------------------
 # Whitespace-insensitive matching helper
@@ -207,7 +223,7 @@ class TestValidateCallbackPathHandling:
         success path is rendered.
         """
         manifest = _write_blueprint(tmp_path / "bp")
-        code = validate(path=manifest)
+        code = _exit_code(lambda: validate(path=manifest, json=False))
 
         assert code == ExitCode.SUCCESS
         captured = capsys.readouterr()
@@ -226,7 +242,7 @@ class TestValidateCallbackPathHandling:
         POSIX).
         """
         _write_blueprint(tmp_path / "bp")
-        code = validate(path=tmp_path / "bp")
+        code = _exit_code(lambda: validate(path=tmp_path / "bp", json=False))
 
         assert code == ExitCode.SUCCESS
         captured = capsys.readouterr()
@@ -253,7 +269,7 @@ class TestValidateCallbackPathHandling:
         """
         empty = tmp_path / "not-a-blueprint"
         empty.mkdir()
-        code = validate(path=empty)
+        code = _exit_code(lambda: validate(path=empty, json=False))
 
         assert code == ExitCode.BLUEPRINT_ERROR  # 2
         err = capsys.readouterr().err
@@ -279,7 +295,7 @@ class TestValidateCallbackPathHandling:
         manifest = tmp_path / "broken.yaml"
         manifest.write_text("id: [unclosed\n", encoding="utf-8")
 
-        code = validate(path=manifest)
+        code = _exit_code(lambda: validate(path=manifest, json=False))
 
         assert code == ExitCode.USER_ERROR  # 1
         captured = capsys.readouterr()
@@ -297,7 +313,7 @@ class TestValidateCallbackPathHandling:
         """
         _write_blueprint(tmp_path / "bp", body="id: [unclosed\n")
 
-        code = validate(path=tmp_path / "bp")
+        code = _exit_code(lambda: validate(path=tmp_path / "bp", json=False))
 
         assert code == ExitCode.USER_ERROR  # 1
 
@@ -338,7 +354,7 @@ class TestValidateDebugBehaviour:
         # Ensure `--debug` is NOT on the argv, so the default path runs.
         monkeypatch.setattr(validate_module, "_debug_requested", lambda: False)
 
-        code = validate(path=manifest)
+        code = _exit_code(lambda: validate(path=manifest, json=False))
 
         assert code == ExitCode.INTERNAL_ERROR  # 5
         err = capsys.readouterr().err
@@ -361,6 +377,14 @@ class TestValidateDebugBehaviour:
         A contributor diagnosing the loader needs the traceback; the
         command must not swallow it. `main()` catches it via
         `handle_exception(debug=True)`, which re-raises.
+
+        This test deliberately does *not* use ``_exit_code`` — its
+        subject is the raise itself ("the exception propagates
+        unchanged"), not the code it would produce. ``pytest.raises``
+        is the correct tool here: it asserts on the mechanism the
+        command is documented to use under ``--debug``. Wrapping the
+        call in ``_exit_code`` would catch the raise and hide what
+        the test is asserting.
         """
         from forge.cli.commands import validate as validate_module
 
@@ -374,7 +398,7 @@ class TestValidateDebugBehaviour:
         monkeypatch.setattr(validate_module, "_debug_requested", lambda: True)
 
         with pytest.raises(RuntimeError, match="simulated loader crash"):
-            validate(path=manifest)
+            validate(path=manifest, json=False)
 
 
 # -----------------------------------------------------------------------------
@@ -400,7 +424,7 @@ class TestValidateSourceLabel:
         """
         _write_blueprint(tmp_path / "bp", body="id: [unclosed\n")
 
-        validate(path=tmp_path / "bp")
+        _exit_code(lambda: validate(path=tmp_path / "bp", json=False))
         captured = capsys.readouterr()
         rendered = captured.out + captured.err
 
@@ -416,7 +440,7 @@ class TestValidateSourceLabel:
         manifest = tmp_path / "broken.yaml"
         manifest.write_text("id: [unclosed\n", encoding="utf-8")
 
-        validate(path=manifest)
+        _exit_code(lambda: validate(path=manifest, json=False))
         captured = capsys.readouterr()
         rendered = captured.out + captured.err
 
