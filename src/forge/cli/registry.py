@@ -152,6 +152,7 @@ import typer
 
 from forge.core.exceptions import BlueprintError
 from forge.discovery import BlueprintDiscoveryService
+from forge.models.blueprint import Blueprint
 
 logger = logging.getLogger(__name__)
 
@@ -722,6 +723,56 @@ def get_blueprint(blueprint_id: str) -> BlueprintEntry:
     )
 
 
+def get_blueprint_document(blueprint_id: str) -> Blueprint:
+    """Load the full ``Blueprint`` document for ``blueprint_id``.
+
+    Companion to ``get_blueprint``. The two differ in *what they return*
+    because they serve different callers:
+
+    * ``get_blueprint`` returns a ``BlueprintEntry`` — a catalogue view
+      with ``id``, ``display_name``, and the raw variables tuple. That
+      is what the interactive wizard needs to build a menu and
+      per-variable prompts; it is *not* enough to resolve values
+      against (the resolver needs the full document type, and reaching
+      into the entry's variables tuple would duplicate the loader's
+      schema validation at the call site).
+
+    * ``get_blueprint_document`` returns the loaded ``Blueprint`` — the
+      schema-validated, model-validated document. That is what any
+      caller that *does something with* the blueprint needs:
+      resolving variables (``forge create``), rendering templates
+      (future), verifying checks (future).
+
+    Both go through the same ``_make_discovery_service()`` seam, so a
+    test that patches the seam substitutes both. The distinction is
+    about *shape*, not about *source* — the source of truth for what
+    a blueprint is remains the loader, and neither function bypasses
+    it.
+
+    Returns
+    -------
+    Blueprint
+        The loaded, validated document.
+
+    Raises
+    ------
+    BlueprintError
+        If ``blueprint_id`` is not present in the catalogue, or if the
+        blueprint's document fails to load. Same domain-level contract
+        as ``get_blueprint`` — the CLI handler routes both to exit
+        code 2 without special-casing either.
+    """
+    service = _make_discovery_service()
+    try:
+        return service.load(blueprint_id)
+    except Exception as exc:
+        available = ", ".join(list_blueprints()) or "(none installed)"
+        raise BlueprintError(
+            f"Blueprint {blueprint_id!r} is not installed.",
+            hint=f"Available blueprints: {available}.",
+        ) from exc
+
+
 # -----------------------------------------------------------------------------
 # Public re-exports
 # -----------------------------------------------------------------------------
@@ -732,6 +783,7 @@ __all__ = [
     "RegisteredCommand",
     "SkippedCommand",
     "discover_command_modules",
+    "get_blueprint_document",
     "get_blueprint",
     "list_blueprints",
     "register_commands",

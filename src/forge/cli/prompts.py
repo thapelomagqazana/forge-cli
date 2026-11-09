@@ -93,9 +93,10 @@ Design principles
 2. **Return types match the answer's semantic type.** ``ask_confirm``
    returns ``bool``; ``ask_select`` returns the chosen ``str``;
    ``ask_text`` returns a trimmed ``str``. Callers never coerce.
-3. **Validation is a parameter, not a pattern.** ``ask_text`` and
-   ``ask_select`` accept an optional validator; the re-prompt loop is
-   inside the function, tested once.
+3. **Validation is a parameter, not a pattern.** ``ask_text`` accepts
+   an optional validator; the re-prompt loop is inside the function,
+   tested once. ``ask_select`` does not need one -- a menu cannot
+   produce an invalid answer (see its docstring).
 4. **Cancellation is uniform.** Every prompt goes through ``_guard``.
    There is no path from a prompt to a traceback.
 5. **No I/O outside the prompt.** No ``print``, no file reads, no
@@ -105,6 +106,19 @@ Design principles
    ``ask_*`` functions are the entire public surface. Replacing
    ``questionary`` with something else means rewriting this file, not
    the command layer.
+
+Why ``UserInputError`` is raised with ``hint=`` only (no positional args)
+------------------------------------------------------------------------
+``ask_select`` raises ``UserInputError`` when its ``choices`` list is
+empty. ``UserInputError`` (in ``core.exceptions``) is a ``ForgeError``
+subclass that provides its own ``__str__``; a ``hint`` kwarg is not part
+of that base class. The version of this module that called
+``UserInputError("...", hint="...")`` would raise ``TypeError`` at
+runtime the moment the empty-menu path fired -- a bug that only shows up
+in the exact misconfiguration it is meant to report, which is the worst
+possible time. The empty-menu message below is a single sentence that
+carries both the *what* and the *what to do*, matching the shape of
+every other ``UserInputError`` call site in the codebase.
 """
 
 from __future__ import annotations
@@ -113,10 +127,7 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Final, TypeVar, cast
 
-from forge.core.exceptions import (
-    PromptCancelledError,
-    UserInputError,
-)
+from forge.core.exceptions import PromptCancelledError, UserInputError
 
 if TYPE_CHECKING:
     # Imported for the type checker only. ``TYPE_CHECKING`` is a
@@ -445,24 +456,37 @@ def ask_text(
             # Re-prompt on empty input. The error is shown inline,
             # exactly like a validator failure, so the user has one
             # mental model: "the wizard tells me what's wrong and
-            # lets me fix it."
+            # lets me fix it." Using a bounded loop rather than
+            # recursion so a script feeding an empty line repeatedly
+            # cannot blow the Python stack -- a non-issue for humans
+            # but a real risk when stdin is a buggy test harness.
             questionary.print("  This field cannot be empty.", style="fg:red")
-            return _run_once()
+            raise _RetryError()
 
         if validator is not None:
             error = validator(answer)
             if error:
-                # Validator failure: show the message, re-prompt. The
-                # recursive call is bounded by the user's patience,
-                # which is exactly the right bound for an interactive
-                # prompt. (A non-interactive mode would never reach
-                # this code path.)
+                # Validator failure: show the message, re-prompt.
+                # Same bounded-loop reasoning as above.
                 questionary.print(f"  {error}", style="fg:red")
-                return _run_once()
+                raise _RetryError()
 
         return answer
 
-    return _guard(_run_once)
+    def _run() -> str:
+        # Bounded re-prompt loop. Each iteration asks once; a failed
+        # validation re-raises ``_RetryError`` which we catch here and
+        # loop back to the top. Using a loop (not recursion) means
+        # an adversarial or buggy stdin cannot exhaust the Python
+        # stack -- a real concern for a wizard that is also driven
+        # by automated tests.
+        while True:
+            try:
+                return _run_once()
+            except _RetryError:
+                continue
+
+    return _guard(_run)
 
 
 def ask_select(
@@ -518,10 +542,16 @@ def ask_select(
         # domain error so the CLI handler renders a clean message
         # and exits 1, instead of questionary raising an opaque
         # internal error.
+        #
+        # ``UserInputError`` provides its own ``__str__``; a hint is
+        # folded into the message itself, because the domain
+        # exception does not accept a ``hint=`` kwarg (calling it
+        # with one raises ``TypeError`` at the exact moment this
+        # error path fires).
         raise UserInputError(
-            "No options are available to select from.",
-            hint="This is likely an installation problem. Try "
-            "reinstalling Forge, or check that blueprints are present.",
+            "No options are available to select from. "
+            "This is likely an installation problem: try reinstalling "
+            "Forge, or check that blueprints are present."
         )
 
     # Build the style once per prompt call -- see the note in
@@ -595,10 +625,36 @@ def ask_confirm(
             ).unsafe_ask(),
         )
 
-    # ``_guard`` is generic, so this now returns ``bool`` -- the
+    # ``_guard`` is generic, so this returns ``bool`` -- the
     # previous non-generic signature forced ``mypy`` to see this as
     # ``str``, which was the "Incompatible return value" error.
     return _guard(_run)
+
+
+# -----------------------------------------------------------------------------
+# Internal control-flow sentinel
+# -----------------------------------------------------------------------------
+class _RetryError(Exception):
+    """Signal used by ``ask_text`` to drive its bounded re-prompt loop.
+
+    Using an exception rather than a sentinel return value keeps
+    ``_run_once`` free to return the real answer type (``str``) on
+    success, and lets the outer loop distinguish "success" from
+    "please try again" without a second union type. The class is
+    private (underscore) because no caller should ever see or raise
+    it -- it is an implementation detail of ``ask_text``'s loop.
+
+    It subclasses ``Exception`` (not ``BaseException``) so that
+    ``except Exception`` blocks in user code do not accidentally
+    swallow it and mask a real bug; the only place it is caught is
+    the ``while True`` loop in ``ask_text``.
+
+    The ``Error`` suffix is what ``ruff``'s ``N818`` rule requires
+    for exception class names. This is a control-flow signal rather
+    than a user-facing failure, but the naming convention is cheap
+    to follow and avoids a localized ``# noqa`` that future readers
+    would have to justify.
+    """
 
 
 # -----------------------------------------------------------------------------
