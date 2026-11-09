@@ -37,11 +37,21 @@ global coverage gate in `pyproject.toml` measures the whole `src/` tree
 on every run, and a single-file run can never meet a 90% gate by
 construction. Use `--no-cov` locally; let CI run the full suite with
 coverage enabled.
+
+Snapshot newline convention
+---------------------------
+The `_assert_snapshot` helper that used to live in this file has been
+replaced by `tests.unit.cli._snapshot.assert_golden`, which is shared
+with `test_list_json.py` and `test_list_empty.py`. The helper
+normalises both sides to the payload (see its docstring), which fixes
+the trailing-newline failure that all three files hit independently.
+The move is not "extract a function for its own sake" -- it is what
+stops the third copy of a helper from being fixed by the fourth
+response to a fourth failure report.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -56,13 +66,13 @@ from forge.models.blueprint import (
     Category,
     DiscoveredBlueprint,
 )
+from tests.unit.cli._snapshot import FIXTURE_ROOT, assert_golden
 
 # ---------------------------------------------------------------------------
 # Shared fixtures and helpers
 # ---------------------------------------------------------------------------
 
-_FIXTURES = Path(__file__).parents[2] / "fixtures" / "list"
-_UPDATE = os.environ.get("UPDATE_SNAPSHOTS") == "1"
+_FIXTURES = FIXTURE_ROOT  # re-exported for tests that need a path directly
 
 
 def _row(
@@ -374,40 +384,19 @@ class TestSnapshots:
       `test_list_json.py`; not duplicated here to keep this file focused
       on table rendering.
 
+    All fixtures go through the shared helper
+    ``tests.unit.cli._snapshot.assert_golden``, which normalises the
+    trailing-newline convention (files end with ``\\n``; payloads do
+    not). The helper is shared with ``test_list_json.py`` and
+    ``test_list_empty.py``, so a future change to the convention
+    touches one place, not three.
+
     If a snapshot fixture is missing and ``UPDATE_SNAPSHOTS`` is not
-    set, this class fails with a message naming the exact command to
+    set, the helper fails with a message naming the exact command to
     regenerate it, rather than letting ``FileNotFoundError`` bubble up
     from ``Path.read_text``. That message is the fix -- regeneration is
     the expected response, not an investigation.
     """
-
-    def _assert_snapshot(self, actual: str, fixture_name: str) -> None:
-        fixture_path = _FIXTURES / fixture_name
-
-        if _UPDATE:
-            fixture_path.parent.mkdir(parents=True, exist_ok=True)
-            fixture_path.write_text(actual, encoding="utf-8")
-            return
-
-        if not fixture_path.exists():
-            pytest.fail(
-                f"Snapshot fixture {fixture_name!r} does not exist.\n"
-                f"Regenerate it with:\n"
-                f"    UPDATE_SNAPSHOTS=1 uv run pytest "
-                f"{Path(__file__).name} --no-cov\n"
-                f"then inspect the diff before committing."
-            )
-
-        expected = fixture_path.read_text(encoding="utf-8")
-        assert actual == expected, (
-            f"\nSnapshot mismatch for {fixture_name}.\n"
-            f"If this change is intentional, regenerate with:\n"
-            f"    UPDATE_SNAPSHOTS=1 uv run pytest "
-            f"{Path(__file__).name} --no-cov\n"
-            f"and inspect the diff before committing.\n\n"
-            f"--- expected ---\n{expected}\n"
-            f"--- actual ---\n{actual}\n"
-        )
 
     def test_snapshot_official_table(
         self,
@@ -427,11 +416,20 @@ class TestSnapshots:
         ]
         _run_command(pairs, capsys=capsys)
         out = capsys.readouterr().out
-        # `ui.emit` appends exactly one trailing newline; the fixture
-        # captures what the user sees minus that terminator. This is
-        # the documented contract from ADR-0012 (`ui.emit` owns line
-        # termination; renderers do not append one).
-        self._assert_snapshot(out.rstrip("\n"), "snapshot_official.txt")
+        # `ui.emit` appends exactly one trailing newline; the helper
+        # normalises it away along with the fixture file's newline.
+        # No `.rstrip("\n")` at the call site: the rule lives in the
+        # helper, so every test in every file that uses it follows the
+        # same rule.
+        assert_golden(
+            out,
+            "snapshot_official.txt",
+            contract_blurb=(
+                "This is a *snapshot* (cosmetic), not a contract. A "
+                "content diff here usually means a DTO projection bug; "
+                "a width-only diff is expected churn."
+            ),
+        )
 
     def test_snapshot_truncation_table(self) -> None:
         # The ID column cap is 32 codepoints; this input is 45 chars,
@@ -439,13 +437,29 @@ class TestSnapshots:
         # cap, so the renderer is what produces the truncation.
         long_id = "python.fastapi.api.very.long.id.that.exceeds.the.cap"
         rendered = render_table([_row(id_=long_id, name="Demo")])
-        self._assert_snapshot(rendered, "snapshot_truncation.txt")
+        assert_golden(
+            rendered,
+            "snapshot_truncation.txt",
+            contract_blurb=(
+                "Truncation is the renderer's contract: the ellipsis "
+                "glyph and column widths are user-visible. A change "
+                "here is consumer-facing for anyone parsing the table."
+            ),
+        )
 
     def test_snapshot_empty_renders_header_only(self) -> None:
         # The renderer's own empty case -- distinct from the command's
         # "No blueprints found." message (see test_list_empty.py).
         rendered = render_table([])
-        self._assert_snapshot(rendered, "snapshot_empty_renderer.txt")
+        assert_golden(
+            rendered,
+            "snapshot_empty_renderer.txt",
+            contract_blurb=(
+                "The renderer's empty case is a building block: a "
+                "future composite report (multiple tables) relies on "
+                "'header + separator, no rows' being stable."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

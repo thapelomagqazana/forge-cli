@@ -15,28 +15,37 @@ Design principles
   `Result[Blueprint, list[ValidationError]]` — never a bare exception, never
   `None`, never a partial object. Callers cannot accidentally ignore failure
   because `Result` is not truthy and `.unwrap()` raises loudly.
+
 * **Aggregate, don't short-circuit.** Except for YAML-parse failures (there
   is no document to check), every phase contributes what it can. A user
   fixes one file in one pass, not N passes.
+
 * **Hints are mandatory.** Every `ValidationError` carries a `hint`.
   A missing hint is a bug, not a cosmetic issue — it means the user is
   being told *what* is wrong without being told *what to do*.
+
 * **Phase order is intentional.** See the flow diagram below. The schema
   is authoritative (ADR-0007); the model is a typed projection (ADR-0008);
   filesystem checks run last because they depend on a structurally valid
   document (a partially-valid model would have ambiguous file references).
 
+* **Accept a file *or* a directory.** Users naturally type
+  `forge validate ./my-blueprint/` — the loader (not the command) is the
+  right place to normalise that input so every caller speaks the same
+  path language and no command re-implements the "is it a directory?"
+  dance. Normalisation happens exactly once, at the top of `load()`.
+
 Phase flow
 ----------
-    raw bytes ─► parse YAML ─► schema ─► model ─► fs checks ─► Ok(Blueprint)
-                     │            │         │          │
-                     │            │         │          └──► template errors
-                     │            │         └─────────────► model errors
-                     │            └───────────────────────► schema errors
-                     └────────────────────────────────────► parse error
-                                                                       │
-                                                                       ▼
-                                                    Err([ValidationError, ...])
+    raw bytes → parse YAML → schema → model → fs checks → Ok(Blueprint)
+                     │           │        │         │
+                     │           │        │         └──── template errors
+                     │           │        └────────────── model errors
+                     │           └─────────────────────── schema errors
+                     └─────────────────────────────────── parse error
+                                                                 │
+                                                                 ▼
+                                             Err([ValidationError, ...])
 
 Short-circuit rules (deliberate, and covered by tests):
     * YAML parse failure  → return immediately (no document to check).
@@ -64,12 +73,43 @@ from forge.loading.yaml_parser import ParsedDocument, parse_yaml
 from forge.models import Blueprint
 from forge.verification.handlers import model_errors, schema_errors
 
+# Filename that identifies a blueprint manifest inside a directory.
+# Kept as a module-level constant so callers (validate, discovery, tests)
+# can reference the same name without duplicating the string.
+MANIFEST_NAME = "blueprint.yaml"
+
+
+def _normalise(path: Path) -> tuple[Path, Path]:
+    """Split a user-supplied path into (manifest_file, blueprint_root).
+
+    A user may pass either:
+        * a directory that contains ``blueprint.yaml``, or
+        * the ``blueprint.yaml`` file itself.
+
+    Both forms mean the same thing to the loader; we normalise once here
+    so downstream phases always see a concrete file plus the directory
+    against which template references resolve.
+
+    The ``blueprint_root`` is what ``check_templates`` uses to look up
+    ``files[].source`` paths — it must be the directory the manifest
+    lives in, regardless of whether the caller passed the manifest
+    directly or its parent directory.
+
+    No filesystem state is mutated; ``.is_dir()`` is a cheap stat that
+    the loader is already going to perform implicitly when it opens the
+    manifest. Doing it up front keeps the intent explicit.
+    """
+    resolved = path.expanduser()
+    if resolved.is_dir():
+        return resolved / MANIFEST_NAME, resolved
+    return resolved, resolved.parent
+
 
 class BlueprintLoader:
     """Load, validate, and type a single blueprint from disk.
 
     Stateless and side-effect-free apart from reading the input file
-    (and, when `check_files=True`, stat-ing referenced template files).
+    (and, when ``check_files=True``, stat-ing referenced template files).
     Safe to reuse across calls and across threads.
     """
 
@@ -79,14 +119,16 @@ class BlueprintLoader:
         *,
         check_files: bool = True,
     ) -> Result[Blueprint, list[ValidationError]]:
-        """Load and validate the blueprint at `path`.
+        """Load and validate the blueprint at ``path``.
 
         Parameters
         ----------
         path
-            Filesystem path to a blueprint YAML file. May be relative;
-            resolved against the current working directory by the caller
-            if absolute paths are needed for logging.
+            Either a directory containing ``blueprint.yaml``, or the
+            path to a ``blueprint.yaml`` file. Relative paths are
+            resolved against the current working directory (``Path``
+            semantics); callers that need absolute paths for logging
+            should resolve them before passing in.
         check_files
             When True (default), verifies that every template file the
             blueprint references actually exists under the blueprint's
@@ -97,9 +139,9 @@ class BlueprintLoader:
         Returns
         -------
         Result[Blueprint, list[ValidationError]]
-            `Ok(blueprint)` on success. `Err(errors)` otherwise, with
-            at least one entry. Every error carries `path`, `message`,
-            `hint`, and `source`.
+            ``Ok(blueprint)`` on success. ``Err(errors)`` otherwise, with
+            at least one entry. Every error carries ``path``,
+            ``message``, ``hint``, and ``source``.
 
         Raises
         ------
@@ -110,18 +152,56 @@ class BlueprintLoader:
             error; it is a plain ``TypeError`` (not an ``AssertionError``)
             so it survives ``python -O``.
         """
+        # The ``source`` label is what the user sees in error output.
+        # We use the *original* path (not the normalised manifest path)
+        # so a user who typed ``./my-blueprint/`` sees their own input
+        # echoed back, not a path they did not type. Errors that point
+        # to a location the user did not name are the single biggest
+        # cause of "I cannot reproduce your error" reports.
         source = str(path)
 
         # ------------------------------------------------------------------
-        # Phase 0 — read the file.
+        # Phase 0 — normalise the path.
+        #
+        # Accept a directory or a file, and split into (manifest, root).
+        # This is the *only* place in the loader that cares which shape
+        # the caller passed; every phase below speaks in terms of the
+        # manifest file, plus (for the filesystem phase) the root
+        # directory.
+        # ------------------------------------------------------------------
+        manifest, blueprint_root = _normalise(path)
+
+        # ------------------------------------------------------------------
+        # Phase 0b — read the file.
         #
         # We read *bytes*, not text, so that encoding problems surface as
         # a located error from the YAML parser rather than as a Unicode
         # traceback. The loader owns the I/O boundary; downstream phases
         # receive `bytes` and never touch disk for the document itself.
+        #
+        # ``FileNotFoundError`` is distinguished from other ``OSError``
+        # cases because it is the most common user mistake (typo in the
+        # path, or a directory that does not contain ``blueprint.yaml``)
+        # and the fix is different from "check permissions" — the hint
+        # names both possibilities so the user does not have to guess.
         # ------------------------------------------------------------------
         try:
-            raw = path.read_bytes()
+            raw = manifest.read_bytes()
+        except FileNotFoundError:
+            return Err(
+                [
+                    ValidationError(
+                        path="",
+                        message=f"no '{MANIFEST_NAME}' found at {path}",
+                        hint=(
+                            f"Pass a directory containing '{MANIFEST_NAME}', "
+                            f"or the path to '{MANIFEST_NAME}' itself."
+                        ),
+                        source=source,
+                        code="input.not_found",
+                    )
+                ]
+            )
         except OSError as exc:
             return Err(
                 [
@@ -133,6 +213,7 @@ class BlueprintLoader:
                             "able to read the file."
                         ),
                         source=source,
+                        code="io.error",
                     )
                 ]
             )
@@ -235,11 +316,17 @@ class BlueprintLoader:
         # Discovery passes `check_files=False` because it stages candidates
         # in a temp directory whose templates cannot exist by construction;
         # failing there would produce false positives.
+        #
+        # The root directory used for template resolution is the *manifest's
+        # parent*, not the caller-supplied path. When the caller passed a
+        # directory they are the same; when the caller passed the file
+        # directly, ``_normalise`` already resolved it to the manifest's
+        # parent. Either way, template references resolve consistently.
         # ------------------------------------------------------------------
         if check_files:
             fs_errs = check_templates(
                 blueprint,
-                blueprint_root=path.parent,
+                blueprint_root=blueprint_root,
                 source=source,
             )
             if fs_errs:

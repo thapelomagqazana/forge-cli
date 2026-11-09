@@ -1,0 +1,8 @@
+{
+  "blueprint_id": "python.fastapi.api",
+  "errors": [],
+  "schema_version": "1.0.0",
+  "source": "my-blueprint",
+  "valid": true,
+  "version": "1.0.0"
+}

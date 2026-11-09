@@ -33,30 +33,60 @@ the callback, registers the callback *function* as a leaf command on
 the root app, and produces the invocation shape users expect —
 ``forge validate <path>``.
 
-Exit-code mechanism: return, not raise
---------------------------------------
-The command declares ``-> int`` and returns its exit code rather than
-raising ``typer.Exit``. This is a deliberate choice with a specific
-justification:
+Exit-code mechanism: raise ``typer.Exit``, not return an int
+------------------------------------------------------------
+The command raises ``typer.Exit(code=...)`` from its body rather
+than returning an integer. This is the mechanism Typer documents for
+signalling an exit code from a command, and it is the *only* one
+that is reliable under ``standalone_mode=False``.
 
-* Under ``standalone_mode=False``, Typer *returns* the callback's
-  return value from ``app(...)``. That has been the documented
-  behaviour on every Typer version since the flag existed. Reading
-  the return value in ``main()`` is therefore portable.
-* ``typer.Exit`` propagation under ``standalone_mode=False`` is *not*
-  documented as stable, and in some Typer versions it is swallowed —
-  ``app(...)`` returns the callback's value (``None``, for a command
-  declared ``-> None``) rather than raising. That silently loses the
-  exit code the command chose.
-* Returning the exit code sidesteps the version-dependence entirely.
-  ``main()`` reads the return value; if it is an integer, that is the
-  exit code. No exception machinery, no version-specific behaviour.
+Why raising works
+~~~~~~~~~~~~~~~~~
+``typer.Exit`` is an exception. When raised from a command body, it
+propagates out of ``app(...)`` regardless of ``standalone_mode``:
+``standalone_mode=False`` disables Typer's *conversion* of
+``typer.Exit`` into ``sys.exit()``, but it does not disable the
+exception itself. ``main()`` catches it in its
+``except typer.Exit as exc:`` clause and converts to
+``SystemExit(exc.exit_code)``. That propagation is documented and
+stable across every Typer version since the flag existed.
 
-The module still imports ``typer`` for the sub-Typer constructor and
-for ``typer.Argument``, but the command body no longer raises
-``typer.Exit``. ``--debug`` behaviour is unchanged: on an escaping
-exception, the command re-raises, and ``main()``'s ``handle_exception``
-(with ``debug=True``) surfaces the traceback.
+Why returning does not
+~~~~~~~~~~~~~~~~~~~~~~
+A callback declared ``-> int`` that *returns* its exit code relies
+on ``app(...)`` to propagate that return value to the caller. Under
+``standalone_mode=False``, that propagation is **not** documented as
+reliable — in some Typer versions it works, in others the return
+value is swallowed and ``app(...)`` returns ``None`` regardless of
+what the callback produced. An earlier draft of this command relied
+on the return value and produced exit code 0 for every invocation
+when the installed Typer version happened to be in the "swallowed"
+camp. Do not reintroduce that reliance.
+
+The callback is declared ``-> None`` for the same reason: it
+communicates to a reader (and to ``mypy``) that the callback has no
+return value to propagate. Every exit path goes through an explicit
+``raise typer.Exit(code=...)``; there is no ``return <int>``
+anywhere in the module.
+
+The module still imports ``typer`` for the sub-Typer constructor,
+for ``typer.Argument`` / ``typer.Option``, and for the ``typer.Exit``
+it raises on every exit path. ``--debug`` behaviour is unchanged: on
+an escaping exception, the command re-raises, and ``main()``'s
+``handle_exception`` (with ``debug=True``) surfaces the traceback.
+
+Why ``raise … from exc`` on the loader-crash path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The loader-crash path uses ``raise typer.Exit(...) from exc`` — not
+``from None``. The exit code (5, "internal error, report it") is
+*caused* by the loader exception, and the causal chain is what a
+contributor sees under ``--debug`` (or under any future change that
+stops re-raising ``exc`` directly). ``from None`` would suppress the
+underlying exception, which contradicts the exit-5 contract — that
+code exists precisely so a Forge bug is visible and reportable, and
+hiding the bug from the person best placed to diagnose it is the
+opposite of that. ``ruff``'s B904 rule requires the explicit choice;
+``from exc`` is the choice that matches the contract.
 
 Why not ``@app.command(name="")``?
 ----------------------------------
@@ -80,32 +110,40 @@ registry's detection correct by construction.
 
 Exit codes
 ----------
-The command obeys the project's stable exit-code contract (see
+The command obeys the project's stable exit-code contract (ADR-0013,
 ``docs/reference/exit-codes.md``). Its exit code is **total** — every
-documented path produces one of three values, never anything else:
+documented path produces one of three values *from the loader's
+perspective*, plus exit 5 for genuine internal failures, matching the
+convention every other command follows:
 
 * ``0`` — validation succeeded.
-* ``1`` — the blueprint is invalid (schema violations, model parity
-  errors, missing templates, unreadable files, malformed YAML), or
-  the loader itself raised an unexpected exception while validating.
-* ``2`` — usage error (missing path, path does not exist, unreadable
-  path, or directory without a ``blueprint.yaml``) — emitted by
-  Typer or by the command body before the loader runs.
+* ``1`` — the blueprint is invalid. The loader returned
+  ``Err([...])``; every reported violation is rendered.
+* ``2`` — usage error emitted by Typer *before* the command body
+  runs (missing ``PATH``, path does not exist, unreadable path), or
+  by the command body when a directory was passed without a
+  ``blueprint.yaml`` (a caller-side mistake, not a blueprint problem).
+* ``5`` — an *unexpected* exception escaped the loader. From the
+  user's perspective "the loader crashed on my file" and "my file is
+  invalid" both mean "my file did not validate", but they have
+  different remedies: a crash means *the tool* has a bug and the
+  user should report it; an invalid blueprint means *the blueprint*
+  needs fixing. Collapsing them into a single code would lose that
+  distinction and violate ADR-0013, which assigns ``5`` specifically
+  to "internal error, report it". So an escaping loader exception
+  exits ``5`` with a message pointing at ``--debug`` and the issue
+  tracker.
 
-**Exit code 5 is never returned by this command.** The loader is
-designed to be total (every expected failure is an ``Err``), but the
-loader runs inside a real process — a missing bundled resource, an
-OS-level permission error, a bug in a phase — and any of those could
-raise. From the *user's* perspective, "the loader crashed on my file"
-and "my file is invalid" are the same problem (their file did not
-validate), so the command converts an escaping exception into exit
-code 1 with a rendered error, not into exit code 5 with an internal-
-error message. Scripts and CI can branch on ``$?`` and be sure that
-exit 5 (if it ever appears) means "the CLI itself has a bug that this
-command could not contain" — never "your blueprint is invalid".
+An earlier draft of this command collapsed the loader-crash case into
+``1`` to keep the contract "narrower". That was rejected: ``validate``
+must be usable in CI, and a CI job that branches on ``$?`` needs to
+tell "your blueprint has a problem" from "Forge has a problem". The
+whole point of ADR-0013's exit ``5`` is to make Forge bugs visible.
+The loader is designed to be total, so a loader exception is, by
+construction, a Forge bug — and Forge bugs are ``5``.
 
-Under ``--debug``, the exception is re-raised rather than converted,
-so a contributor diagnosing the underlying bug gets the full
+Under ``--debug``, an escaping exception is re-raised rather than
+converted to exit 5, so a contributor diagnosing the bug gets the full
 traceback. The two audiences (users and contributors) get what each
 of them needs from the same code path.
 
@@ -121,20 +159,59 @@ belongs.
 
 Output modes
 ------------
-Human mode (default): one error per line, using
+The command has two output modes, dispatched by ``_render_dispatch``
+after a successful load. Both modes carry the *same* exit code; the
+mode changes presentation, not verdict.
+
+**Human mode** (default): one error per line, using
 ``ValidationError.format()``, which the loader guarantees renders
-``source:line:col: path: message — hint: fix``. Greppable, copy-
-pasteable, and readable in a narrow terminal. A leading summary line
+``source: path: message — hint: fix`` and, when the parser could
+locate the failure (YAML parse errors), ``source:line:col: path:
+message — hint: fix``. A leading summary line
 (``N validation error(s):``) orients the user before the list, and a
 trailing success line (``OK: <id> v<version>``) tells them the
 command did something when there are no errors.
 
-The ``--json`` flag is *not* added here. It was scoped to a separate
-task, and adding it now would couple this command to a serialization
-module that does not yet exist. When the JSON output task lands, the
-change is additive: a new flag, a new branch in ``_render``, and no
-change to the pipeline. The command is structured so that change is a
-small, obvious diff rather than a rewrite.
+**JSON mode** (``--json``): a versioned envelope built as a
+``ValidateOutput`` DTO (see ``forge.cli.schemas.validate_output``)
+and serialised by ``render_validate_json``. The DTO's field set,
+nullability, and version literal are enforced at construction, so
+the serialised shape cannot drift from the documented contract
+(``docs/reference/CLI_VALIDATE_OUTPUT.md``). JSON output goes to
+stdout only; nothing in either branch writes to stderr when
+``--json`` is active, because mixing human-readable prose into a
+machine-readable stream breaks consumers (see ``test_validate_json``).
+
+Both renderers live in ``forge.cli.renderers`` and are kept pure (no
+I/O, no sorting, no ANSI); the command's only job at this stage is to
+pick one and forward its result. The two-renderer split is ADR-0012.
+
+Each renderer exits by raising ``typer.Exit`` — the *mechanism* is
+identical to the command body's, and for the same reason. The
+renderers do not return exit codes; they *are* the exit-code
+decision, expressed as the one operation the process boundary
+understands.
+
+Why ``--json`` is coerced to a real ``bool`` before dispatch
+------------------------------------------------------------
+``@app.callback()`` returns the decorated function *unchanged*, so a
+direct caller — a unit test, a script importing ``validate``, a
+future embedding of the CLI — invokes the Python signature, not the
+Typer dispatch. The default for a ``typer.Option(False, "--json")``
+parameter is an ``OptionInfo`` instance, not ``False``. Typer unpacks
+it during dispatch; a direct Python call does not.
+
+``OptionInfo`` is a non-empty object, so ``if as_json:`` is truthy
+even when the flag was omitted. Left alone, a direct caller that says
+nothing about the mode gets JSON mode instead of human mode — a
+behaviour-change-on-import bug that is invisible in review and
+impossible to diagnose from a downstream stack trace.
+
+``_coerce_bool`` makes the unwrapping explicit and testable, and its
+docstring records why it exists so a future maintainer does not
+delete it on the theory that "Typer always passes a bool." Typer
+*does* when the flag comes through dispatch; direct callers do not,
+and the guard is for them.
 
 What this command deliberately does not do
 ------------------------------------------
@@ -157,6 +234,20 @@ What this command deliberately does not do
   ``forge create``; validation is fast and belongs here. Blueprint
   authors get template syntax errors when they run ``forge create``
   against a test project, which is the natural workflow.
+
+Deferred improvements
+---------------------
+* **Thread ``ctx.obj`` through the registry.** The current
+  ``_debug_requested()`` helper scans ``sys.argv`` because the
+  registry does not pass ``typer.Context.obj`` to single-command
+  callbacks. When the registry grows support for it (or when a
+  second root-level flag needs the same treatment), ``_debug_requested``
+  should be replaced with a read of ``ctx.obj["debug"]``. Recorded
+  here so a contributor replacing the argv scan has a clear
+  destination. (``--json`` is a *command-level* flag, not a root
+  one, so it does not participate in this deferred work: Typer
+  threads it through the callback signature like any other
+  ``typer.Option``.)
 """
 
 from __future__ import annotations
@@ -165,8 +256,10 @@ import sys
 from pathlib import Path
 
 import typer
+from typer.models import OptionInfo
 
 from forge.cli import ui
+from forge.core.exceptions import ExitCode
 from forge.loading import BlueprintLoader
 from forge.loading.errors import ValidationError
 from forge.loading.result import Err, Ok
@@ -183,6 +276,43 @@ app = typer.Typer(
     name="validate",
     help="Validate a blueprint definition.",
 )
+
+
+# -----------------------------------------------------------------------------
+# Option coercion
+# -----------------------------------------------------------------------------
+def _coerce_bool(value: object, *, default: bool) -> bool:
+    """Return a real ``bool``, unwrapping a Typer ``OptionInfo`` if present.
+
+    The reason this exists (and the reason it must not be removed):
+
+    * ``@app.callback()`` returns the decorated function unchanged, so
+      a *direct* caller — a unit test, an embedding script, a future
+      non-CLI entry point — is calling the Python signature, not the
+      CLI. Typer unpacks ``OptionInfo`` during dispatch; a direct
+      caller does not.
+    * ``OptionInfo`` is a non-empty object, so ``if value:`` is truthy
+      even when the flag was omitted. Any branch that treats the
+      parameter as a boolean (like ``_render_dispatch``'s
+      ``if as_json:``) silently takes the "flag was set" path for a
+      caller who said nothing about it — the classic
+      behaviour-change-on-import bug.
+
+    The unwrap is conservative: ``OptionInfo`` exposes ``.default``,
+    which is the value Typer would have passed through dispatch. Any
+    other value falls through to ``bool(value)``, which is correct
+    for real ``bool`` parameters and is what Typer produces in normal
+    operation.
+
+    ``default`` is passed explicitly rather than baked into the
+    helper so the coercion is honest about the *caller's* intent: a
+    caller with a default of ``False`` and one with a default of
+    ``True`` both get the right answer, and the helper does not
+    invent a third policy that neither of them asked for.
+    """
+    if isinstance(value, OptionInfo):
+        return bool(value.default)
+    return bool(value) if value is not None else default
 
 
 # -----------------------------------------------------------------------------
@@ -219,12 +349,24 @@ def validate(
         # so the rendered output does not depend on ``cwd``.
         resolve_path=True,
     ),
-) -> int:
+    json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a versioned JSON envelope instead of human-readable text.",
+        # No short flag: ``-j`` is reserved for a hypothetical future
+        # ``--jobs`` (parallel validation of multiple blueprints).
+        # Giving ``--json`` a short alias now would force a rename
+        # later, when the alias is more expensive to change than the
+        # convenience is worth.
+    ),
+) -> None:
     """Validate a blueprint without generating a project.
 
-    Returns the process exit code (see the module docstring's
-    "Exit-code mechanism: return, not raise" section for why the exit
-    code is a return value rather than a raised ``typer.Exit``).
+    Every exit path raises ``typer.Exit(code=...)``; the function is
+    declared ``-> None`` so that a reader (and mypy) sees there is no
+    return value to propagate. See the module docstring's
+    "Exit-code mechanism: raise ``typer.Exit``, not return an int"
+    section for the full reasoning.
     """
     # ------------------------------------------------------------------
     # 1. Resolve the user's path to a blueprint manifest.
@@ -237,17 +379,24 @@ def validate(
     manifest = _resolve_manifest(path)
     if manifest is None:
         # A directory was passed but contains no ``blueprint.yaml``.
-        # This is a usage error: the caller pointed at something that
-        # is not a blueprint. Return code 2 (Typer's own usage-error
-        # code) so scripts cannot distinguish "forgot PATH" from
-        # "PATH is not a blueprint folder" — both mean "you called me
-        # wrong", not "your blueprint is invalid".
+        # This is a *usage* error: the caller pointed at something
+        # that is not a blueprint directory. Exit code 2 (Typer's own
+        # usage-error code) so scripts cannot distinguish "forgot
+        # PATH" from "PATH is not a blueprint folder" — both mean
+        # "you called me wrong", not "your blueprint is invalid".
+        #
+        # The message goes through the *human* stream unconditionally:
+        # even in ``--json`` mode, the envelope machinery never runs
+        # because the loader was never called. Emitting the human
+        # message here is correct because this is a *usage* error,
+        # not a validation result, and a usage error in JSON mode is
+        # a caller mistake worth surfacing on stderr regardless.
         ui.error(
             f"No blueprint.yaml found in directory: {path}\n"
             f"  hint: A blueprint directory must contain a "
             f"'blueprint.yaml' at its root."
         )
-        return 1
+        raise typer.Exit(code=ExitCode.BLUEPRINT_ERROR)  # 2
 
     # ------------------------------------------------------------------
     # 2. Run the loader.
@@ -263,12 +412,23 @@ def validate(
     # template, unreadable file) is returned as ``Err([...])``. But
     # the loader runs inside a real process — a missing bundled
     # resource, an OS-level permission error, or a bug in a phase
-    # could raise. From the *user's* perspective, "the loader crashed
-    # on my file" and "my file is invalid" are the same problem: their
-    # file did not validate. So we convert any escaping exception into
-    # a single rendered error and return exit code 1 (validation
-    # failed), not 5 (internal error). The command's exit-code
-    # contract becomes total: 0, 1, or 2 — never 5.
+    # could raise. Per ADR-0013, an *unexpected* exception is a Forge
+    # bug, not a user error, and it must surface as exit 5 so CI
+    # jobs can distinguish "your blueprint has a problem" from "Forge
+    # has a problem". Collapsing both into exit 1 would lose that
+    # distinction and hide real bugs behind a "blueprint invalid"
+    # message that the user cannot fix.
+    #
+    # The report on this path is always human-readable, even in
+    # ``--json`` mode: a loader crash is a Forge bug, and the
+    # JSON envelope (`ValidateOutput`) is shaped for *blueprint
+    # validation results*, not for tool failures. Emitting a
+    # `{"valid": false, "errors": [...]}` envelope for "the loader
+    # crashed" would force every consumer to distinguish "the
+    # blueprint was rejected" from "the tool blew up" by inspecting
+    # `errors[0].code` — which is exactly the sort of mixed-message
+    # stream the ADR-0012 renderer split exists to avoid. The
+    # correct signal for "tool failed" is exit 5 and stderr prose.
     #
     # Under ``--debug``, we do *not* catch: a contributor debugging
     # the loader wants the traceback, and swallowing it would hide
@@ -284,31 +444,52 @@ def validate(
             # user explicitly asked for it, and a contributor
             # diagnosing the loader needs the stack.
             raise
-        # Convert the exception into the same error surface a
-        # validation failure produces, so scripts and CI see one
-        # kind of failure (exit 1) for the same command — not an
-        # internal-error exit 5 that would suggest the CLI itself
-        # is broken.
-        ui.error(f"Could not validate {path}: {exc}")
-        ui.hint(
-            "Run with --debug for a full traceback, or report this "
-            "at https://github.com/thapelomagqazana/forge-cli/issues"
+        # Convert the exception into a user-facing report, but
+        # *preserve* the exit-5 contract: this is a Forge bug, not a
+        # blueprint problem. The message names the exception class so
+        # the user has a specific string to include in a bug report,
+        # but the *hint* (and the exit code) tell them this is not
+        # something they can fix in their blueprint.
+        ui.print_error(f"Could not validate {path}: {type(exc).__name__}: {exc}")
+        ui.print_hint(
+            "This is an internal Forge error, not a problem with your "
+            "blueprint. Run with --debug for a full traceback, or report "
+            "this at https://github.com/thapelomagqazana/forge-cli/issues"
         )
-        return 1
+        # ``from exc`` (not ``from None``) is deliberate. The exit
+        # code is *caused* by the loader exception, and the causal
+        # chain is what a contributor sees under ``--debug`` (or
+        # under any future change that stops re-raising ``exc``
+        # directly). ``from None`` would suppress the underlying
+        # exception, which contradicts the exit-5 contract — that
+        # code exists precisely so a Forge bug is visible and
+        # reportable, and hiding the bug from the person best placed
+        # to diagnose it is the opposite of that. ``ruff``'s B904
+        # rule requires the explicit choice; this is the choice that
+        # matches the contract.
+        raise typer.Exit(code=ExitCode.INTERNAL_ERROR) from exc  # 5
 
     # ------------------------------------------------------------------
     # 3. Render.
     #
-    # A helper keeps the command body read as a three-step flow
-    # (resolve, load, render) rather than interleaving formatting
-    # logic with control flow. It also gives the future ``--json``
-    # branch a natural home and a place to add its tests without
-    # touching the command body.
+    # Dispatch on the flag, then each renderer owns one output format
+    # end to end (per ADR-0012). The dispatch helper is one line of
+    # branching, which is the correct amount of branching: any more
+    # belongs in a renderer; any less (inlining the branch here)
+    # would tangle the renderer choice into the pipeline.
     #
-    # ``_render`` already returns 0 or 1 (the exit code), so the
-    # command simply forwards it to ``main()``.
+    # ``json`` may be an ``OptionInfo`` when this callback is invoked
+    # directly (tests, scripts, future embeddings). Coerce it to a
+    # real ``bool`` before dispatching — see ``_coerce_bool``'s
+    # docstring for the full reason. Passing the raw parameter through
+    # would silently flip a caller who omitted the flag into JSON
+    # mode, because ``OptionInfo`` is truthy.
+    #
+    # The renderer raises ``typer.Exit`` — it does not return. See the
+    # module docstring's "Exit-code mechanism" section.
     # ------------------------------------------------------------------
-    return _render(result, source=str(manifest))
+    as_json = _coerce_bool(json, default=False)
+    _render_dispatch(result, source=str(manifest), as_json=as_json)
 
 
 # -----------------------------------------------------------------------------
@@ -375,34 +556,82 @@ def _debug_requested() -> bool:
     of this helper is to *recall* whether it was set. A full parse
     here would duplicate Typer's parsing and could disagree with it;
     a literal scan cannot disagree with itself.
+
+    ``--json`` is **not** read here. It is a command-level option and
+    Typer threads it through the callback signature as a boolean
+    parameter, so no argv scan is needed (or wanted — a scan would
+    duplicate Typer's parsing for a flag whose value we already
+    have). Direct callers get the coercion from ``_coerce_bool``
+    instead; that helper handles the ``OptionInfo`` sentinel that
+    would otherwise leak through a direct call.
+
+    See the module docstring's "Deferred improvements" section for
+    the plan to replace this with a ``ctx.obj`` read once the
+    registry threads context through to single-command callbacks.
     """
     return "--debug" in sys.argv
 
 
 # -----------------------------------------------------------------------------
-# Rendering
+# Rendering — dispatch
 # -----------------------------------------------------------------------------
-def _render(
+def _render_dispatch(
     result: Ok[Blueprint] | Err[list[ValidationError]],
     *,
     source: str,
-) -> int:
-    """Render a loader result and return the process exit code.
+    as_json: bool,
+) -> None:
+    """Route to the correct renderer.
 
-    Extracted from the command body so:
+    A single, obvious branch. The two renderers do not share state,
+    do not call each other, and do not know about each other; the
+    dispatch is the only place ``as_json`` is consulted. That keeps
+    the flag from leaking into either renderer's signature (a
+    renderer that knew about ``--json`` would be doing two jobs) and
+    keeps the exit-code decision structurally identical between
+    modes — both ``_render_human`` and ``_render_json`` raise the
+    same ``typer.Exit`` code for the same ``Result``.
 
-    * The future ``--json`` flag has an obvious insertion point — a
-      sibling ``_render_json`` function and a branch in the command
-      body, no restructuring of the pipeline.
-    * The human-mode output can be unit-tested by calling ``_render``
-      directly with a constructed ``Result``, without spinning up
-      Typer's ``CliRunner`` for a formatting assertion. Typer tests
-      are slower and noisier; reserving them for command-level tests
-      keeps the suite fast.
-    * The exit-code decision lives in exactly one place. Adding a new
-      error category (e.g. a warning that does not change the exit
-      code) means editing one function, not hunting for ``return 1``
-      scattered through the command.
+    ``as_json`` is *always* a real ``bool`` here, not an
+    ``OptionInfo``. The caller (``validate``) coerces the parameter
+    before passing it in — see ``_coerce_bool``'s docstring. Trusting
+    the caller here is correct because the trust is enforced at the
+    single boundary where the untrusted value enters the module.
+
+    Why a helper and not an inline ``if as_json: ... else: ...``
+    in the command body:
+
+    * The command body already reads as a three-step flow (resolve,
+      load, render). Inlining the branch would add a fourth step
+      whose only job is to choose between two calls, which obscures
+      the flow rather than clarifying it.
+    * Test suites that want to prove "the command renders through
+      exactly one renderer" can inspect this function's source
+      rather than trying to trace two call sites in the command.
+    * Future modes (a ``--format=yaml`` added later, say) become
+      new branches here and nowhere else.
+    """
+    if as_json:
+        _render_json(result, source=source)
+    else:
+        _render_human(result, source=source)
+
+
+# -----------------------------------------------------------------------------
+# Rendering — human mode
+# -----------------------------------------------------------------------------
+def _render_human(
+    result: Ok[Blueprint] | Err[list[ValidationError]],
+    *,
+    source: str,
+) -> None:
+    """Render a loader result as human-readable text, then exit.
+
+    Kept as a separate function (rather than inlined) so the JSON
+    renderer can sit beside it with an identical signature — that
+    symmetry is what lets ``_render_dispatch`` be one line, and what
+    lets a reader compare the two modes side by side without
+    hunting through control flow.
 
     The parameter types are the concrete instantiations
     ``BlueprintLoader.load()`` returns — ``Ok[Blueprint]`` on success,
@@ -415,11 +644,17 @@ def _render(
     ``result.error`` the type ``list[ValidationError]``, so the
     attribute accesses inside are checked rather than inferred as
     ``Any``.
+
+    Each ``ValidationError`` also carries a machine-readable ``code``
+    (see ``forge.loading.errors``). Human output does not surface it —
+    the ``code`` exists for the JSON renderer and for automation that
+    consumes ``ValidationError`` directly. Do not "clean up" the
+    unused field: it is populated and preserved by design.
     """
     if isinstance(result, Ok):
         bp = result.value
         ui.success(f"OK: {bp.id} v{bp.version}")
-        return 0
+        raise typer.Exit(code=ExitCode.SUCCESS)  # 0
 
     errors = result.error
     # Summary line first, then detail. A user with a 40-error report
@@ -432,9 +667,91 @@ def _render(
         # ``ValidationError.format()`` is the single, tested rendering
         # for a validation error; using it here means the ``validate``
         # command's output matches every other place errors are shown
-        # (``create`` failures, future doctor output, future --json
-        # consumers that read the same fields). The alternative —
-        # hand-formatting here — would drift the first time someone
-        # fixed ``format()`` and forgot this call site.
+        # (``create`` failures, future doctor output, JSON consumers
+        # that read the same fields). The alternative — hand-formatting
+        # here — would drift the first time someone fixed ``format()``
+        # and forgot this call site.
         ui.info("  • " + error.format())
-    return 1
+    raise typer.Exit(code=ExitCode.USER_ERROR)  # 1
+
+
+# -----------------------------------------------------------------------------
+# Rendering — JSON mode
+# -----------------------------------------------------------------------------
+def _render_json(
+    result: Ok[Blueprint] | Err[list[ValidationError]],
+    *,
+    source: str,
+) -> None:
+    """Render a loader result as the versioned JSON envelope, then exit.
+
+    The envelope is constructed as a ``ValidateOutput`` DTO *before*
+    serialisation. Two reasons:
+
+    * The DTO's field set, nullability, and ``schema_version``
+      literal are enforced at construction. A change that would
+      violate the contract (a new required field, a renumbered
+      version, a missing hint) fails here, at the one place the
+      shape is built — not at snapshot time, three layers away.
+    * ``render_validate_json`` is a pure serialiser. It does not
+      reshape, rename, or drop fields; it takes the DTO and produces
+      the string. That separation is what makes the JSON contract
+      reviewable in ``forge/cli/schemas/validate_output.py`` and
+      testable in isolation.
+
+    Stream discipline: JSON output goes to **stdout only**. Nothing
+    here writes to stderr. The ADR-0012 contract says machine
+    output is product (stdout), commentary is stderr; a validation
+    report is product, so stderr stays empty. A future test that
+    asserts ``captured.err == ""`` in JSON mode is proving this
+    invariant; it is not just checking a convenience.
+
+    Exit codes match the human renderer exactly (0 on success, 1 on
+    validation failure). The envelope is a *presentation* of the
+    result, not a replacement for its exit-code meaning — a consumer
+    that branches on ``$?`` gets the same answer in both modes.
+    """
+    # Local imports keep the JSON path lazy: importing ``renderers``
+    # at module level pulls in every renderer the CLI ships (JSON,
+    # table, human, etc.), and a user who runs ``forge validate``
+    # in human mode pays the cost of loading modules they never use.
+    # Local imports are cheap here and only execute once per run.
+    from forge.cli.renderers import render_validate_json
+    from forge.cli.schemas.validate_output import ValidateError, ValidateOutput
+
+    if isinstance(result, Ok):
+        bp = result.value
+        output = ValidateOutput(
+            valid=True,
+            source=source,
+            blueprint_id=bp.id,
+            version=bp.version,
+        )
+        ui.emit(render_validate_json(output))
+        raise typer.Exit(code=ExitCode.SUCCESS)  # 0
+
+    # Failure path: build one ``ValidateError`` per loader error.
+    # Field-by-field (rather than ``ValidateError(**err.__dict__)``
+    # or similar) so that a field added to the loader's
+    # ``ValidationError`` (e.g. ``severity``) does not *silently*
+    # leak into the JSON contract — it becomes a compile-time
+    # concern in this one place, and the contract document
+    # (``CLI_VALIDATE_OUTPUT.md``) gets updated in the same change
+    # or not at all.
+    output = ValidateOutput(
+        valid=False,
+        source=source,
+        errors=[
+            ValidateError(
+                path=err.path,
+                message=err.message,
+                hint=err.hint,
+                code=err.code,
+                line=err.line,
+                column=err.column,
+            )
+            for err in result.error
+        ],
+    )
+    ui.emit(render_validate_json(output))
+    raise typer.Exit(code=ExitCode.USER_ERROR)  # 1

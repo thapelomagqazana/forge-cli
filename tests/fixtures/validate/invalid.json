@@ -1,0 +1,25 @@
+{
+  "blueprint_id": null,
+  "errors": [
+    {
+      "code": "required.missing",
+      "column": null,
+      "hint": "Provide a dotted lowercase identifier such as 'python.fastapi.api'.",
+      "line": null,
+      "message": "'id' is a required property",
+      "path": "id"
+    },
+    {
+      "code": "pattern.invalid",
+      "column": null,
+      "hint": "Use full SemVer: MAJOR.MINOR.PATCH, e.g. '1.0.0'.",
+      "line": null,
+      "message": "'1.0' does not match the SemVer pattern",
+      "path": "version"
+    }
+  ],
+  "schema_version": "1.0.0",
+  "source": "my-blueprint",
+  "valid": false,
+  "version": null
+}
