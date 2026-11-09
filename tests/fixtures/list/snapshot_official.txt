@@ -1,0 +1,5 @@
+ID                         NAME                       VERSION  CATEGORY  STATUS
+-------------------------  -------------------------  -------  --------  ------
+python.automation.cli      Python Automation CLI      1.0.0    api       ok
+python.fastapi.api         Python FastAPI API         1.0.0    api       ok
+typescript.frontend.react  TypeScript React Frontend  1.0.0    frontend  ok

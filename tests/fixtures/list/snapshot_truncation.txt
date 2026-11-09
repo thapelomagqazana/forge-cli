@@ -1,0 +1,3 @@
+ID                                NAME  VERSION  CATEGORY  STATUS
+--------------------------------  ----  -------  --------  ------
+python.fastapi.api.very.long.id…  Demo  1.0.0    api       ok
