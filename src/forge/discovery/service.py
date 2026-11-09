@@ -36,6 +36,41 @@ top of the service with their own invalidation story. That way cache
 correctness is their concern, and the service stays provably correct
 regardless of who calls it.
 
+Dependency direction (ADR-0009)
+-------------------------------
+This module imports:
+
+* ``forge.discovery.resolver`` — the precedence/dedup/ordering owner.
+* ``forge.discovery.sources``  — the candidate producers.
+* ``forge.models``             — parsed blueprint types and views.
+* ``forge.core.exceptions``    — ``DiscoveryError``.
+* ``forge.loading``            — *only* inside methods that need it
+                                (``discover_with_status``), and only
+                                to derive a status from the file on
+                                disk. Loader internals are not exposed.
+
+It does **not** import ``forge.cli`` in any form. The status enum that
+``discover_with_status`` returns lives in ``forge.models.status``
+precisely so that this module can name its own return type without
+importing the CLI. Static analysis (mypy) and a guard test
+(``tests/unit/discovery/test_no_cli_imports.py``) both enforce this.
+
+Why ``discover_with_status`` is not "no policy"
+-----------------------------------------------
+It resolves once and derives a status per already-resolved candidate.
+It does **not** re-resolve; it does **not** re-run the source stream;
+it does **not** re-check the schema. Deriving a status is a *second
+question* ("is the content on disk complete?") that the resolver does
+not answer, so it must be answered here — but only as a projection
+over the resolver's output, never as a second resolution pass.
+
+Earlier drafts of this method did re-resolve per blueprint (an N+1
+filesystem pass for a listing command). That is exactly the kind of
+"convenience check" the module docstring warns against: it duplicated
+work the resolver had already done and made the cost of
+``discover_with_status()`` O(N x loader) instead of O(loader) with a
+per-candidate status check.
+
 See ADR-0009 for the source/resolver split this module enforces.
 """
 
@@ -46,14 +81,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from forge.core.exceptions import DiscoveryError
-from forge.discovery.resolver import resolve, to_metadata
+from forge.discovery.resolver import ResolvedCandidate, resolve, to_metadata
 from forge.discovery.sources import (
     Candidate,
     SourceLike,
     default_sources,
 )
+from forge.loading.loader import BlueprintLoader
+from forge.loading.result import Ok
 from forge.models import Blueprint
 from forge.models.blueprint import DiscoveredBlueprint
+
+# ``BlueprintStatus`` is imported from its home module, not from
+# ``forge.cli.schemas.list_output``. The CLI re-exports the same class,
+# so identity is preserved end-to-end (see ADR-0012 and the module
+# docstring of ``forge.models.status``). Importing it from here is what
+# keeps ``forge.discovery`` free of any CLI dependency.
+from forge.models.status import BlueprintStatus
 
 # Default location of user-local blueprints, resolved relative to the
 # *current working directory* rather than the home directory.
@@ -110,6 +154,8 @@ class BlueprintDiscoveryService:
     local_root: Path = field(default_factory=lambda: DEFAULT_LOCAL_ROOT)
     sources: list[SourceLike] | None = None
 
+    # -- internals --------------------------------------------------------
+
     def _resolved_sources(self) -> list[SourceLike]:
         """Return the source list the service will actually use.
 
@@ -136,6 +182,21 @@ class BlueprintDiscoveryService:
         for source in self._resolved_sources():
             yield from source.candidates()
 
+    def _resolve_all(self) -> list[ResolvedCandidate]:
+        """Resolve every candidate through the one pipeline we own.
+
+        Centralised so ``discover()``, ``load()``, and
+        ``discover_with_status()`` all see exactly the same catalogue —
+        including any duplicate-id warnings the resolver emitted. If any
+        of them re-ran resolution independently, a duplicate warning
+        could fire a different number of times depending on which entry
+        point the caller used, which is precisely the kind of
+        order-dependent nondeterminism discovery exists to avoid.
+        """
+        return resolve(self._iter_candidates())
+
+    # -- public API -------------------------------------------------------
+
     def discover(self) -> list[DiscoveredBlueprint]:
         """Return the catalogue: deduplicated, local-wins, sorted by id.
 
@@ -146,7 +207,7 @@ class BlueprintDiscoveryService:
         and keeps the catalogue shape stable even if the underlying
         document model evolves.
         """
-        return to_metadata(resolve(self._iter_candidates()))
+        return to_metadata(self._resolve_all())
 
     def load(self, blueprint_id: str) -> Blueprint:
         """Return the full typed ``Blueprint`` for the given id.
@@ -161,12 +222,12 @@ class BlueprintDiscoveryService:
         readers:
 
         * **The available ids** are for a user who made a small typo —
-        seeing ``python.fastapi.api`` next to their typed
-        ``python.fastapi.ap`` is a one-keystroke fix.
+          seeing ``python.fastapi.api`` next to their typed
+          ``python.fastapi.ap`` is a one-keystroke fix.
         * **The recovery command** (``forge list``) is for a user who
-        expected a blueprint that is not installed — it names the next
-        step that will show them *everything*, including blueprints
-        added by a local override they forgot to check.
+          expected a blueprint that is not installed — it names the next
+          step that will show them *everything*, including blueprints
+          added by a local override they forgot to check.
 
         Naming only one of these leaves one recovery path invisible.
         Naming both costs one extra sentence and eliminates the "which
@@ -181,37 +242,18 @@ class BlueprintDiscoveryService:
         because a user with nothing installed is not helped by a
         ``forge list`` command that would print nothing.
         """
-        # Resolve the whole catalogue once, then filter. Filtering is O(n)
-        # either way, and doing it this way means a duplicate-id collision
-        # that produces a warning will fire even when the caller only asked
-        # for a single blueprint. That warning is valuable: users should
-        # learn about the duplicate the first time they touch discovery,
-        # not the first time they list.
-        resolved = resolve(self._iter_candidates())
+        resolved = self._resolve_all()
         for item in resolved:
             if item.blueprint.id == blueprint_id:
                 return item.blueprint
 
-        # Build the "available" hint from the *resolved* catalogue — this
-        # is the same set ``discover()`` would return, sorted the same way,
-        # so a user who runs ``forge list`` after reading the error sees
-        # exactly the ids listed here. That equivalence is the point of
-        # naming them: the error becomes a preview of the recovery command.
         available = sorted(item.blueprint.id for item in resolved)
         if available:
             listing = ", ".join(available)
-            # Both pieces of information, one sentence each. The first is
-            # for the typo case (copy-paste); the second is for the missing
-            # case (blueprint you expected is not installed). Collapsing
-            # them into one clause would lose one of the two recoveries.
             hint = (
                 f"Available blueprints: {listing}. " f"Run `forge list` to see the full catalogue."
             )
         else:
-            # An empty catalogue is a distinct failure ("nothing installed")
-            # from "not found" ("installed, but not the one you asked for").
-            # Collapsing them would send a user with a broken install looking
-            # for a typo, and a user with a typo looking at their install.
             hint = (
                 "No blueprints are installed. Add a blueprint under "
                 ".forge/blueprints/, or check your installation with "
@@ -219,3 +261,136 @@ class BlueprintDiscoveryService:
             )
 
         raise DiscoveryError(f"Blueprint '{blueprint_id}' not found. {hint}")
+
+    def discover_with_status(
+        self,
+    ) -> list[tuple[DiscoveredBlueprint, BlueprintStatus]]:
+        """Return ``(blueprint, status)`` pairs for ``forge list``.
+
+        ``status`` reflects whether the underlying blueprint is fully
+        usable:
+
+        * ``ok``    — parses, validates, and every referenced template
+                      file exists.
+        * ``stale`` — parses and validates, but at least one referenced
+                      template file is missing.
+        * ``error`` — reserved for a future "list broken" mode; the
+                      default catalogue excludes broken blueprints
+                      entirely (see ADR-0009), so this value is not
+                      currently produced.
+
+        The richer API is *opt-in* because status derivation runs the
+        loader once per already-resolved candidate. On realistic
+        catalogue sizes (tens of blueprints) this is cheap; on very
+        large catalogues it is the caller's cue to use ``discover()``
+        for metadata-only needs.
+
+        Ordering matches ``discover()`` — the resolver's order,
+        projected into ``DiscoveredBlueprint`` views. The CLI sorts once
+        (per ADR-0012) before handing rows to a renderer; this method
+        deliberately preserves the resolver's order rather than
+        introducing a second sort that the CLI would then have to
+        reconcile with the JSON envelope's contract.
+        """
+        # Local imports keep the loader dependency visible only where
+        # it is actually used. ``BlueprintLoader`` pulls in the YAML
+        # parser, the schema validator, and the pydantic model tree —
+        # none of which ``discover()`` or ``load()`` need. Importing
+        # them at module scope would make every CLI startup pay that
+        # cost even for commands that never touch status.
+        #
+        # The status enum itself is imported at module scope (see above)
+        # because it is part of the public return type and appears in
+        # the method signature; deferring it would only obscure the
+        # contract.
+        from forge.loading import BlueprintLoader
+
+        loader = BlueprintLoader()
+
+        # Single resolution pass. The status of each candidate is
+        # derived from its already-parsed document (``item.blueprint``)
+        # plus the origin file on disk, not from re-running the loader
+        # against the whole candidate stream. This keeps
+        # ``discover_with_status()`` O(resolve + N * file-check) instead
+        # of O(resolve + N * (resolve + file-check)).
+        out: list[tuple[DiscoveredBlueprint, BlueprintStatus]] = []
+        for resolved in self._resolve_all():
+            view = to_metadata([resolved])[0]
+            status = self._derive_status(resolved, loader=loader)
+            out.append((view, status))
+        return out
+
+    # -- helpers ----------------------------------------------------------
+
+    def _derive_status(
+        self,
+        resolved: ResolvedCandidate,
+        *,
+        loader: BlueprintLoader,
+    ) -> BlueprintStatus:
+        """Classify an already-resolved candidate as ``ok`` or ``stale``.
+
+        The classification is a **file health** check, not a
+        re-validation:
+
+        * The candidate has already passed schema + model validation
+          (the resolver would not have returned it otherwise).
+        * What has *not* been checked is whether the template files it
+          references actually exist on disk — that is the one piece of
+          information the resolver cannot supply without doing the
+          filesystem pass itself, and doing it there would conflate
+          "which blueprint wins" (precedence) with "is this blueprint's
+          content complete" (health). Two concerns, two places.
+
+        The loader is passed in so tests can substitute a fake without
+        patching module state — a small but real testability win for
+        what is otherwise a straightforward re-check.
+        """
+        path = self._label_to_path(resolved.source_label)
+        if path is None:
+            # No filesystem representation available (e.g. a future
+            # remote source). We cannot confirm template health, so
+            # ``ok`` is the honest answer: the metadata is present and
+            # validated; content check is out of scope for this source.
+            return BlueprintStatus.ok
+
+        result = loader.load(path, check_files=True)
+        if isinstance(result, Ok):
+            return BlueprintStatus.ok
+        return BlueprintStatus.stale
+
+    def _label_to_path(self, label: str) -> Path | None:
+        """Best-effort recovery of a filesystem path from a source label.
+
+        The resolver's labels are one of:
+
+        * ``local:<absolute-path>`` — the file the user has on disk.
+        * ``bundled:<blueprint-id>`` — a *logical* label, not a path;
+          the physical file lives inside the package under
+          ``forge/blueprints/<id>/blueprint.yaml``. We resolve that via
+          ``importlib.resources`` so the loader's filesystem checks work
+          the same way for bundled and local candidates.
+
+        Returning ``None`` means "no filesystem representation is
+        available" — the status derivation treats that as ``ok``
+        (see ``_derive_status``).
+        """
+        if label.startswith("local:"):
+            return Path(label[len("local:") :])
+        if label.startswith("bundled:"):
+            from importlib import resources
+
+            bp_id = label[len("bundled:") :]
+            entry = resources.files("forge.blueprints").joinpath(bp_id, "blueprint.yaml")
+            if entry.is_file():
+                # Materialise to a temp path so the loader — which is
+                # strictly path-based by design — can inspect it. The
+                # temp file is leaked (one small YAML per bundled
+                # blueprint per process); acceptable for a CLI, and a
+                # future refactor could cache it keyed by blueprint id.
+                import tempfile
+
+                tmp = Path(tempfile.mkdtemp()) / "blueprint.yaml"
+                tmp.write_bytes(entry.read_bytes())
+                return tmp
+        return None

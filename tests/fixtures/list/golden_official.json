@@ -1,0 +1,1 @@
+{"blueprints":[{"category":"api","id":"python.automation.cli","name":"Python Automation CLI","status":"ok","version":"1.0.0"},{"category":"api","id":"python.fastapi.api","name":"Python FastAPI API","status":"ok","version":"1.0.0"},{"category":"frontend","id":"typescript.frontend.react","name":"TypeScript React Frontend","status":"ok","version":"1.0.0"}],"schema_version":"1.0.0"}

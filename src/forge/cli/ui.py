@@ -11,6 +11,7 @@ helpers are deliberately few and simple:
   wizards to delimit steps, and by any command that groups output.
 - ``print_hint`` — dim remediation line, stderr.
 - ``print_cancelled`` — dim acknowledgement line, stderr.
+- ``emit`` — raw passthrough for pre-rendered payloads (JSON, tables).
 
 The distinction between stdout and stderr is not cosmetic. It is the
 Unix contract: ``stdout`` is the *product* of the command (the result
@@ -67,6 +68,20 @@ Design principles
    that adds layout the caller cannot remove is a helper that fights
    the caller — and the caller always wins in the end, either by
    working around the helper (drift) or by removing it (dead code).
+6. **Payloads flow through ``emit``.** Commands that produce a
+   pre-rendered payload (JSON from ``forge list --json``, a formatted
+   table from ``forge list``, a template's output) call ``emit``,
+   which is a raw passthrough to stdout with the same broken-pipe
+   safety as the framed helpers. This is the seam that lets renderers
+   stay pure (they return a string) while the CLI still owns the
+   stream decision and the broken-pipe fallback.
+7. **Colour is applied at emit, never in the payload.** Renderers
+   (``cli/renderers/``) must return ANSI-free strings so that JSON
+   stays valid and snapshot fixtures stay diffable. If a future helper
+   needs to colour a pre-rendered payload, it must do so by framing
+   (prefix/suffix), not by injecting escape codes into the payload
+   itself — otherwise the renderer's contract is broken by the
+   caller, which is exactly the drift principle 5 exists to prevent.
 
 Why ``print_section`` is a first-class helper
 ----------------------------------------------
@@ -84,6 +99,25 @@ The alternative — having the wizard call ``print_info`` with a
 caller, which is how drift starts: two wizards render headers two
 ways, and the third wizard copies the wrong one. The helper exists so
 the *look* of a section is decided once, here.
+
+Why ``emit`` is separate from ``print_info``
+--------------------------------------------
+``print_info`` routes a message through Rich, which applies wrapping,
+markup, and TTY-aware formatting. That is correct for human commentary
+— but wrong for machine-readable payloads, where the *bytes* are the
+contract. A JSON payload must not be re-wrapped, must not have markup
+interpreted, and must not have its whitespace normalised. ``emit``
+bypasses Rich entirely and writes the payload as-is to stdout, with
+only the broken-pipe fallback retained. Two helpers, two contracts:
+framed for humans, raw for machines.
+
+Why the aliases are re-exports, not wrappers
+--------------------------------------------
+``section is print_section`` (identity, not delegation). Re-exports are
+zero-cost, and they mean a caller that patches one name patches both —
+a subtlety that matters for tests. A wrapper would break that identity
+and force tests to know which spelling a given call site used, which is
+exactly the kind of accidental coupling the aliases exist to avoid.
 """
 
 from __future__ import annotations
@@ -128,7 +162,7 @@ def _is_colour_enabled() -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Framed helpers (human commentary)
 # -----------------------------------------------------------------------------
 def print_success(message: str) -> None:
     """Print a success message to stdout, in green, with a checkmark.
@@ -290,6 +324,53 @@ def print_hint(message: str) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Raw passthrough (machine payloads)
+# -----------------------------------------------------------------------------
+def emit(payload: str) -> None:
+    """Write a pre-rendered payload to stdout, unchanged.
+
+    This is the machine-payload seam. Commands that produce output a
+    renderer has already formatted — JSON from ``forge list --json``,
+    a table from ``forge list``, a rendered template — call ``emit``
+    rather than ``print_info``, because ``print_info`` routes through
+    Rich, which wraps, interprets markup, and normalises whitespace.
+    None of those are safe for a payload whose *bytes* are the
+    contract.
+
+    ``emit`` writes the payload verbatim to stdout with a single
+    trailing newline (POSIX text convention: a line ends in a
+    newline). It does not add a leading newline, does not add
+    colour, does not interpret markup, and does not reformat.
+
+    It retains the same broken-pipe safety as the framed helpers: if
+    the consumer closes the pipe (``forge list | head``), the write
+    failure is caught and the payload is silently dropped — writing
+    to a closed pipe is normal for a piped CLI, not an error.
+
+    Contract notes for renderers
+    ----------------------------
+    * Renderers must return ANSI-free strings. Colour is a framing
+      concern owned by ``ui``, and injecting escape codes into a
+      payload breaks JSON validity and snapshot determinism.
+    * Renderers must return strings without a trailing newline.
+      ``emit`` owns line termination so that every payload ends with
+      exactly one newline, regardless of which renderer produced it.
+      A renderer that appends its own newline would produce two, and
+      the two-renders-one-newline invariant is what makes golden
+      fixtures diffable.
+
+    Args:
+        payload: The pre-rendered payload to write to stdout. Emitted
+            verbatim, followed by one newline.
+    """
+    try:
+        sys.stdout.write(payload + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        typer_echo_safe(payload)
+
+
+# -----------------------------------------------------------------------------
 # Short aliases
 # -----------------------------------------------------------------------------
 # The ``print_*`` names are the canonical API — they are what
@@ -348,6 +429,7 @@ def typer_echo_safe(message: str, *, err: bool = False) -> None:
 # -----------------------------------------------------------------------------
 __all__ = [
     "cancelled",
+    "emit",
     "error",
     "hint",
     "info",

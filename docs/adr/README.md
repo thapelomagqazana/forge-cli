@@ -21,6 +21,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0009](0009-blueprint-discovery-uses-layered-sources-with-a-central-reso.md) | Blueprint Discovery Uses Layered Sources with a Central Resolver | Accepted | 2026-11-08 |
 | [0010](0010-blueprint-loading-returns-a-result-and-aggregates-every-erro.md) | Blueprint Loading Returns a Result and Aggregates Every Error | Accepted | 2026-11-08 |
 | [0011](0011-variable-resolution-is-a-pure-function-over-ordered-sources-.md) | Variable Resolution Is a Pure Function over Ordered Sources with a Single Validation Funnel | Accepted | 2026-11-09 |
+| [0012](0012-cli-output-is-a-versioned-dto-consumed-by-pluggable-renderer.md) | CLI Output Is a Versioned DTO Consumed by Pluggable Renderers | Accepted | 2026-11-09 |
 
 ## Creating a new ADR
 
