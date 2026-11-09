@@ -124,6 +124,11 @@ CheckId = Annotated[
 # schema: relative, no leading slash, no ``..`` segment. Keeping them as
 # one alias makes it obvious that the two fields are governed by the same
 # rule — a change to path safety is a one-line edit.
+#
+# The negative lookahead ``(?!...)`` is the reason ``regex_engine`` is
+# set to ``python-re`` on ``_BlueprintModel``: the default engine (Rust
+# ``regex``) does not support lookarounds and would silently fail to
+# enforce this pattern.
 SafeRelativePath = Annotated[
     str,
     StringConstraints(
@@ -319,10 +324,10 @@ class VariableDefinition(_BlueprintModel):
 
         If the schema is later tightened to forbid ``string`` +
         ``validation.enum``, this validator gains a third branch that
-        mirrors the new rule. The order of operations is schema →
-        model, never model → schema: the schema is the referee
-        (ADR-0007), and a model that rejects what the referee accepts
-        is a bug, not a policy.
+        mirrors the new rule. The order of operations is schema → model,
+        never model → schema: the schema is the referee (ADR-0007), and
+        a model that rejects what the referee accepts is a bug, not a
+        policy.
         """
         v = self.validation
         match self.type:

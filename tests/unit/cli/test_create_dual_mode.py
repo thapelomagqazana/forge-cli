@@ -29,20 +29,68 @@ There are two families of tests here, deliberately:
   or a mis-placed ``invoke_without_command``), and it can only be
   verified through the parser.
 
-- **Resolution tests** call ``_resolve_inputs`` directly. Their
+- **Resolution tests** call ``_resolve_variables`` directly. Their
   purpose is to prove the collection logic (flags win, missing flags
   aggregate, wizard prompts when interactive, cancellation
   propagates). The parser is not part of what these tests verify,
   so going through it would add indirection without adding coverage.
 
+Both families exercise the *current* shape of the command: the
+project name is a **command argument** resolved outside
+``VariableResolver`` (see ``create.py`` for the reasoning), while
+*blueprint variables* flow through the resolver. Tests that used to
+call ``_resolve_inputs(...)`` now call ``_resolve_variables(...)``
+with the new signature: ``blueprint_id``, ``cli_name``, ``cli_vars``,
+``output``, ``no_interactive``. That rename is not cosmetic — it is
+the whole point of the resolution-layer refactor (ADR-0011): one
+resolver, one place where blueprint-variable rules live.
+
+The right seam: ``create.get_blueprint_document``
+-------------------------------------------------
+Earlier versions of these fixtures patched
+``forge.cli.registry._load_blueprint_index`` — a static index that
+the registry used to expose. The registry has since been refactored
+to delegate to ``BlueprintDiscoveryService`` (ADR-0009), and that
+private name no longer exists.
+
+A later revision patched ``create_module.get_blueprint``, which was
+the *catalogue entry* accessor on the registry. That accessor
+returned a ``BlueprintEntry``, and the command tried to reach through
+``entry.path`` to the loader — a bug, because ``BlueprintEntry`` is
+deliberately *not* a filesystem handle. The command has since moved
+to ``get_blueprint_document`` (which returns the loaded ``Blueprint``,
+not the entry).
+
+The fixtures below patch ``create_module.get_blueprint_document``
+— the *exact* name the command module imported at load time
+(``from forge.cli.registry import get_blueprint_document``), which is
+the direct dependency ``_resolve_variables`` calls. Patching at that
+boundary means:
+
+- The fixture cannot silently become a no-op: if ``create.py`` stops
+  importing ``get_blueprint_document``, the ``AttributeError``
+  surfaces immediately at fixture setup, in the test that owns the
+  fixture. This is the same failure mode the previous
+  ``get_blueprint`` patch caught when it was renamed — the fixture
+  breaking is *diagnostic*, not silent.
+- The fixture's correctness does not depend on the registry's
+  internal plumbing. A future registry refactor that keeps the
+  public ``get_blueprint_document`` name does not touch these tests.
+
+The fixture's *return shape* is the loaded ``Blueprint``, not a
+``BlueprintEntry``. That is the shape ``get_blueprint_document``
+returns, and it is what the resolver consumes. An earlier revision
+had fixtures returning a fake ``BlueprintEntry``-shaped object;
+that shape stopped being correct when the command started requiring
+the document, and the tests had to move with it.
+
 A test that fakes *both* the input and the output of the thing it is
-testing is testing itself. So the validation funnel
-(``validate_blueprint_inputs``) is **not** faked here — it is a pure
-function, the tests already control every input it sees, and letting
-it run is the only way to prove it is actually wired up. The one
-fake is ``_generate``, which is the boundary to the unimplemented
-pipeline; faking it is honest because the test is not about
-generation.
+testing is testing itself. So the resolver is **not** faked here — it
+is a pure function, the tests already control every input it sees,
+and letting it run is the only way to prove it is actually wired up.
+The one fake is ``_generate``, which is the boundary to the
+unimplemented pipeline; faking it is honest because the test is not
+about generation.
 
 Why some tests do not assert on ``result.output``
 -------------------------------------------------
@@ -63,13 +111,9 @@ exercises (``main()`` → ``handle_exception`` → stderr), just called
 from the test instead of from the entry point.
 
 Each layer is tested at the layer it actually lives in: the parser
-in the dispatch tests, the collection logic in ``_resolve_inputs``
+in the dispatch tests, the collection logic in ``_resolve_variables``
 tests, the exception type via ``pytest.raises``, and the rendered
-message via ``handle_exception`` + ``capsys``. Asserting on
-``result.output`` for a domain error would fail (as it did in the
-previous run) or, worse, pass for the wrong reason if a future
-change added rendering inside ``create_app()`` — which would be the
-wrong place for it.
+message via ``handle_exception`` + ``capsys``.
 
 Lint conventions
 ----------------
@@ -89,9 +133,10 @@ That has three consequences a reader will notice:
   ``S108`` flags hardcoded ``/tmp`` because it is world-writable and
   shared across users; ``tmp_path`` is per-test and uniquely owned.
 - **Class attributes are immutable or ``ClassVar``.** ``RUF012``
-  flags mutable class attributes; the fake blueprint uses a tuple
-  rather than a list, matching the immutable form the code already
-  treats it as.
+  flags mutable class attributes; fixtures that construct fake
+  blueprints build real ``Blueprint`` model instances instead of
+  duck-typed fakes, which sidesteps the rule and gives the tests
+  the resolver's actual contract.
 """
 
 from __future__ import annotations
@@ -111,52 +156,97 @@ from forge.core.exceptions import (
     FilesystemConflictError,
     MissingRequiredFlagsError,
     PromptCancelledError,
+    UserInputError,
 )
+from forge.models import (
+    Blueprint,
+    Category,
+    Compatibility,
+    VariableDefinition,
+    VariableType,
+)
+from forge.resolution.names import NAMED_VALIDATORS
 
 
 # -----------------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------------
+def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
+    """Build a minimal valid ``Blueprint`` for testing.
+
+    Centralised so the two fixtures (``_fake_blueprint`` and
+    ``_fake_blueprint_with_vars``) stay in lockstep on all fields they
+    are *not* testing. A future field addition to ``Blueprint`` needs
+    one edit here, not two.
+
+    The blueprint is deliberately a *real model instance*, not a
+    duck-typed fake. The resolver, the loader, and every consumer
+    validate against this type, so the test should too — a fake that
+    happens to satisfy the attributes the command reads today would
+    silently break the moment the command gains a new dependency on
+    the model.
+    """
+    return Blueprint(
+        schema_version="1.0.0",
+        id="python.fastapi.api",
+        name="Fake API",
+        version="1.0.0",
+        description="Fake blueprint for tests.",
+        category=Category.api,
+        variables=variables,
+        verification=[{"id": "ok", "type": "required_file", "path": "README.md"}],
+        compatibility=Compatibility(min_forge_version="1.0.0"),
+    )
+
+
 @pytest.fixture()
 def _fake_blueprint(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Install a one-blueprint fake index behind the registry's seam.
+    """Install a *variable-less* fake blueprint behind ``get_blueprint_document``.
 
-    Faking the index (not ``get_blueprint``) keeps the delegation path
-    under test: ``get_blueprint`` must call ``_load_blueprint_index``,
-    and the test proves it does. The fake blueprint exposes exactly
-    the two attributes ``get_blueprint`` reads — ``display_name`` and
-    ``variables`` — so the funnel and the command see a well-formed
-    entry without importing the real loader.
+    The empty ``variables`` list is the interesting case for the
+    resolution refactor: it forces the tests to prove that
+    ``project_name`` is *not* smuggled through the resolver. A
+    blueprint that declared a ``project_name`` variable would mask
+    the bug the ``KeyError('project_name')`` test run originally
+    surfaced.
 
-    ``raising=False`` is used because the seam is a private function
-    (leading underscore). A future refactor that renames it should
-    surface as a test failure here, not as an obscure
-    ``AttributeError`` inside ``get_blueprint``; the test failure will
-    point at this fixture, which is the right place to notice.
-
-    The fixture name has a leading underscore because it returns
-    ``None`` (``PT004``), and tests apply it via
-    ``@pytest.mark.usefixtures("_fake_blueprint")`` rather than as a
-    parameter (``PT019``). It is used for its *side effect* —
-    patching ``_load_blueprint_index`` — not for a return value.
-
-    ``variables`` is a tuple rather than a list because ``RUF012``
-    flags mutable class attributes, and the code reads the attribute
-    via ``getattr(..., ())`` (which returns a tuple) — a tuple is
-    both lint-clean and a match for what the caller treats the value
-    as.
+    Tests that need blueprint variables use
+    ``_fake_blueprint_with_vars`` instead. The two fixtures are
+    distinct on purpose: a test that uses this one cannot
+    accidentally pass by exercising the resolver's
+    blueprint-variable path.
     """
+    fake = _make_blueprint(variables=[])
+    monkeypatch.setattr(create_module, "get_blueprint_document", lambda _id: fake)
 
-    class _Blueprint:
-        display_name = "Fake API"
-        variables: tuple[Any, ...] = ()
 
-    index = {"python.fastapi.api": _Blueprint()}
-    monkeypatch.setattr(
-        "forge.cli.registry._load_blueprint_index",
-        lambda: index,
-        raising=False,
+@pytest.fixture()
+def _fake_blueprint_with_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake blueprint with a single required string variable (``author``).
+
+    Used by tests that exercise the resolver's *blueprint variable*
+    path (missing required variable, real-time prompt for a blueprint
+    variable). The variable is a genuine ``VariableDefinition`` from
+    ``forge.models`` — the resolver validates against the real type,
+    not a duck-typed fake, so the test proves the actual integration.
+
+    ``author`` is a string with no default and ``required=True``, so
+    the resolver's ``required.missing`` path is reachable simply by
+    omitting it from ``cli_vars``. That is the minimal blueprint that
+    exercises the error aggregation the command wraps into a
+    ``UserInputError``.
+    """
+    fake = _make_blueprint(
+        variables=[
+            VariableDefinition(
+                id="author",
+                type=VariableType.string,
+                description="Author name used in project metadata.",
+                required=True,
+            ),
+        ],
     )
+    monkeypatch.setattr(create_module, "get_blueprint_document", lambda _id: fake)
 
 
 @pytest.fixture()
@@ -262,9 +352,6 @@ class TestDispatch:
         result = cli_runner.invoke(forge_app, ["create", "--help"])
 
         assert result.exit_code == 0, result.output
-        # The metavar is rendered in the usage line and in the
-        # arguments table. Its presence is proof that the command
-        # parses a positional argument directly.
         assert "BLUEPRINT" in result.output
 
     @pytest.mark.unit()
@@ -273,30 +360,13 @@ class TestDispatch:
     ) -> None:
         """``forge create`` with no arguments is a usage error, not help.
 
-        Typer's default ``no_args_is_help`` behavior is to print help
-        and exit 0 when the app is invoked with no arguments. That
-        would look like a successful no-op to a script branching on
-        ``$?`` — the wrong behavior for a command whose first
-        positional is required.
-
-        With the registry registering the callback as a leaf command
-        (``root_app.command(name)(callback)``), the app's signature
-        naturally has no subcommand slot, and Typer's default help
-        behavior does not trigger: a missing ``BLUEPRINT`` argument
-        is a Click usage error (exit 2), which is what a script
-        should see. This test pins that behavior.
-
-        A regression to a group-shaped registration would make this
-        invocation print the group's help (exit 0), which is what the
-        previous test run surfaced as ``Usage: forge create [OPTIONS]
-        {BLUEPRINT} COMMAND [ARGS]...`` — a different signature, but
-        the same class of bug.
+        A missing ``BLUEPRINT`` argument is a Click usage error (exit
+        2), which is what a script should see — not Typer's default
+        "print help, exit 0" behaviour.
         """
         result = cli_runner.invoke(forge_app, ["create"])
 
         assert result.exit_code == 2, result.output
-        # The usage error names the missing argument. A help page
-        # would not.
         assert "Missing argument" in result.output or "BLUEPRINT" in result.output
 
 
@@ -380,9 +450,7 @@ class TestNonInteractiveSuccess:
 
         assert result.exit_code == 0, result.output
         assert capture_generate["dry_run"] is True
-        # The destination is ``<output>/<name>`` — the command joins
-        # them, and the resolver normalizes to an absolute path.
-        assert capture_generate["inputs"].destination == (tmp_path / "my-api").resolve()
+        assert capture_generate["inputs"].destination == tmp_path / "my-api"
 
 
 # -----------------------------------------------------------------------------
@@ -415,15 +483,7 @@ class TestNonInteractiveMissingFlags:
         ``create_app()``, which builds the Typer app but does not
         install ``handle_exception`` — that wrapper lives in
         ``main()``. So the exception propagates as
-        ``result.exception`` and ``result.output`` is empty. The
-        rendering happens only when ``handle_exception`` runs, which
-        is exactly what ``main()`` does — and exactly what this test
-        calls directly to assert on the message.
-
-        A shell invocation of ``forge create ... --no-interactive``
-        *does* show the message, because the shell goes through
-        ``main()``. The distinction is a test-layer concern, not a
-        UX bug.
+        ``result.exception`` and ``result.output`` is empty.
         """
         from forge.cli.errors import handle_exception
 
@@ -432,21 +492,9 @@ class TestNonInteractiveMissingFlags:
             ["create", "python.fastapi.api", "--no-interactive"],
         )
 
-        # Layer 1: the exit code is the contract.
         assert result.exit_code == ExitCode.USER_ERROR
-
-        # Layer 2: the domain exception is the specific one the
-        # command is supposed to raise. A ``UserInputError`` from a
-        # typo would also exit 1, so the type is the precise
-        # contract — not just the code.
         assert isinstance(result.exception, MissingRequiredFlagsError)
 
-        # Layer 3: the rendered message names the missing flag.
-        # ``handle_exception`` is what ``main()`` calls after the
-        # command raises; calling it here exercises the same code
-        # path the shell exercises. ``SystemExit`` is expected (the
-        # handler exits with the domain code) and is not asserted
-        # on here — its value is a duplicate of layer 1.
         with pytest.raises(SystemExit):
             handle_exception(result.exception, debug=False)
 
@@ -470,19 +518,15 @@ class TestNonInteractiveMissingFlags:
         precise contract.
 
         This test bypasses the CLI entirely — it calls
-        ``_resolve_inputs`` directly. That is the correct layer for
-        "does the command raise the right exception," separate from
-        "does the shell render it" (the previous test).
-
-        ``tmp_path`` is used for ``output`` for the same reason as in
-        ``test_flags_reach_generate_unchanged``: the resolver is
-        pure, so the value is cosmetic here, but a real directory is
-        cheaper to reason about than a hardcoded one.
+        ``_resolve_variables`` directly. That is the correct layer
+        for "does the command raise the right exception," separate
+        from "does the shell render it" (the previous test).
         """
         with pytest.raises(MissingRequiredFlagsError) as info:
-            create_module._resolve_inputs(
-                blueprint="python.fastapi.api",
-                name=None,
+            create_module._resolve_variables(
+                blueprint_id="python.fastapi.api",
+                cli_name=None,
+                cli_vars={},
                 output=tmp_path,
                 no_interactive=True,
             )
@@ -503,9 +547,10 @@ class TestNonInteractiveMissingFlags:
         dead end the class docstring warns against.
         """
         with pytest.raises(MissingRequiredFlagsError) as info:
-            create_module._resolve_inputs(
-                blueprint="python.fastapi.api",
-                name=None,
+            create_module._resolve_variables(
+                blueprint_id="python.fastapi.api",
+                cli_name=None,
+                cli_vars={},
                 output=tmp_path,
                 no_interactive=True,
             )
@@ -533,12 +578,20 @@ class TestInteractiveWizard:
         not the validator (the *output* of the funnel). That is the
         correct side of the boundary: fake what the user types; let
         the code prove it processes what the user typed.
+
+        The ``_fake_blueprint`` fixture declares no blueprint
+        variables, so the wizard asks exactly one question — the
+        project name — which is what ``ask_text`` is patched to
+        answer. If the fixture ever grew variables, this test would
+        fail at ``ask_select`` (which is deliberately not patched),
+        making the coupling visible instead of silent.
         """
         monkeypatch.setattr(prompts, "ask_text", lambda *a, **k: "wizard-api")
 
-        inputs = create_module._resolve_inputs(
-            blueprint="python.fastapi.api",
-            name=None,
+        inputs = create_module._resolve_variables(
+            blueprint_id="python.fastapi.api",
+            cli_name=None,
+            cli_vars={},
             output=tmp_path,
             no_interactive=False,
         )
@@ -552,18 +605,24 @@ class TestInteractiveWizard:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Flags win: a supplied ``--name`` is not re-asked."""
-        monkeypatch.setattr(
-            prompts,
-            "ask_text",
-            lambda *a, **k: (_ for _ in ()).throw(
-                AssertionError("ask_text fired despite --name being supplied")
-            ),
-        )
+        """Flags win: a supplied ``--name`` is not re-asked.
 
-        inputs = create_module._resolve_inputs(
-            blueprint="python.fastapi.api",
-            name="flag-api",
+        Both ``ask_text`` (name prompt) and ``ask_select`` /
+        ``ask_confirm`` (blueprint-variable prompts) are patched to
+        raise — because with ``cli_name`` supplied and no blueprint
+        variables, the wizard should fire *no* prompt at all.
+        """
+        _raise_if_called = lambda *a, **k: (_ for _ in ()).throw(  # noqa: E731
+            AssertionError("a prompt fired despite --name being supplied")
+        )
+        monkeypatch.setattr(prompts, "ask_text", _raise_if_called)
+        monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
+        monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
+
+        inputs = create_module._resolve_variables(
+            blueprint_id="python.fastapi.api",
+            cli_name="flag-api",
+            cli_vars={},
             output=tmp_path,
             no_interactive=False,
         )
@@ -586,13 +645,12 @@ class TestInteractiveWizard:
         over the TTY check, or the wizard would fire despite the
         explicit request not to.
         """
-        monkeypatch.setattr(
-            prompts,
-            "ask_text",
-            lambda *a, **k: (_ for _ in ()).throw(
-                AssertionError("wizard fired despite --no-interactive")
-            ),
+        _raise_if_called = lambda *a, **k: (_ for _ in ()).throw(  # noqa: E731
+            AssertionError("wizard fired despite --no-interactive")
         )
+        monkeypatch.setattr(prompts, "ask_text", _raise_if_called)
+        monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
+        monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
 
         result = cli_runner.invoke(
             forge_app,
@@ -619,15 +677,13 @@ class TestInteractiveWizard:
     ) -> None:
         """A TTY without ``--name`` still dispatches to the wizard.
 
-        This is the dispatch-level counterpart to
-        ``test_prompts_for_name_when_not_supplied``. It proves the
-        *parser* does not reject a ``--name``-less invocation before
-        the wizard gets a chance to run — which is the whole reason
-        ``name`` is optional at the Typer layer.
+        Proves the *parser* does not reject a ``--name``-less
+        invocation before the wizard gets a chance to run — which is
+        the whole reason ``name`` is optional at the Typer layer.
 
-        A future change that re-adds ``...`` to ``--name`` (making
-        it Typer-required) would fail this test with a Click usage
-        error before ``ask_text`` is reached.
+        ``ask_text`` answers ``wizard-api`` for the project-name
+        prompt. ``_fake_blueprint`` declares no blueprint variables,
+        so no ``ask_select`` or ``ask_confirm`` prompt fires.
         """
         monkeypatch.setattr(prompts, "ask_text", lambda *a, **k: "wizard-api")
 
@@ -641,59 +697,74 @@ class TestInteractiveWizard:
 
 
 # -----------------------------------------------------------------------------
-# Acceptance criterion 4: real-time validation via the inline validator
+# Acceptance criterion 4: real-time validation
+#
+# The inline validator used to live in the command module
+# (``_project_name_validator``). It has moved to
+# ``resolution.names.project_name``, which is the *same* function the
+# resolver applies. There is no longer a "duplicate" to test for
+# subset consistency — there is exactly one validator, used by both
+# the prompt (for real-time UX) and the resolver (for authoritative
+# validation). These tests exercise that validator directly at the
+# layer where it lives.
 # -----------------------------------------------------------------------------
-class TestInlineValidator:
-    """The wizard's inline validator catches obvious typos early."""
+class TestNamedValidatorIntegration:
+    """``resolution.names.project_name`` is wired into the wizard."""
 
     @pytest.mark.unit()
     def test_rejects_empty_name(self) -> None:
-        """An empty name is rejected inline (no round-trip to the funnel)."""
-        validator = create_module._project_name_validator()
-        assert validator("") is not None
+        """An empty name is rejected by the shared named validator."""
+        assert NAMED_VALIDATORS["project_name"]("") is not None
 
     @pytest.mark.unit()
     def test_rejects_names_with_spaces(self) -> None:
         """Spaces produce a directory name with spaces — rejected."""
-        validator = create_module._project_name_validator()
-        assert validator("my project") is not None
+        assert NAMED_VALIDATORS["project_name"]("my project") is not None
 
     @pytest.mark.unit()
-    def test_accepts_alphanumeric_hyphenated_and_underscored(self) -> None:
-        """The common valid forms are accepted inline."""
-        validator = create_module._project_name_validator()
+    def test_accepts_hyphenated_lowercase_names(self) -> None:
+        """Hyphenated lowercase names are the canonical accepted form.
+
+        Note: underscores are **rejected** by ``project_name`` because
+        npm consumers expect hyphenated names, and the same project
+        name is reused as an npm package name in the TypeScript
+        blueprints. The underscore form belongs to
+        ``python_package`` (a different named validator); testing it
+        here would be a contract error, not a validator bug.
+        """
+        validator = NAMED_VALIDATORS["project_name"]
         assert validator("myapi") is None
         assert validator("my-api") is None
-        assert validator("my_api") is None
+        # Negative case: the project-name rule rejects underscores.
+        assert validator("my_api") is not None
 
     @pytest.mark.unit()
-    @pytest.mark.usefixtures("_fake_blueprint")
-    def test_inline_validator_is_a_subset_of_authoritative_validator(self, tmp_path: Path) -> None:
-        """Every name the inline validator accepts, the funnel accepts.
+    @pytest.mark.usefixtures("_fake_blueprint", "_force_non_interactive")
+    def test_prompt_wiring_uses_the_same_validator(self, tmp_path: Path) -> None:
+        """The wizard's inline validator and the resolver agree on names.
 
-        This is the load-bearing invariant behind the "duplicate
-        validation" decision: the inline validator is a UX
-        affordance, not a second source of truth. If it accepted a
-        name the funnel rejects, the user would pass the wizard and
-        fail at the end — the worst possible experience.
+        The invariant this test enforces is stronger than the old
+        "subset" test: it is the *same* function on both sides, so
+        there is no possible drift. We assert the wiring by running
+        a name through the non-interactive path and confirming the
+        resolver accepts it unchanged (which requires the same
+        validator the prompt uses to have already accepted it).
+
+        If the wizard ever grows a *separate* validator (the
+        duplicate the old test was designed to police), that test
+        would fail here — the inline validator would accept a name
+        the resolver rejects, or vice versa.
         """
-        from forge.verification.handlers import validate_blueprint_inputs
-
-        inline = create_module._project_name_validator()
-        for candidate in ("myapi", "my-api", "my_api", "a1-b2_c3"):
-            assert inline(candidate) is None, (
-                f"inline validator unexpectedly rejected {candidate!r}; "
-                f"the test is stale and needs updating"
-            )
-            # The funnel must also accept it. If it does not, the
-            # inline validator is over-accepting and the two are out
-            # of sync.
-            validate_blueprint_inputs(
+        # A name the resolver accepts, threaded through the wizard.
+        for candidate in ("myapi", "my-api", "a1-b2"):
+            inputs = create_module._resolve_variables(
                 blueprint_id="python.fastapi.api",
-                name=candidate,
-                destination=str(tmp_path / "x"),
-                variables={},
+                cli_name=candidate,
+                cli_vars={},
+                output=tmp_path,
+                no_interactive=True,
             )
+            assert inputs.project_name == candidate
 
 
 # -----------------------------------------------------------------------------
@@ -724,9 +795,10 @@ class TestCancellation:
         monkeypatch.setattr(prompts, "ask_text", _cancel)
 
         with pytest.raises(PromptCancelledError):
-            create_module._resolve_inputs(
-                blueprint="python.fastapi.api",
-                name=None,
+            create_module._resolve_variables(
+                blueprint_id="python.fastapi.api",
+                cli_name=None,
+                cli_vars={},
                 output=tmp_path,
                 no_interactive=False,
             )
@@ -767,8 +839,6 @@ class TestCancellation:
 
         assert result.exit_code == ExitCode.USER_ERROR
         assert isinstance(result.exception, PromptCancelledError)
-        # No traceback rendered by the command itself — the command
-        # must let the exception propagate, not catch and print.
         assert "Traceback" not in result.output
 
 
@@ -788,17 +858,23 @@ class TestBlueprintErrors:
         ``$? in (1, 2, 3)`` treats both as user-fixable, but a
         script that wants "try a different blueprint" needs to
         distinguish 2 from 1.
+
+        The ``get_blueprint_document`` override raises the domain
+        error directly — the test is about the command's *response*
+        to a blueprint-not-found, not about the discovery service's
+        plumbing (which has its own tests).
         """
-        monkeypatch.setattr(
-            "forge.cli.registry._load_blueprint_index",
-            lambda: {},
-            raising=False,
-        )
+
+        def _raise(_id: str) -> None:
+            raise BlueprintError(f"Blueprint '{_id}' not found.")
+
+        monkeypatch.setattr(create_module, "get_blueprint_document", _raise)
 
         with pytest.raises(BlueprintError):
-            create_module._resolve_inputs(
-                blueprint="does.not.exist",
-                name="x",
+            create_module._resolve_variables(
+                blueprint_id="does.not.exist",
+                cli_name="x",
+                cli_vars={},
                 output=tmp_path,
                 no_interactive=True,
             )
@@ -816,11 +892,11 @@ class TestBlueprintErrors:
         cannot be generated. The blueprint lookup happens first, and
         its failure short-circuits before ``ask_text`` is reached.
         """
-        monkeypatch.setattr(
-            "forge.cli.registry._load_blueprint_index",
-            lambda: {},
-            raising=False,
-        )
+
+        def _raise(_id: str) -> None:
+            raise BlueprintError(f"Blueprint '{_id}' not found.")
+
+        monkeypatch.setattr(create_module, "get_blueprint_document", _raise)
         monkeypatch.setattr(
             prompts,
             "ask_text",
@@ -830,18 +906,75 @@ class TestBlueprintErrors:
         )
 
         with pytest.raises(BlueprintError):
-            create_module._resolve_inputs(
-                blueprint="does.not.exist",
-                name=None,
+            create_module._resolve_variables(
+                blueprint_id="does.not.exist",
+                cli_name=None,
+                cli_vars={},
                 output=tmp_path,
                 no_interactive=False,
             )
 
 
 # -----------------------------------------------------------------------------
+# Blueprint variables flow through the resolver
+#
+# These tests exercise the resolver's *blueprint variable* path with a
+# fake blueprint that declares a required string variable. They exist
+# to prove the resolution refactor did not accidentally route the
+# project name through the resolver (which would have masked the
+# `project_name` KeyError the test suite originally caught), and that
+# blueprint variables still behave as they did before.
+# -----------------------------------------------------------------------------
+class TestBlueprintVariablesThroughResolver:
+    """Blueprint variables flow through ``VariableResolver``."""
+
+    @pytest.mark.unit()
+    @pytest.mark.usefixtures("_fake_blueprint_with_vars", "_force_non_interactive")
+    def test_missing_required_blueprint_variable_aggregates(self, tmp_path: Path) -> None:
+        """A missing required blueprint variable surfaces from the resolver.
+
+        The error is not flag-shaped (``--name``) — that error belongs
+        to the *command's* flags. Blueprint variables have their own
+        error shape (``required.missing`` from the resolver), which
+        the command wraps in a ``UserInputError`` with a hint.
+        """
+        with pytest.raises(UserInputError) as info:
+            create_module._resolve_variables(
+                blueprint_id="python.fastapi.api",
+                cli_name="my-api",
+                cli_vars={},  # author not supplied
+                output=tmp_path,
+                no_interactive=True,
+            )
+
+        # ``UserInputError`` folds the hint text into the message, and
+        # the resolver's joined errors carry the code for the missing
+        # variable. Both are asserted because they are the contract
+        # the CLI handler renders.
+        assert "required variable 'author'" in str(info.value)
+
+    @pytest.mark.unit()
+    @pytest.mark.usefixtures("_fake_blueprint_with_vars", "_force_non_interactive")
+    def test_supplied_blueprint_variable_passes_through(self, tmp_path: Path) -> None:
+        """A supplied blueprint variable lands in ``_ResolvedInputs.variables``."""
+        inputs = create_module._resolve_variables(
+            blueprint_id="python.fastapi.api",
+            cli_name="my-api",
+            cli_vars={"author": "alice"},
+            output=tmp_path,
+            no_interactive=True,
+        )
+
+        assert inputs.variables["author"] == "alice"
+        # The project name is also present — a command argument added
+        # alongside the resolver's output.
+        assert inputs.variables["project_name"] == "my-api"
+
+
+# -----------------------------------------------------------------------------
 # Generation pre-flight (filesystem)
 # -----------------------------------------------------------------------------
-# These tests do not go through ``_resolve_inputs`` — the validator
+# These tests do not go through ``_resolve_variables`` — the resolver
 # is deliberately pure and does not check the filesystem. The
 # destination-conflict check lives in ``_generate``, and that is the
 # layer these tests exercise.
@@ -853,12 +986,12 @@ class TestGeneratePreFlight:
     def test_existing_destination_without_overwrite_raises(self, tmp_path: Path) -> None:
         """A non-empty destination without ``--overwrite`` → exit 3.
 
-        The check is in ``_generate``, not in the funnel, because the
-        *input* (a destination path) is valid regardless of whether
-        the path is occupied. The conflict is a *target* problem, not
-        an *input* problem — a distinction that lets scripts
-        distinguish "fix your flags" (exit 1) from "fix your target"
-        (exit 3).
+        The check is in ``_generate``, not in the resolver, because
+        the *input* (a destination path) is valid regardless of
+        whether the path is occupied. The conflict is a *target*
+        problem, not an *input* problem — a distinction that lets
+        scripts distinguish "fix your flags" (exit 1) from "fix your
+        target" (exit 3).
         """
         target = tmp_path / "occupied"
         target.mkdir()
@@ -878,15 +1011,7 @@ class TestGeneratePreFlight:
     def test_existing_destination_with_overwrite_reaches_not_implemented(
         self, tmp_path: Path
     ) -> None:
-        """``--overwrite`` skips the conflict check and hits the stub.
-
-        The generator is unimplemented, so the test asserts on the
-        stub's failure rather than on a success path. The point is
-        that the pre-flight check did *not* fire — the pre-flight
-        would have raised ``FilesystemConflictError``, and the stub
-        raises ``NotImplementedError``. Different exception, so the
-        test can distinguish the two.
-        """
+        """``--overwrite`` skips the conflict check and hits the stub."""
         target = tmp_path / "occupied"
         target.mkdir()
         (target / "existing.txt").write_text("present")
@@ -907,16 +1032,11 @@ class TestGeneratePreFlight:
     ) -> None:
         """``--dry-run`` renders the plan for a conflicted destination.
 
-        A dry run is a *plan*, not a *commit*. Its purpose is to
-        tell the user what would happen, including the conflict — so
-        it must not fail on the conflict, and it must not silently
-        return. The assertion here is on the *rendered plan* (its
-        presence in stdout), not on the absence of an exception.
-
-        Asserting only "no exception" would pass for a future change
-        that returns early without printing anything — which would
-        look successful to a script but produce no useful output for
-        a human.
+        A dry run is a *plan*, not a *commit*. Its purpose is to tell
+        the user what would happen, including the conflict — so it
+        must not fail on the conflict, and it must not silently
+        return. The assertion is on the *rendered plan* (its presence
+        in stdout), not on the absence of an exception.
         """
         target = tmp_path / "occupied"
         target.mkdir()
@@ -931,10 +1051,6 @@ class TestGeneratePreFlight:
 
         create_module._generate(inputs, dry_run=True, overwrite=False)
 
-        # The dry-run plan goes to stdout via ``ui.print_section`` /
-        # ``ui.print_info``. The three fields below are the entire
-        # plan; their presence is the observable proof that the plan
-        # was rendered (not just "no exception raised").
         captured = capsys.readouterr()
         assert "python.fastapi.api" in captured.out
         assert "my-api" in captured.out

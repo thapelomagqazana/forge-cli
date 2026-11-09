@@ -20,6 +20,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0008](0008-pydantic-models-are-a-generated-parity-tested-projection-of-.md) | Pydantic Models Are a Generated, Parity-Tested Projection of the Canonical Schema | Accepted | 2026-11-08 |
 | [0009](0009-blueprint-discovery-uses-layered-sources-with-a-central-reso.md) | Blueprint Discovery Uses Layered Sources with a Central Resolver | Accepted | 2026-11-08 |
 | [0010](0010-blueprint-loading-returns-a-result-and-aggregates-every-erro.md) | Blueprint Loading Returns a Result and Aggregates Every Error | Accepted | 2026-11-08 |
+| [0011](0011-variable-resolution-is-a-pure-function-over-ordered-sources-.md) | Variable Resolution Is a Pure Function over Ordered Sources with a Single Validation Funnel | Accepted | 2026-11-09 |
 
 ## Creating a new ADR
 

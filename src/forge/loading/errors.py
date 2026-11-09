@@ -50,6 +50,19 @@ Every field earns its place. Removing any of them breaks a real consumer:
     column      validator could locate the failure. Optional because
                 semantic errors (missing template, semantic invariant)
                 have no meaningful line — inventing one would lie.
+                Both are populated together or not at all; a half-located
+                error is more confusing than an unlocated one.
+
+    code      → machine-readable failure class. Optional (default empty
+                string) because it is not always available — a
+                hand-constructed error in a test need not declare one —
+                but every error produced by the resolution layer or by
+                the loader's phase adapters *does* carry one. Callers
+                that route on category (CI, telemetry, future i18n) use
+                this rather than parsing prose. Stable vocabulary lives
+                in `docs/reference/VARIABLE_RESOLUTION.md` and
+                `docs/reference/VALIDATION_ERRORS.md`; treat it as a
+                public contract.
 
     extra     → a small typed escape hatch for phase-specific data
                 (e.g. `{"phase": "schema"}`). Kept as `dict[str, object]`
@@ -68,16 +81,26 @@ Deliberately NOT included:
                 consumer to filter, and filtering is exactly how warnings
                 get lost.
 
-    code      → tempting for i18n, but every consumer today uses the
-                message. Adding codes speculatively means we have to keep
-                them stable forever without any real benefit. If a
-                structured-errors use case arises, `extra["code"]` is
-                the migration path.
-
     exception → storing the underlying exception object breaks the
                 frozen/slots contract and leaks implementation details
                 to callers. Callers who need a stack trace can log at the
                 raise site, not in the error value.
+
+Why `code` is a field and not just `extra["code"]`
+--------------------------------------------------
+An earlier draft of this module deferred `code` with the reasoning that
+"every consumer today uses the message; adding codes speculatively means
+we have to keep them stable forever." That reasoning aged badly the
+moment the resolution layer shipped: variable-name validation, type
+coercion, enum membership, pattern matching, and missing-required each
+produce *distinct* failure classes that different consumers want to
+route differently (e.g. CI may fail *only* on `required.missing`; the
+wizard may suppress `required.missing` while the user is still typing).
+Making `code` first-class — a typed field with a documented vocabulary —
+keeps that routing out of the message string, where it was already
+happening as string-prefix matching. The default of `""` preserves the
+original "not all errors need a code" stance without forcing a
+migration on hand-constructed test fixtures.
 
 Frozen and slotted
 ------------------
@@ -111,10 +134,11 @@ class ValidationError:
     """A single, actionable validation failure.
 
     All instances of this class are produced by the loader pipeline
-    (`parse_yaml`, `schema_errors`, `model_errors`, `check_templates`)
-    or by helpers in `loading/hints.py` that construct them for the
-    "unknown field" and "unknown phase" cases. Consumers should treat
-    this class as closed: they render and route it, they do not extend it.
+    (`parse_yaml`, `schema_errors`, `model_errors`, `check_templates`),
+    by the resolution layer (`coercion`, `validators`, `resolver`), or by
+    helpers in `loading/hints.py` that construct them for the "unknown
+    field" and "unknown phase" cases. Consumers should treat this class
+    as closed: they render and route it, they do not extend it.
     """
 
     path: str
@@ -169,6 +193,22 @@ class ValidationError:
     phases must respect this pairing.
     """
 
+    code: str = ""
+    """Machine-readable failure class, e.g. `required.missing`.
+
+    Empty string means "no code assigned" — the norm for hand-constructed
+    fixtures and for errors whose class is not (yet) part of the stable
+    vocabulary. Every error the loader or resolution layer produces in
+    production carries one; the empty default exists so tests can
+    construct minimal fixtures without a fake code polluting assertions.
+
+    Callers that branch on category (CI gates, telemetry, future i18n)
+    key on this, never on `message`. The vocabulary is documented in
+    `docs/reference/VARIABLE_RESOLUTION.md` and
+    `docs/reference/VALIDATION_ERRORS.md`; treat it as a public contract
+    and add a doc entry whenever a new code is introduced.
+    """
+
     extra: dict[str, object] = field(default_factory=dict)
     """Phase-specific structured payload (e.g. `{"phase": "schema"}`).
 
@@ -196,7 +236,7 @@ class ValidationError:
 
         Example outputs::
 
-            broken.yaml:3:12: invalid YAML: found unexpected ':'
+            broken.yaml:3:12: <root>: invalid YAML: found unexpected ':'
                 — hint: Re-save the blueprint as UTF-8 ...
 
             examples/multi-error.yaml: version: expected '1.0.0',
@@ -214,7 +254,7 @@ class ValidationError:
         else:
             location = self.source
         field_path = self.path or "<root>"
-        return f"{location}: {field_path}: {self.message} " f"— hint: {self.hint}"
+        return f"{location}: {field_path}: {self.message} — hint: {self.hint}"
 
     def format_multiline(self) -> str:
         """Two-line rendering suitable for narrow terminals and JSON logs.
@@ -232,4 +272,4 @@ class ValidationError:
         else:
             location = self.source
         field_path = self.path or "<root>"
-        return f"{location}: {field_path}: {self.message}\n" f"    hint: {self.hint}"
+        return f"{location}: {field_path}: {self.message}\n    hint: {self.hint}"
