@@ -12,9 +12,9 @@ the exception's category first, then dispatches to the right
 renderer. The categories are:
 
 1. **Cancellations** (``KeyboardInterrupt``, ``click.Abort``,
-   ``typer.Abort``, ``PromptCancelledError``). These are neither
-   failures nor errors. Rendered as a single dimmed "Cancelled."
-   line on stderr, exiting with ``ExitCode.USER_ERROR``.
+   ``typer.Abort``, ``EOFError``, ``PromptCancelledError``). These
+   are neither failures nor errors. Rendered as a single dimmed
+   "Cancelled." line on stderr, exiting with ``ExitCode.USER_ERROR``.
 
 2. **``ForgeError`` and its subclasses.** The user's fault (bad
    input, missing blueprint, filesystem conflict). Rendered as a
@@ -49,6 +49,27 @@ cancellation first makes the rendering deterministic and preserves
 the "cancellations are commentary, not errors" rule from the module
 docstring.
 
+Why both ``click.Abort`` and ``typer.Abort`` are in the set
+-----------------------------------------------------------
+Older Typer re-exported ``click.Abort`` as ``typer.Abort`` — they
+were the same class, and code written against that assumption could
+use either name interchangeably. Current Typer does **not**:
+``typer.Abort`` is ``typer.exceptions.Abort``, a distinct class that
+is *not* a subclass of ``click.Abort``. A handler that checks only
+``click.Abort`` will therefore miss every cancellation that arrives
+through a Typer prompt while still catching every cancellation that
+arrives through a Click prompt — an asymmetry that is invisible in
+tests that construct one class and visible only in tests that
+construct the other.
+
+Both names belong in the tuple. A future Typer that re-aliases them
+(or splits them again) is also covered: ``isinstance(x, (A, B))``
+tolerates ``A is B`` silently, unlike the ``A | B`` union form
+which raises ``TypeError: isinstance() argument 2 cannot contain
+duplicate types``. Do not "clean this up" by removing one name on
+the theory that "they're the same class." They are not, and a future
+contributor relying on that theory will ship the bug.
+
 Why ``--debug`` does *not* re-raise user errors
 -----------------------------------------------
 ``--debug`` is a tool for the *developer of Forge*, not for the
@@ -69,7 +90,7 @@ the standard contract for every serious CLI: ``--debug`` is for the
 developer, not for the user's typos.
 
 Why ``SystemExit``, not ``typer.Exit``
----------------------------------------
+--------------------------------------
 The handler is called from ``main()``, *after* Typer's dispatch has
 finished. ``typer.Exit`` is only special *inside* a Typer command —
 Typer catches it there and converts it to a ``SystemExit`` with the
@@ -145,8 +166,59 @@ from forge.cli.ui import print_cancelled, print_error, print_hint
 from forge.core.exceptions import (
     ExitCode,
     ForgeError,
-    MissingRequiredFlagsError,
     PromptCancelledError,
+)
+
+# -----------------------------------------------------------------------------
+# Cancellation set
+# -----------------------------------------------------------------------------
+# The set of exceptions that mean "the user asked us to stop." These
+# are *commentary*, not errors: the user chose to cancel, so the
+# renderer must not use the error style (red ✗), must not print a
+# hint, and must write to stderr (so a cancelled JSON stream never
+# receives "Cancelled." interleaved into its product output).
+#
+# Why a tuple and not a ``|`` union:
+#   * ``isinstance(x, A | B)`` raises ``TypeError: isinstance()
+#     argument 2 cannot contain duplicate types`` when ``A is B``.
+#     ``isinstance(x, (A, B))`` silently de-duplicates. That matters
+#     here because ``click.Abort`` and ``typer.Abort`` have been the
+#     same class in some Typer releases and distinct classes in
+#     others; the tuple form works in both worlds, the union form
+#     works in only one.
+#   * A future Typer that re-aliases the two names (or splits them
+#     again) is covered with no edit to this tuple. The union would
+#     need a conditional at import time to build the correct set
+#     per version. The tuple is unconditionally correct.
+#
+# Why BOTH ``click.Abort`` and ``typer.Abort`` are listed:
+#   * They are distinct classes in current Typer. ``typer.Abort`` is
+#     ``typer.exceptions.Abort``, which is **not** a subclass of
+#     ``click.Abort``. A handler that listed only ``click.Abort``
+#     would miss every cancellation that arrived through a Typer
+#     prompt — while still catching every one that arrived through a
+#     Click prompt. That asymmetry is invisible to tests that
+#     construct one class and visible only to tests that construct
+#     the other.
+#   * They have been the same class in older Typer. The tuple
+#     tolerates that (``isinstance`` de-duplicates), so listing both
+#     is safe even when they refer to the same class. Do not remove
+#     one on the theory that "they're the same" — the theory has
+#     already been wrong once, and re-wronging it is one dependency
+#     bump away.
+#
+# ``EOFError`` is included because a user piping input
+# (``echo "" | forge create``) hits EOF at the first read; that is
+# a cancellation, not a bug. ``KeyboardInterrupt`` covers Ctrl+C at
+# any non-Typer point. ``PromptCancelledError`` covers the wizard's
+# own cancellation path (see ``PromptCancelledError``'s docstring
+# for why it is not a plain ``UserInputError`` here).
+_CANCELLATIONS: tuple[type[BaseException], ...] = (
+    PromptCancelledError,
+    KeyboardInterrupt,
+    click.Abort,
+    typer.Abort,  # Distinct class in current Typer; listed for that reason.
+    EOFError,
 )
 
 
@@ -166,11 +238,15 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     ``--debug`` behaviour:
 
     - **Cancellation** — ``KeyboardInterrupt``, ``click.Abort``,
-      ``typer.Abort``, or ``PromptCancelledError``. Rendered as
-      "Cancelled." on stderr, exit 1. ``--debug`` does not change
-      this.
+      ``typer.Abort``, ``EOFError``, or ``PromptCancelledError``.
+      Rendered as "Cancelled." on stderr, exit 1. ``--debug`` does
+      not change this.
     - **``ForgeError``** — user error, rendered friendly, exit code
       from the subclass. ``--debug`` does not change this.
+      ``MissingRequiredFlagsError`` (a subclass) is rendered by the
+      same branch; its distinct hint carries the remediation
+      ("Pass the missing flags, or re-run in an interactive
+      terminal."), so no separate branch is needed.
     - **``click.ClickException``** — user error, rendered friendly,
       exit code from Click (2 for usage errors). ``--debug`` does not
       change this.
@@ -200,48 +276,40 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     # they did not fail. Cancellation is commentary, and commentary
     # goes through ``print_cancelled`` (stderr, dimmed, no prefix).
     #
-    # ``click.Abort`` is listed alongside ``typer.Abort`` because
-    # Typer's re-export has drifted across versions; testing against
-    # both is a one-token cost that removes a future footgun. Modern
-    # Typer aliases them, but a pinned old version may not.
-    if isinstance(exc, PromptCancelledError | KeyboardInterrupt | click.Abort | typer.Abort):
+    # ``typer.Abort`` subclasses ``click.ClickException`` in current
+    # Typer, so if this branch did not exist (or if ``typer.Abort``
+    # were missing from ``_CANCELLATIONS``) it would fall through to
+    # the ClickException branch below and be rendered as a user
+    # error with exit code 1 — numerically the same as the
+    # cancellation branch, but with an error-style message instead
+    # of "Cancelled." The numeric coincidence is exactly what makes
+    # this bug hard to notice without a test that asserts on the
+    # rendered *message*, not just the exit code.
+    if isinstance(exc, _CANCELLATIONS):
         print_cancelled()
         raise SystemExit(ExitCode.USER_ERROR) from None
 
     # -------------------------------------------------------------------------
-    # MissingRequiredFlagsError — the user's fault, rendered like any
-    # ForgeError, but kept as an explicit branch for two reasons:
+    # ForgeError and subclasses — the user's fault, with an exit code.
     #
-    #   1. **Documentation value.** A reader scanning the handler sees
-    #      that this specific failure mode is a known, first-class
-    #      case — not an accident of inheritance.
-    #   2. **Testability.** Future tests that assert "missing flags
-    #      render with a hint on stderr" read clearly against this
-    #      branch, not against a generic ``ForgeError`` assertion.
+    # This branch handles ``MissingRequiredFlagsError`` (via its
+    # ``UserInputError`` parent) with no special-casing: the subclass
+    # already overrides ``hint`` with the "pass these flags" text,
+    # and the message lists every missing flag. A dedicated branch
+    # would be behaviourally identical and would be deleted by the
+    # next cleanup, taking any rationale with it. The comment here
+    # is the documentation for that case.
     #
-    # This branch is behaviorally identical to the ``ForgeError``
-    # branch below (same rendering, same exit code) — but the
-    # duplication is one screen's worth of clarity for a failure
-    # mode that is *the* acceptance criterion of Task 1.1.6.
-    # -------------------------------------------------------------------------
-    if isinstance(exc, MissingRequiredFlagsError):
-        print_error(str(exc))
-        if exc.hint:
-            print_hint(exc.hint)
-        raise SystemExit(exc.exit_code) from None
-
-    # -------------------------------------------------------------------------
-    # ForgeError and subclasses — the user's fault, with an exit code
+    # ``SystemExit`` (not ``typer.Exit``) — the handler is called
+    # from ``main()``, outside Typer's dispatch, so Typer is not
+    # there to catch ``typer.Exit``. ``SystemExit`` is the
+    # exception ``sys.exit`` expects, and it exits the process
+    # cleanly with the correct code.
     # -------------------------------------------------------------------------
     if isinstance(exc, ForgeError):
         print_error(str(exc))
         if exc.hint:
             print_hint(exc.hint)
-        # ``SystemExit`` (not ``typer.Exit``) — the handler is called
-        # from ``main()``, outside Typer's dispatch, so Typer is not
-        # there to catch ``typer.Exit``. ``SystemExit`` is the
-        # exception ``sys.exit`` expects, and it exits the process
-        # cleanly with the correct code.
         raise SystemExit(exc.exit_code) from None
 
     # -------------------------------------------------------------------------
@@ -254,6 +322,14 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     # not bugs. Render them as friendly messages with Click's own
     # exit code (2 for usage errors), not as "unexpected internal
     # error" with exit 5.
+    #
+    # We do **not** wrap ``exc.exit_code`` in ``ExitCode(...)`` even
+    # though ADR-0013 discourages magic numbers. Click's usage error
+    # is 2, which numerically equals ``ExitCode.BLUEPRINT_ERROR`` —
+    # wrapping would *silently* relabel a usage error as a blueprint
+    # error, which is the wrong signal for a CI consumer. Leave
+    # Click's code raw and treat "Click owns its own code" as an
+    # explicit exception to ADR-0013, documented here.
     #
     # ``click.exceptions.Exit`` is a subclass of ``ClickException``
     # but it is Click's *success* path (the user asked for help or
@@ -276,6 +352,12 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     # a vulnerability. The user gets a generic message and a link to
     # the issue tracker; the developer gets the traceback via --debug.
     if debug:
+        # ``raise exc`` outside an ``except`` context preserves the
+        # exception's own ``__traceback__`` and appends one frame at
+        # the ``raise`` — the developer sees the full original
+        # traceback, including the raise site, plus a marker for
+        # where the handler surfaced it. That is exactly what we
+        # want.
         raise exc
 
     print_error("An unexpected internal error occurred.")

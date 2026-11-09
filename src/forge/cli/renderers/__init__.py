@@ -68,12 +68,26 @@ Every renderer in this package MUST:
 
 Public surface
 --------------
-The package re-exports exactly the two renderers that exist today:
+The package re-exports exactly the renderers that exist today,
+grouped by the command whose DTO each one consumes. Grouping keeps
+the surface honest as the catalogue grows: a reader can tell at a
+glance which command each format serves, and a new command's
+renderers slot into a new, obviously-named group rather than
+lengthening a flat list.
 
-* ``render_table`` — plain ASCII table for human terminals.
-* ``render_json``  — deterministic JSON for automation.
+* ``forge list``
+    * ``render_table``        — plain ASCII table (human terminals).
+    * ``render_json``         — deterministic JSON (automation).
+                                Generic over any validated Pydantic
+                                model, so future commands reuse it
+                                without a new renderer.
 
-Adding a renderer is intentionally a two-line change here (one import,
+* ``forge validate``
+    * ``render_validate_human`` — multi-line error report (terminals).
+    * ``render_validate_json``  — deterministic JSON envelope
+                                  (see ``CLI_VALIDATE_OUTPUT.md``).
+
+Adding a renderer is intentionally a small change here (one import,
 one ``__all__`` entry). The deliberate friction is that adding it
 *also* requires:
 
@@ -93,11 +107,12 @@ What this module is NOT
 -----------------------
 * **Not a factory.** There is no ``get_renderer(format)`` here. The
   command picks the renderer directly by name — ``render_table`` or
-  ``render_json`` — because there are two of them and a lookup table
-  would obscure which formats are supported at each call site. When
-  the third format arrives, the factory can be added *here* without
-  touching callers, which is the correct time to introduce the
-  indirection.
+  ``render_json``, ``render_validate_human`` or
+  ``render_validate_json`` — because the set of formats per command
+  is small and a lookup table would obscure which formats are
+  supported at each call site. When a command grows past two formats,
+  the factory can be added *here* without touching callers, which is
+  the correct time to introduce the indirection.
 
 * **Not a place for cross-cutting logic.** Colour, indentation,
   pagination, and terminal-width detection are *not* the renderer's
@@ -116,30 +131,44 @@ What this module is NOT
 Layering recap
 --------------
     cli/commands/list.py       -> collects data, sorts once, picks renderer
-    cli/schemas/list_output.py -> the DTO (contract)
-    cli/renderers/table.py     -> DTO -> string  (this package)
-    cli/renderers/json.py      -> DTO -> string  (this package)
-    cli/ui.py                  -> writes the string to stdout (+ newline, colour)
+    cli/commands/validate.py   -> loads blueprint, picks renderer, returns exit code
+    cli/schemas/list_output.py     -> the list DTO (contract)
+    cli/schemas/validate_output.py -> the validate DTO (contract)
+    cli/renderers/table.py            -> DTO -> string
+    cli/renderers/json.py             -> DTO -> string (generic JSON)
+    cli/renderers/validate_human.py   -> DTO -> string
+    cli/renderers/validate_json.py    -> DTO -> string
+    cli/ui.py                         -> writes the string to stdout (+ newline, colour)
 
 The dependency arrow points *down* the list, never up: renderers do
 not import commands, ``ui`` does not import renderers, and
 ``schemas`` imports nothing from ``forge.cli`` at all. That is what
-makes the DTO reusable from non-CLI entry points (a future HTTP
+makes the DTOs reusable from non-CLI entry points (a future HTTP
 catalog endpoint, an editor integration) without pulling the CLI in
-with it.
+with them.
 """
 
 from __future__ import annotations
 
+# --- `forge list` renderers ------------------------------------------------
 from forge.cli.renderers.json import render_json
 from forge.cli.renderers.table import render_table
 
+# --- `forge validate` renderers -------------------------------------------
+from forge.cli.renderers.validate_human import render_validate_human
+from forge.cli.renderers.validate_json import render_validate_json
+
 __all__ = [
-    # `forge list` table format — human terminals.
+    # `forge list` — table format for human terminals.
     "render_table",
-    # Generic deterministic JSON — every command's `--json` mode.
-    # (Currently consumed by `forge list`; the signature accepts any
-    # validated Pydantic model, so new commands reuse it without a
-    # new renderer.)
+    # `forge list` — generic deterministic JSON for automation.
+    # (Signature accepts any validated Pydantic model; new commands with
+    # a flat envelope reuse this without a new renderer.)
     "render_json",
+    # `forge validate` — multi-line error report for human terminals.
+    # Prints every error from the loader with path, message, and hint.
+    "render_validate_human",
+    # `forge validate` — deterministic JSON envelope for CI.
+    # Shape is locked by CLI_VALIDATE_OUTPUT.md and its contract test.
+    "render_validate_json",
 ]

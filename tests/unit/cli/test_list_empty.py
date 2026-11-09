@@ -47,11 +47,33 @@ Contract reference
 See `docs/reference/CLI_LIST_OUTPUT.md` for the JSON envelope and
 `docs/adr/0012-cli-output-contracts-and-renderers.md` for the
 "emptiness is success" rule.
+
+Golden-fixture newline convention
+---------------------------------
+The fixture files under ``tests/fixtures/list/`` are *text files on
+disk*, and text files end with a newline. The payload they contain
+(the JSON envelope) does not end with a newline — the newline is
+``ui.emit``'s framing, not the renderer's output.
+
+``_assert_golden`` normalises both sides to the payload:
+
+* **Read side:** the file's trailing ``"\\n"`` is stripped before
+  comparison.
+* **Write side:** ``UPDATE_SNAPSHOTS=1`` writes ``actual + "\\n"``,
+  so the file on disk keeps the canonical POSIX text-file form
+  even when it is regenerated.
+
+Both sides agreeing on this rule is what makes the test *stable*
+across editors, ``git`` autocrlf settings, and PR review UIs, all
+of which add a trailing newline to a file they touch. It is also
+what keeps this helper consistent with its sibling in
+``test_list_json.py``, which applies the same rule.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -401,6 +423,21 @@ class TestEmptyEnvelopeSnapshot:
     command's empty behaviour", one from "the JSON contract") shortens
     the debug loop when something goes wrong.
 
+    Newline convention
+    ------------------
+    See the module docstring's "Golden-fixture newline convention"
+    section. Both this helper and its sibling in ``test_list_json.py``
+    use the same rule:
+
+    * Read: ``file.read_text().rstrip("\\n")``
+    * Write: ``file.write_text(actual + "\\n")``
+
+    The rule is applied *identically* on both sides so the two
+    helpers cannot fight over the file's form when ``UPDATE_SNAPSHOTS=1``
+    is set. A helper that writes a trailing newline and one that does
+    not would race; whichever ran last would decide, and every future
+    run of the *other* helper would fail.
+
     Regenerate with:
         UPDATE_SNAPSHOTS=1 uv run pytest tests/unit/cli/test_list_empty.py --no-cov
     """
@@ -410,7 +447,18 @@ class TestEmptyEnvelopeSnapshot:
 
         if os.environ.get("UPDATE_SNAPSHOTS") == "1":
             fixture_path.parent.mkdir(parents=True, exist_ok=True)
-            fixture_path.write_text(actual, encoding="utf-8")
+            # Write with a trailing newline so the file stays in the
+            # POSIX text-file form that editors, ``git``, and PR
+            # review UIs all produce and preserve. The read side
+            # strips exactly one ``\n`` before comparing, so the
+            # newline is a file convention, not part of the payload.
+            #
+            # Do NOT remove the ``+ "\n"``. A fixture written without
+            # a trailing newline will regain one the next time any
+            # editor touches it, and this helper will then fail with
+            # a newline-only diff — the exact failure that the current
+            # change is fixing.
+            fixture_path.write_text(actual + "\n", encoding="utf-8")
             return
 
         if not fixture_path.exists():
@@ -422,8 +470,16 @@ class TestEmptyEnvelopeSnapshot:
                 f"and inspect the diff before committing."
             )
 
-        expected = fixture_path.read_text(encoding="utf-8")
-        assert actual == expected, (
+        # ``rstrip("\n")`` (not ``rstrip()``) is deliberate: we strip
+        # the file's trailing line terminator, and only that. A
+        # payload whose last character is a space is preserved
+        # exactly, which matters for a byte-level contract. Stripping
+        # *all* whitespace would silently mangle such a payload and
+        # make this test incapable of catching a real bug where the
+        # renderer emitted a trailing space.
+        expected = fixture_path.read_text(encoding="utf-8").rstrip("\n")
+        actual_payload = actual.rstrip("\n")
+        assert actual_payload == expected, (
             f"\nGolden fixture mismatch for {fixture_name}.\n"
             f"The empty envelope is a *contract* for `forge list "
             f"--json`; any change is consumer-visible.\n"
@@ -432,7 +488,7 @@ class TestEmptyEnvelopeSnapshot:
             f"{Path(__file__).name} --no-cov\n"
             f"and update CLI_LIST_OUTPUT.md if the shape changed.\n\n"
             f"--- expected ---\n{expected}\n"
-            f"--- actual ---\n{actual}\n"
+            f"--- actual ---\n{actual_payload}\n"
         )
 
     def test_empty_envelope_matches_golden_fixture(
@@ -442,11 +498,6 @@ class TestEmptyEnvelopeSnapshot:
         _exit, out, _err = _run_list([], json_mode=True, capsys=capsys)
         # `ui.emit` appends one newline; the fixture captures the
         # payload without it (the newline is `emit`'s framing, not the
-        # payload's).
-        self._assert_golden(out.rstrip("\n"), "envelope_empty.json")
-
-
-# `os` is imported here rather than at module scope to keep the
-# top-of-file imports focused on what most tests need. The snapshot
-# branch is the only consumer, and it is at the bottom of the file.
-import os  # noqa: E402
+        # payload's). ``_assert_golden`` normalises the read side to
+        # the same convention.
+        self._assert_golden(out, "envelope_empty.json")

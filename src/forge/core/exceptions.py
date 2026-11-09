@@ -54,6 +54,28 @@ Every ``ForgeError`` can carry an optional ``hint`` — a one-line
 remediation suggestion. The handler renders the hint on a separate,
 dimmed line, so the user sees the *problem* and the *fix* together.
 
+``hint`` has two legitimate sources:
+
+* **Class-level default.** Set on the subclass
+  (``SchemaValidationError.hint = "See ..."``). Applies when the
+  caller does not override it. Used for stable, type-wide
+  remediation text.
+* **Instance-level override.** Passed as a keyword to the
+  constructor. Subclasses that declare ``hint`` as a dataclass field
+  with a default accept this; classes that keep it a class attribute
+  do not expose the keyword. See the field-vs-attribute rationale
+  below.
+
+The ``SchemaValidationError`` and ``ModelValidationError`` classes
+declare a class-level hint *and* inherit a constructor that accepts
+an override via the base ``ForgeError.__init__`` path — but as
+dataclasses they call ``Exception.__init__`` directly and therefore
+do **not** accept the ``hint=`` keyword. The class-level hint is
+fixed for these two types, by design: their hints do not need
+per-instance context, and a keyword would widen the surface for no
+use case. If a future need emerges, adding ``hint`` as a field is
+non-breaking.
+
 Why the enum lives here, not in ``cli/``
 ----------------------------------------
 The exit code is a **domain decision**, not a CLI decision. Every
@@ -63,20 +85,21 @@ the code. The decision belongs in ``core/``; the use belongs in
 
 Hierarchy at a glance
 ---------------------
+
 ::
 
-    ForgeError (Exception)
+    ForgeError (Exception)              [not slotted; see rationale]
     ├── UserInputError                 (1)
-    │   ├── MissingRequiredFlagsError  (1)
-    │   └── PromptCancelledError       (1)
+    │   ├── MissingRequiredFlagsError  (1) [slotted dataclass]
+    │   └── PromptCancelledError       (1) [slotted dataclass]
     ├── BlueprintError                 (2)
     ├── DiscoveryError                 (2)
-    │   └── MalformedBlueprintError    (2)
+    │   └── MalformedBlueprintError    (2) [slotted dataclass]
     ├── FilesystemConflictError        (3)
     ├── VerificationError              (4)
-    └── StructuredError                (5)
-        ├── SchemaValidationError      (1)   <- user's blueprint
-        └── ModelValidationError       (5)   <- Forge bug
+    └── StructuredError                (5) [slotted dataclass]
+        ├── SchemaValidationError      (1) [slotted dataclass]
+        └── ModelValidationError       (5) [slotted dataclass]
 
 Two design rules follow from this tree:
 
@@ -118,6 +141,20 @@ worth that cost. Exceptions are *events*, not values: their identity
 is their traceback, not their fields. ``slots=True`` is kept because
 it reduces per-instance memory without interfering with exception
 machinery.
+
+Why ``ForgeError`` itself is *not* slotted
+------------------------------------------
+``slots=True`` is applied to the *dataclass* subclasses, not to the
+base class. Two reasons:
+
+* ``Exception`` carries state that must remain settable
+  (``__traceback__``, ``__context__``, ``__cause__``,
+  ``__notes__``). A slotted base would need to declare slots for all
+  of these, which is fragile across Python versions.
+* The base class is instantiated rarely (only for the
+  "unanticipated failure" fallback). The memory saving is
+  negligible; the risk of interfering with exception mechanics is
+  not.
 
 The ``hint`` field on dataclass subclasses
 ------------------------------------------
@@ -223,6 +260,10 @@ class ForgeError(Exception):
             hint; the constructor's ``hint=None`` does not clobber it.
     """
 
+    # Not slotted: ``Exception`` requires settable traceback/context
+    # attributes (see module docstring, "Why ForgeError itself is not
+    # slotted"). Subclasses that need memory savings are dataclasses
+    # with ``slots=True``.
     exit_code: ExitCode = ExitCode.INTERNAL_ERROR
     hint: str | None = None
 
@@ -302,6 +343,15 @@ class DiscoveryError(ForgeError):
     **What the user should do:** Run ``forge list`` to see available
     blueprints, or fix the local override that shadowed the requested
     id.
+
+    .. note::
+       This class deliberately does not define ``__init__``. Dataclass
+       subclasses (``MalformedBlueprintError``) rely on the base
+       having no custom initializer; adding one here would silently
+       bypass the dataclass-generated ``__init__`` on those
+       subclasses. If a custom initializer becomes necessary, audit
+       every dataclass subclass and either drop ``slots=True`` or
+       provide an explicit ``__post_init__`` forwarding path.
     """
 
     # Deliberately redeclared rather than inherited from a nonexistent
@@ -384,8 +434,10 @@ class MissingRequiredFlagsError(UserInputError):
     Attributes:
         command: The command name (e.g., ``"create"``).
         missing: The missing flag names, without the ``--`` prefix,
-            in stable declaration order. Materialized to a tuple in
-            ``__post_init__``.
+            in stable declaration order. Normalized to a deduplicated
+            tuple in ``__post_init__``; a caller that passed
+            ``["name", "name"]`` sees one rendered flag, matching the
+            "fix everything in a single edit" contract.
         hint: A one-line remediation suggestion. Defaults to the
             class-level value ("Pass the missing flags, or re-run in
             an interactive terminal."). Raisers with better context
@@ -399,16 +451,18 @@ class MissingRequiredFlagsError(UserInputError):
     )
 
     def __post_init__(self) -> None:
-        """Normalise ``missing`` and initialise ``Exception.args``.
+        """Normalize ``missing`` and initialize ``Exception.args``.
 
         Two responsibilities, both load-bearing:
 
-        1. **Normalise ``missing`` to a tuple.** The public type is
-           ``tuple[str, ...]``, but callers habitually pass a list
-           comprehension or a generator. Materializing here makes the
-           attribute safe to read in handlers, loggers, and tests. A
-           generator passed directly would be consumed once, which is
-           a subtle footgun the dataclass cannot express in its type.
+        1. **Normalize ``missing`` to a deduplicated tuple.** The
+           public type is ``tuple[str, ...]``, but callers habitually
+           pass a list comprehension or a generator, and may pass the
+           same flag twice (e.g. from a merged source list). We
+           deduplicate while preserving order:
+           ``(a, b, a)`` becomes ``(a, b)``. A generator passed
+           directly would be consumed once, which is a subtle footgun
+           the dataclass cannot express in its type.
 
         2. **Compose the message and feed it to ``Exception.args``.**
            Dataclasses generate ``__init__`` for us, so the base
@@ -416,11 +470,13 @@ class MissingRequiredFlagsError(UserInputError):
            Without this, ``str(exc)`` would return an empty string and
            pickle round-trips would lose the message.
 
-        The message is built *after* normalisation so it reflects the
-        canonical tuple, not the caller's input — a caller that passed
-        a duplicate flag gets one rendered instance, not two.
+        The message is built *after* normalization so it reflects the
+        canonical tuple, not the caller's input.
         """
-        self.missing = tuple(self.missing)
+        # ``dict.fromkeys`` preserves insertion order and deduplicates.
+        # Cheaper and more readable than a manual seen-set loop, and
+        # guaranteed O(n) by CPython's dict implementation.
+        self.missing = tuple(dict.fromkeys(self.missing))
 
         formatted = ", ".join(f"--{flag}" for flag in self.missing)
         message = f"Missing required option(s) for non-interactive mode: " f"{formatted}."
@@ -444,7 +500,11 @@ class PromptCancelledError(UserInputError):
     Attributes:
         prompt: The prompt message that was interrupted, if known.
             Included in the message so the user can see *where* they
-            cancelled. ``None`` means "cannot identify the step."
+            cancelled. ``None`` **and** an empty string both mean
+            "cannot identify the step" — the truthiness check in
+            ``__post_init__`` treats them identically, and this is
+            deliberate: a caller who forgot to pass ``prompt`` gets
+            the same generic message as one who passed ``""``.
         hint: A one-line remediation suggestion. Defaults to the
             class-level value ("Re-run when ready, or use
             --no-interactive ..."). Raisers with better context may
@@ -460,12 +520,13 @@ class PromptCancelledError(UserInputError):
     )
 
     def __post_init__(self) -> None:
-        """Compose the message and initialise ``Exception.args``.
+        """Compose the message and initialize ``Exception.args``.
 
-        The message varies based on whether ``prompt`` is provided:
-        with a prompt, it names the step; without, it stays generic.
-        Both forms end in "cancelled by user" so log scrapers and
-        tests keying on that phrase work uniformly.
+        The message varies based on whether ``prompt`` is truthy:
+        with a prompt, it names the step; without (``None`` or
+        ``""``), it stays generic. Both forms end in "cancelled by
+        user" so log scrapers and tests keying on that phrase work
+        uniformly.
         """
         if self.prompt:
             message = f"Interactive prompt cancelled by user at " f"'{self.prompt}'."
@@ -496,6 +557,12 @@ class MalformedBlueprintError(DiscoveryError):
     **What the user should do:** Fix the named file. The ``reason``
     string carries the underlying failure so the message is
     self-contained; no separate logging lookup is needed.
+
+    .. note::
+       This dataclass relies on ``DiscoveryError`` having no
+       ``__init__`` of its own. Adding one to the parent would
+       require dropping ``slots=True`` here or forwarding explicitly
+       through ``__post_init__``; see the parent class's note.
 
     Attributes:
         source_label: The candidate's provenance label, in the
@@ -569,13 +636,22 @@ class StructuredError(ForgeError):
     errors: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
-        """Initialise ``Exception.args`` so ``str()`` and pickling work.
+        """Initialize ``Exception.args`` so ``str()`` and pickling work.
 
         ``Exception.__init__`` is normally called in ``__init__``, but
         a dataclass generates ``__init__`` for us. We call the base
         initializer here with the message that ``__str__`` will
         render, so ``repr(exc)`` and pickle round-trips behave as
         callers expect from an exception.
+
+        Note: this eagerly formats the message, which means
+        ``__str__`` runs once at construction and again whenever the
+        caller formats the exception. For the error counts in
+        practice (single digits) that is a non-issue; for very large
+        batches the extra pass is negligible. If profiling ever shows
+        this matters, switch to storing the raw fields and formatting
+        lazily — but keep ``Exception.args`` populated so pickling
+        continues to work.
         """
         Exception.__init__(self, self.__str__())
 
@@ -620,7 +696,8 @@ class SchemaValidationError(StructuredError):
     # Override the base's exit code and hint. Both are class-level
     # because they are contract, not state. Overriding via a field
     # here would widen the constructor signature without a current
-    # use case; the class-attribute form is intentional.
+    # use case; the class-attribute form is intentional. See the
+    # module docstring, "The hint field on dataclass subclasses."
     exit_code = ExitCode.USER_ERROR
     hint = "See docs/reference/SCHEMA_REFERENCE.md for field-level guidance."
 
@@ -658,12 +735,15 @@ class ModelValidationError(StructuredError):
     validation succeeds but ``Blueprint.model_validate`` fails.
 
     **What the user should do:** Report it. The message names the
-    parity regression, and the hint points at the regeneration check.
+    parity regression, and the hint points at the two checks that
+    guard against it.
     """
 
     exit_code = ExitCode.INTERNAL_ERROR
     hint = (
-        "This is a Forge bug, not an input error. " "Run `make models-check` and report the diff."
+        "This is a Forge bug, not an input error. Run "
+        "`make models-check` and `pytest tests/unit/models/test_schema_model_parity.py`, "
+        "then report the diff."
     )
 
     def __str__(self) -> str:
@@ -671,7 +751,9 @@ class ModelValidationError(StructuredError):
 
         The footer is what distinguishes this from a schema error at a
         glance in CI logs: schema errors end with a bullet list (fix
-        the blueprint); model errors end with "report it" (fix Forge).
+        the blueprint); model errors end with "this is a Forge bug"
+        (report it). The distinction matters because the two have
+        opposite remedies.
         """
         if not self.errors:
             return (
@@ -697,7 +779,9 @@ class ModelValidationError(StructuredError):
 # documented common ancestor, not a catch target: callers should catch
 # ``SchemaValidationError`` (actionable: fix the blueprint) or
 # ``ModelValidationError`` (actionable: report a bug) — never the base,
-# because the correct response differs.
+# because the correct response differs. The class remains importable
+# (``from forge.core.exceptions import StructuredError``) for handlers
+# that legitimately need to share rendering code across both subtypes.
 __all__ = [
     "BlueprintError",
     "DiscoveryError",

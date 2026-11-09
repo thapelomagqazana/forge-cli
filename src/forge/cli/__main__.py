@@ -10,7 +10,10 @@ This module exists so that:
    can invoke Forge without a symlink.
 
 The behaviour is identical to ``forge`` because it calls the same
-``main()`` function.
+``main()`` function. (``forge`` is defined in ``pyproject.toml`` as
+``forge = "forge.cli.main:main"`` -- the console-script entry point and
+this ``-m`` entry point are two front doors onto the same function. If
+one of them ever changes, check the other.)
 
 Why the ``if __name__ == "__main__"`` guard is required
 -------------------------------------------------------
@@ -31,6 +34,10 @@ The guard confines execution to the actual ``-m`` invocation. At that
 point Python sets ``__name__ == "__main__"`` for the module it is
 executing, and only then does ``main()`` run.
 
+The guard is exercised by ``tests/integration/test_cli_entrypoint.py``;
+if you change this file, run that test -- it is the only thing that
+proves the ``-m`` path still works.
+
 Why no explicit ``sys.exit`` wrapper
 ------------------------------------
 ``main()`` is declared ``-> NoReturn`` and terminates by raising
@@ -50,6 +57,14 @@ attribute to the process exit status. Wrapping ``main()`` in
 
 The no-wrapper form is the canonical pattern for a ``__main__`` module
 whose entry point already raises ``SystemExit``.
+
+The call site below is therefore load-bearing: ``main()`` must never
+grow a return value. If ``main()`` is ever changed to *return* an
+``int`` exit code (as ``forge validate``'s callback already does for
+``standalone_mode=False``, see ``forge/cli/commands/validate.py``),
+this file must be updated to forward that return value -- otherwise
+the process will exit ``0`` regardless of what the command reported,
+silently breaking every script that branches on ``$?``.
 
 Why the module imports ``main`` from ``forge.cli.main`` (not from
 ``forge.cli``)
@@ -88,4 +103,8 @@ from __future__ import annotations
 from forge.cli.main import main
 
 if __name__ == "__main__":
+    # ``main()`` is ``-> NoReturn``: it raises ``SystemExit`` and never
+    # returns. The bare call is correct *only* because of that
+    # contract. Do not add a ``sys.exit(main())`` wrapper here -- see
+    # the module docstring, "Why no explicit ``sys.exit`` wrapper".
     main()
