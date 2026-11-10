@@ -1,0 +1,46 @@
+# EXERCISES: not-equals (both string and boolean)
+# Covers `!=` for the two literal kinds where it is most useful.
+# The test suite drives both sides of each comparison.
+schema_version: "1.0.0"
+id: sample.conditions.notequals
+name: Not-Equals Conditions Demo
+version: 1.0.0
+description: |
+  Covers `!=` for strings and booleans.
+category: other
+
+variables:
+  - id: database
+    type: enum
+    description: Database engine.
+    required: false
+    default: "postgresql"
+    validation:
+      enum: ["postgresql", "sqlite"]
+  - id: include_docker
+    type: boolean
+    description: Whether Docker is wanted.
+    required: false
+    default: false
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: database != 'sqlite'
+    files:
+      - source: templates/db/pg.py.j2
+        destination: db/engine.py
+  - condition: include_docker != true
+    files:
+      - source: templates/README.md.j2
+        destination: README_NO_DOCKER.md
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

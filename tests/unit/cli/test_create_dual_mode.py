@@ -40,26 +40,39 @@ Both families exercise the *current* shape of the command:
     * The project name is a **command argument** resolved outside
       ``VariableResolver`` (see ``create.py`` for the reasoning).
     * The *blueprint variables* flow through the resolver.
-    * ``_resolve_variables`` returns a **two-tuple**
-      ``(blueprint, inputs)`` — the blueprint document is needed by
-      ``_generate`` to feed the planner, and returning it alongside
-      the resolved inputs is the deliberate coupling the command
-      docstring explains.
+    * **Conditional file groups** are evaluated by
+      ``ConditionalEvaluator`` and only the surviving groups reach
+      the planner. That is why ``_resolve_variables`` returns a
+      **three-tuple** — the third element is the surviving groups
+      the planner consumes.
+    * ``_resolve_variables`` returns
+      ``(blueprint, inputs, surviving_groups)`` — the blueprint
+      document is needed by ``_generate`` to feed the planner, and
+      returning it alongside the resolved inputs is the deliberate
+      coupling the command docstring explains.
     * ``_generate`` takes the blueprint as a **keyword-only**
-      argument, alongside ``inputs``, ``dry_run``, and ``overwrite``.
-      All four are keyword-only on purpose: a positional call would
-      read as ``_generate(blueprint, inputs, ...)`` and make the
-      order easy to get wrong.
+      argument, alongside ``inputs``, ``conditional_groups``,
+      ``dry_run``, and ``overwrite``. All five are keyword-only on
+      purpose: a positional call would read as
+      ``_generate(blueprint, inputs, ...)`` and make the order easy
+      to get wrong.
+    * ``conditional_groups`` is a **required** argument because the
+      safe-by-default rule (ADR-0015) says the planner never
+      includes conditional files unless the caller opts in. Passing
+      ``[]`` explicitly is the caller saying "I evaluated conditions
+      and none survived" — which is different from "I forgot to
+      evaluate conditions", and the type system makes the difference
+      visible at every call site.
 
 Tests written before this shape change called ``_resolve_variables``
-and expected a single ``_ResolvedInputs`` return value, then passed
-``inputs`` positionally to ``_generate``. Both broke the moment the
-shape changed — which is exactly what the tests are for. The two
-corrections (unpack the tuple, pass the blueprint) are mechanical;
-the *failure* was the diagnostic that told us the shape had changed,
-and keeping that failure legible in the test suite (rather than
-papering over it with a duck-typed shim) is what makes the next
-shape change equally visible.
+and expected a two-tuple, and passed ``_generate`` a signature that
+had not yet grown ``conditional_groups``. Both broke the moment the
+shape changed — which is exactly what the tests are for. The
+corrections (unpack three values, pass the conditional groups) are
+mechanical; the *failure* was the diagnostic that told us the shape
+had changed, and keeping that failure legible in the test suite
+(rather than papering over it with a duck-typed shim) is what makes
+the next shape change equally visible.
 
 The right seam: ``create.get_blueprint_document``
 -------------------------------------------------
@@ -221,6 +234,11 @@ def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
     — a fake that happens to satisfy the attributes the command reads
     today would silently break the moment the command gains a new
     dependency on the model.
+
+    ``conditional_files`` is intentionally empty: these tests exercise
+    input collection, not conditional evaluation. ``_generate``'s
+    ``conditional_groups`` argument is therefore supplied as ``[]``
+    by every test that calls it.
     """
     return Blueprint(
         schema_version="1.0.0",
@@ -331,10 +349,11 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     The stub signature mirrors the *current* signature of
     ``create_module._generate``: keyword-only ``blueprint``,
-    ``inputs``, ``dry_run``, ``overwrite``. The ``blueprint``
-    parameter is recorded alongside the others so future tests can
-    assert that the *same* document the wizard used was passed
-    through to the planner — a property the command's docstring
+    ``inputs``, ``conditional_groups``, ``dry_run``, ``overwrite``.
+    The ``conditional_groups`` parameter is recorded alongside the
+    others so future tests can assert that the *surviving* groups
+    from the evaluator (not the raw ``conditional_files`` list) were
+    what reached the planner — a property the command's docstring
     promises and the tests should pin.
 
     If ``create_module._generate`` gains a parameter (or renames
@@ -353,11 +372,13 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         *,
         blueprint: Any,
         inputs: Any,
+        conditional_groups: Any,
         dry_run: bool,
         overwrite: bool,
     ) -> None:
         captured["blueprint"] = blueprint
         captured["inputs"] = inputs
+        captured["conditional_groups"] = conditional_groups
         captured["dry_run"] = dry_run
         captured["overwrite"] = overwrite
 
@@ -435,6 +456,9 @@ class TestDispatch:
         # document the user's answers were validated against is the
         # document that will be planned.
         assert capture_generate["blueprint"].id == "python.fastapi.api"
+        # No conditional files on the fake blueprint → the evaluator
+        # returns an empty list, which is what reaches `_generate`.
+        assert capture_generate["conditional_groups"] == []
 
     @pytest.mark.unit()
     def test_create_help_shows_leaf_signature(self, cli_runner: CliRunner, forge_app: Any) -> None:
@@ -682,17 +706,20 @@ class TestInteractiveWizard:
         fail at ``ask_select`` (which is deliberately not patched),
         making the coupling visible instead of silent.
 
-        ``_resolve_variables`` returns a two-tuple
-        ``(blueprint, inputs)``. We unpack the tuple and ignore the
-        blueprint here — the assertions are on the *inputs*. The
-        blueprint is available and asserted on in
+        ``_resolve_variables`` returns a three-tuple
+        ``(blueprint, inputs, surviving_groups)``. We unpack the
+        tuple and ignore the blueprint and surviving groups here —
+        the assertions are on the *inputs*. The blueprint is
+        available and asserted on in
         ``TestDispatch::test_create_accepts_positional_blueprint_directly``,
         where its presence in ``capture_generate`` proves the
-        command passes it through to ``_generate``.
+        command passes it through to ``_generate``. The surviving
+        groups are empty (the fake blueprint declares no conditional
+        files) and are asserted on in the same dispatch test.
         """
         monkeypatch.setattr(prompts, "ask_text", lambda *a, **k: "wizard-api")
 
-        _blueprint, inputs = create_module._resolve_variables(
+        _blueprint, inputs, _groups = create_module._resolve_variables(
             blueprint_id="python.fastapi.api",
             cli_name=None,
             cli_vars={},
@@ -723,7 +750,7 @@ class TestInteractiveWizard:
         monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
 
-        _blueprint, inputs = create_module._resolve_variables(
+        _blueprint, inputs, _groups = create_module._resolve_variables(
             blueprint_id="python.fastapi.api",
             cli_name="flag-api",
             cli_vars={},
@@ -859,12 +886,13 @@ class TestNamedValidatorIntegration:
         would fail here — the inline validator would accept a name
         the resolver rejects, or vice versa.
 
-        The tuple return of ``_resolve_variables`` is unpacked
-        (blueprint ignored) because the assertion is on the *inputs*.
+        The three-tuple return of ``_resolve_variables`` is unpacked
+        (blueprint and surviving groups ignored) because the
+        assertion is on the *inputs*.
         """
         # A name the resolver accepts, threaded through the wizard.
         for candidate in ("myapi", "my-api", "a1-b2"):
-            _blueprint, inputs = create_module._resolve_variables(
+            _blueprint, inputs, _groups = create_module._resolve_variables(
                 blueprint_id="python.fastapi.api",
                 cli_name=candidate,
                 cli_vars={},
@@ -1064,7 +1092,7 @@ class TestBlueprintVariablesThroughResolver:
     @pytest.mark.usefixtures("_fake_blueprint_with_vars", "_force_non_interactive")
     def test_supplied_blueprint_variable_passes_through(self, tmp_path: Path) -> None:
         """A supplied blueprint variable lands in ``_ResolvedInputs.variables``."""
-        _blueprint, inputs = create_module._resolve_variables(
+        _blueprint, inputs, _groups = create_module._resolve_variables(
             blueprint_id="python.fastapi.api",
             cli_name="my-api",
             cli_vars={"author": "alice"},
@@ -1092,6 +1120,13 @@ class TestBlueprintVariablesThroughResolver:
 # blueprint used here is a real ``Blueprint`` instance (from
 # ``_make_blueprint``) rather than a fake, so the planner (which
 # ``_generate`` calls) validates against the actual type.
+#
+# ``conditional_groups`` is passed as ``[]``: the fake blueprint has
+# no conditional files, so the evaluator would return an empty list
+# in the real pipeline. Passing ``[]`` explicitly is the caller saying
+# "I evaluated conditions and none survived" — the correct shape,
+# per ADR-0015's safe-by-default rule (a missing argument is not the
+# same as an empty result).
 #
 # ``inputs.variables`` must be a real ``ResolvedValues``, not a plain
 # ``dict``: ``_generate`` calls ``.as_dict()`` on it, and that method
@@ -1123,6 +1158,7 @@ class TestGeneratePreFlight:
             create_module._generate(
                 blueprint=_make_blueprint(variables=[]),
                 inputs=inputs,
+                conditional_groups=[],
                 dry_run=False,
                 overwrite=False,
             )
@@ -1142,6 +1178,7 @@ class TestGeneratePreFlight:
             create_module._generate(
                 blueprint=_make_blueprint(variables=[]),
                 inputs=inputs,
+                conditional_groups=[],
                 dry_run=False,
                 overwrite=True,
             )
@@ -1167,6 +1204,7 @@ class TestGeneratePreFlight:
         create_module._generate(
             blueprint=_make_blueprint(variables=[]),
             inputs=inputs,
+            conditional_groups=[],
             dry_run=True,
             overwrite=False,
         )

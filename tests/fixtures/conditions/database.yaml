@@ -1,0 +1,43 @@
+# EXERCISES: equality-true, equality-false (string literal)
+# The canonical example from CONDITION_GRAMMAR.md. Driving this fixture
+# with `database=postgresql` must include the db/ files; `database=sqlite`
+# must exclude them.
+schema_version: "1.0.0"
+id: sample.conditions.database
+name: Database Condition Demo
+version: 1.0.0
+description: |
+  Demonstrates a string-equality condition. Includes pg/ files only when
+  `database == 'postgresql'` holds.
+category: api
+
+variables:
+  - id: database
+    type: enum
+    description: Database engine to scaffold against.
+    required: false
+    default: "postgresql"
+    validation:
+      enum: ["postgresql", "sqlite"]
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+
+conditional_files:
+  - condition: database == 'postgresql'
+    files:
+      - source: templates/db/pg.py.j2
+        destination: db/postgres.py
+      - source: templates/db/pg_test.py.j2
+        destination: tests/test_postgres.py
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

@@ -1,0 +1,37 @@
+# EXPECTED-FAILURE: condition.undefined_variable on `missing_var`
+#
+# The blueprint *loads* cleanly — the loader validates structure, not
+# semantics of conditions. The failure happens at the evaluator, which
+# is where the fixture is exercised.
+#
+# Note: the variable is *not* declared, so the resolver does not reject
+# it and does not produce a value. The evaluator is the layer that must
+# catch "a condition references something the blueprint never offered."
+schema_version: "1.0.0"
+id: sample.conditions.undefined
+name: Undefined Variable Condition (expected failure)
+version: 1.0.0
+description: |
+  Condition references a variable the blueprint does not declare.
+  Loader succeeds; evaluator reports the undefined reference.
+category: api
+
+variables: []
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: missing_var == 'anything'
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

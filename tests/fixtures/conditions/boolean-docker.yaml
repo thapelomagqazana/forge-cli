@@ -1,0 +1,35 @@
+# EXERCISES: boolean-true, boolean-false
+# A boolean variable whose condition (include_docker == true) is the
+# most common real-world conditional in blueprints.
+schema_version: "1.0.0"
+id: sample.conditions.boolean
+name: Boolean Docker Condition Demo
+version: 1.0.0
+description: |
+  Includes a Dockerfile only when `include_docker == true` holds.
+category: automation
+
+variables:
+  - id: include_docker
+    type: boolean
+    description: Whether to scaffold a Dockerfile.
+    required: false
+    default: true
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: include_docker == true
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

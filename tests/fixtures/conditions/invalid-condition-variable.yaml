@@ -1,0 +1,43 @@
+# EXPECTED-FAILURE: condition.invalid_variable on `Database`
+#
+# The variable name in the condition uses PascalCase, which is not a
+# valid identifier in the DSL (grammar requires lowercase snake_case,
+# matching the blueprint's `VariableDefinition.id` rule). The parser
+# rejects it before the evaluator can report a hypothetical undefined
+# reference — which is exactly right: an invalid identifier is a
+# *grammar* error, not a *reference* error, and the hint should
+# suggest the correct spelling rule rather than "add the variable".
+schema_version: "1.0.0"
+id: sample.conditions.invalidvariable
+name: Invalid Condition Variable (expected failure)
+version: 1.0.0
+description: |
+  Condition uses PascalCase. Loader succeeds; parser rejects.
+category: api
+
+variables:
+  - id: database
+    type: enum
+    description: Database engine.
+    required: false
+    default: "postgresql"
+    validation:
+      enum: ["postgresql", "sqlite"]
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: Database == 'postgresql'
+    files:
+      - source: templates/db/pg.py.j2
+        destination: db/postgres.py
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

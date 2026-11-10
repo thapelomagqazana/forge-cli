@@ -3,8 +3,9 @@
 This command is the primary entry point for project generation. It
 takes a blueprint ID (e.g., ``python.fastapi.api``), resolves it from
 the discovered blueprints, resolves the variables (from CLI flags,
-interactive prompts, or blueprint defaults), plans the file manifest,
-and — once the writer lands — commits the project atomically.
+interactive prompts, or blueprint defaults), evaluates conditional
+file groups against those variables, plans the file manifest, and —
+once the writer lands — commits the project atomically.
 
 Dual-mode input handling
 ------------------------
@@ -142,8 +143,35 @@ in the registry, so tests patch *one* thing and both are
 substituted. The distinction is about *what the caller gets back*,
 not about *where the data comes from*.
 
+Conditional file inclusion
+--------------------------
+Conditional file groups are evaluated *after* variable resolution and
+*before* file planning, so the planner only sees the groups whose
+conditions hold (ADR-0016). The flow is:
+
+    variables ──► ConditionalEvaluator.evaluate ──► surviving groups
+                                                            │
+                                                            ▼
+    blueprint ──► FileMapper.map (unconditional + surviving)
+
+The evaluator is a pure function; it never touches the filesystem.
+Its failures (undefined variable in a condition, invalid condition
+syntax) are aggregated into a single ``ConditionError`` and routed
+through the same ``UserInputError`` channel the resolver and planner
+use, so a broken condition surfaces as a user error (exit 1) with
+actionable hints — exactly like a broken variable. That consistency
+is deliberate: from the user's perspective, both are "the blueprint
+or my inputs are wrong."
+
+Do **not** skip the evaluator when the blueprint has no
+``conditional_files`` — the evaluator short-circuits on empty input
+and the pipeline stays uniform. A special case here would be the
+one place conditions *were* skipped when they should have run, and
+that class of bug is exactly what the explicit phase exists to
+prevent.
+
 Why no ``try`` / ``except`` around the command body
---------------------------------------------------
+---------------------------------------------------
 Every exception this command raises is a ``ForgeError`` subclass
 (user-facing) or is allowed to propagate to ``handle_exception``
 (unexpected). The handler is the *single* renderer — printing here
@@ -181,10 +209,11 @@ schema- and model-valid by the time this command sees it.
 Planning — where the plan comes from
 -----------------------------------
 ``forge.planning.FileMapper`` (ADR-0015) turns the resolved variables
-and the blueprint's ``files[]`` / ``conditional_files[]`` into a
-sorted, deduplicated ``list[PlannedFile]``. The planner is pure, total,
-and tested independently of this command; this command's job is to
-*invoke* it and hand the resulting plan to the next phase.
+and the blueprint's ``files[]`` / *surviving* ``conditional_files[]``
+into a sorted, deduplicated ``list[PlannedFile]``. The planner is
+pure, total, and tested independently of this command; this command's
+job is to *invoke* it with the right inputs and hand the resulting
+plan to the next phase.
 
 There are two use sites, one for each mode:
 
@@ -227,11 +256,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import typer
 
 from forge.cli import prompts, ui
 from forge.cli.registry import get_blueprint_document
+from forge.conditions import ConditionalEvaluator
+from forge.conditions.errors import ConditionError
 from forge.core.exceptions import (
     FilesystemConflictError,
     MissingRequiredFlagsError,
@@ -243,6 +275,18 @@ from forge.models import Blueprint, VariableDefinition
 from forge.planning import FileMapper, MappingError, PlannedFile
 from forge.resolution import ResolvedValues, VariableResolver
 from forge.resolution.names import NAMED_VALIDATORS
+
+if TYPE_CHECKING:
+    # Type-only import: ``SurvivingGroup`` is the return type of
+    # ``ConditionalEvaluator.evaluate`` and is threaded through
+    # ``_resolve_variables`` and ``_generate``. Importing it at
+    # module scope would pull ``forge.conditions`` (and its parser,
+    # evaluator, and ast modules) into the CLI's import cost, which
+    # the command does not need for its *type* — only for its
+    # *runtime* behaviour. The runtime import is already present via
+    # ``ConditionalEvaluator``; the type-only alias just gives the
+    # annotations below a name to point at.
+    from forge.conditions.evaluator import SurvivingGroup
 
 # -----------------------------------------------------------------------------
 # Command module contract
@@ -354,7 +398,7 @@ def create(
 
     - 0 — Project created successfully (or dry-run completed).
     - 1 — User error (missing required variable, invalid input,
-      cancellation, planning collision).
+      cancellation, planning collision, broken condition).
     - 2 — Blueprint error (not found, invalid, incompatible).
     - 3 — Filesystem conflict (destination exists, permission denied).
     - 5 — Internal error (unexpected exception).
@@ -363,7 +407,7 @@ def create(
     here. This command does not declare it yet, so the flag's absence
     is not a breaking change when it lands.
     """
-    blueprint_document, inputs = _resolve_variables(
+    blueprint_document, inputs, surviving_groups = _resolve_variables(
         blueprint_id=blueprint,
         cli_name=name,
         cli_vars=_parse_var_flags(var),
@@ -373,6 +417,7 @@ def create(
     _generate(
         blueprint=blueprint_document,
         inputs=inputs,
+        conditional_groups=surviving_groups,
         dry_run=dry_run,
         overwrite=overwrite,
     )
@@ -426,17 +471,27 @@ def _resolve_variables(
     cli_vars: dict[str, str],
     output: Path,
     no_interactive: bool,
-) -> tuple[Blueprint, _ResolvedInputs]:
-    """Collect user input and resolve it through the variable resolver.
+) -> tuple[Blueprint, _ResolvedInputs, list[SurvivingGroup]]:
+    """Collect user input, resolve variables, evaluate conditional groups.
 
-    Returns *both* the loaded blueprint document and the resolved inputs.
-    The caller needs both: the resolver validates *against* the
-    blueprint's variable definitions, and the planner (invoked later,
-    in ``_generate``) needs the blueprint's ``files[]`` and
-    ``conditional_files[]`` to build the plan. Returning them together
-    makes the coupling explicit and prevents ``_generate`` from
-    re-fetching the document — which would re-run validation for no
-    benefit and could disagree with the document the wizard saw.
+    Returns three things, because the caller needs all three and
+    separating them into phases would force this function to hold
+    state or the caller to re-enter the pipeline:
+
+    1. ``blueprint`` — the loaded, validated document. Required by the
+       resolver (for variable definitions) and by the planner (for
+       ``files[]``/``conditional_files[]``). Returning it here means
+       the caller does not need to re-fetch or re-validate.
+    2. ``_ResolvedInputs`` — the resolver's output plus the project
+       name. Immutable, ready for downstream phases.
+    3. ``surviving_groups`` — the conditional groups whose conditions
+       held, in the shape ``FileMapper.map`` expects
+       (``list[SurvivingGroup]`` = ``list[tuple[Expression,
+       list[FileEntry]]]``). Passing them explicitly (rather than
+       letting the planner re-evaluate) is the safe-by-default rule
+       from ADR-0015: the planner *never* includes conditional files
+       unless the caller opts in by handing them the evaluator's
+       output.
 
     Two modes, one resolver for *blueprint variables*, one explicit
     handling of the *project name* (a command argument, not a variable):
@@ -456,29 +511,9 @@ def _resolve_variables(
     ``VariableResolver.resolve`` — the single validation funnel for
     *blueprint variables* (ADR-0011). The project name is validated
     alongside, by the *same* named validator, so the two paths cannot
-    disagree on what a legal name is.
-
-    Args:
-        blueprint_id: The blueprint ID passed as a positional argument.
-            Always required (Typer enforces it).
-        cli_name: The project name from ``--name``, or ``None`` if
-            omitted. Presence is enforced by mode, not by Typer.
-        cli_vars: Parsed ``--var`` flags as ``{key: value}``. Highest
-            precedence in the resolver for *blueprint* variables.
-        output: The destination directory from ``--output``.
-        no_interactive: ``True`` if the user passed ``--no-interactive``.
-
-    Returns:
-        ``(blueprint_document, resolved_inputs)`` — both immutable,
-        both needed downstream.
-
-    Raises:
-        MissingRequiredFlagsError: Non-interactive mode, missing
-            ``--name``.
-        PromptCancelledError: Interactive mode, user cancelled.
-        UserInputError: The project name or any blueprint variable
-            failed validation.
-        BlueprintError: The blueprint ID is not known.
+    disagree on what a legal name is. Conditional groups are then
+    evaluated against the *resolved* variables, so a condition can
+    reference any value the resolver produced — never a raw flag.
     """
     # Load the blueprint *first*, before any prompts. Three reasons:
     #   1. A bad blueprint ID fails fast with exit code 2, before we
@@ -487,11 +522,8 @@ def _resolve_variables(
     #   2. The blueprint's variable definitions drive both the wizard's
     #      prompts and the resolver's validation rules, so we need the
     #      loaded document regardless of mode.
-    #   3. ``get_blueprint_document`` returns the *loaded document*
-    #      (``Blueprint``), which is what the resolver requires — not
-    #      the catalogue view (``BlueprintEntry``) that ``forge list``
-    #      uses. See the module docstring's "Why the command calls
-    #      ``get_blueprint_document``, not ``get_blueprint``".
+    #   3. The blueprint's conditional_files drive the evaluator's
+    #      input, so we cannot evaluate conditions before loading it.
     blueprint = get_blueprint_document(blueprint_id)
 
     interactive = prompts.is_interactive() and not no_interactive
@@ -560,7 +592,38 @@ def _resolve_variables(
         raise _as_user_input_error(result.error, source=f"blueprint:{blueprint_id}")
 
     # ------------------------------------------------------------------
-    # 3. Combine: project_name (command arg) + resolver output
+    # 3. Evaluate conditional file groups against the *resolved*
+    #    variables.
+    #
+    #    Running the evaluator unconditionally (even when the blueprint
+    #    declares no conditional groups) is deliberate: the evaluator
+    #    short-circuits on empty input, and uniformity here means the
+    #    pipeline has exactly one shape. A "skip when empty" special
+    #    case would be the one place conditions *were* skipped when
+    #    they should have run — the exact bug class the explicit phase
+    #    exists to prevent (ADR-0016).
+    #
+    #    The evaluator sees the resolver's output, not the raw flags,
+    #    so a condition comparing to a variable sees the *validated,
+    #    coerced* value (e.g. ``include_docker == true`` compares to
+    #    ``True``, never to the string ``"true"``). That is what makes
+    #    conditions type-safe in the same way the resolver makes
+    #    variables type-safe.
+    # ------------------------------------------------------------------
+    evaluation = ConditionalEvaluator().evaluate(blueprint, result.value.as_dict())
+    if isinstance(evaluation, Err):
+        # Aggregate condition errors into the same ``UserInputError``
+        # channel the resolver and planner use, so a broken condition
+        # surfaces as a user error (exit 1) with actionable hints —
+        # exactly like a broken variable. From the user's perspective,
+        # both are "my inputs or the blueprint are wrong."
+        raise _as_user_input_error_from_conditions(
+            evaluation.error, source=f"blueprint:{blueprint_id}"
+        )
+    surviving_groups = evaluation.value
+
+    # ------------------------------------------------------------------
+    # 4. Combine: project_name (command arg) + resolver output
     #    (blueprint variables). The result is a fresh, immutable
     #    ``ResolvedValues`` so downstream code continues to get the
     #    compile-time guarantee — a plain ``dict`` here would silently
@@ -575,7 +638,7 @@ def _resolve_variables(
         destination=output / project_name,
         variables=ResolvedValues(MappingProxyType(combined)),
     )
-    return blueprint, inputs
+    return blueprint, inputs, surviving_groups
 
 
 def _validate_project_name(value: str) -> None:
@@ -640,6 +703,40 @@ def _as_user_input_error(errors: list[ValidationError], *, source: str) -> UserI
         return UserInputError(f"Input validation failed for {source} (no details available).")
     joined = "\n  ".join(err.format() for err in errors)
     return UserInputError(f"Input validation failed for {source}:\n  {joined}")
+
+
+def _as_user_input_error_from_conditions(error: ConditionError, *, source: str) -> UserInputError:
+    """Convert a ``ConditionError`` into a ``UserInputError``.
+
+    Condition errors carry the same structured shape as loader and
+    planner errors (``condition``, ``message``, ``hint``, ``code``).
+    We render each finding on its own line so a blueprint with several
+    broken conditions produces one message the user can act on in one
+    pass — the same "fail complete" contract the resolver provides.
+
+    Kept as a dedicated function (rather than a shared
+    ``_as_user_input_error`` overload) so the wording can stay specific
+    to conditions ("condition errors", not "input errors") and a
+    future structured error renderer has a clear seam to plug into.
+
+    Why the per-finding line is built from fields, not a ``format()``
+    call: ``Finding`` is a frozen dataclass with four string fields
+    (``condition``, ``message``, ``hint``, ``code``) and no rendering
+    method. The prior ``f.format()`` call was a leftover from
+    ``ValidationError`` (which *does* have ``format()``) — a
+    copy-paste that only surfaced under mypy strict once this
+    function's parameter gained a concrete type (``ConditionError``),
+    because before that the body operated on ``Any`` and mypy had no
+    basis to complain. Rendering from fields here makes the line's
+    shape explicit and keeps the function total over any ``Finding``
+    the evaluator produces, present or future.
+    """
+    findings = error.findings
+    if not findings:
+        return UserInputError(f"Condition evaluation failed for {source} (no details available).")
+    lines = [f"{f.condition}: {f.message} — hint: {f.hint}" for f in findings]
+    joined = "\n  ".join(lines)
+    return UserInputError(f"Condition errors for {source}:\n  {joined}")
 
 
 def _collect_interactive_answers(
@@ -732,16 +829,27 @@ def _generate(
     *,
     blueprint: Blueprint,
     inputs: _ResolvedInputs,
+    conditional_groups: list[SurvivingGroup],
     dry_run: bool,
     overwrite: bool,
 ) -> None:
     """Build the plan, then hand it to the writer (or render it in dry run).
 
-    The plan is built via ``forge.planning.FileMapper`` (ADR-0015), which
-    is pure, total, and independently tested. This function's job is to
-    invoke it with the right inputs, translate its failures into the
-    command layer's error types, and — depending on ``dry_run`` — either
-    render the plan or hand it to the writer.
+    The plan is built via ``forge.planning.FileMapper`` (ADR-0015),
+    which is pure, total, and independently tested. This function's
+    job is to invoke it with the right inputs, translate its failures
+    into the command layer's error types, and — depending on
+    ``dry_run`` — either render the plan or hand it to the writer.
+
+    ``conditional_groups`` are the *surviving* groups from
+    ``ConditionalEvaluator`` (ADR-0016). Passing them explicitly is
+    the safe-by-default rule from ADR-0015: the planner never
+    includes conditional files unless the caller opts in. The
+    evaluator decided *which* groups survive; the planner decides
+    *how* they are written. Splitting the two responsibilities is
+    what lets each be tested independently and what prevents the
+    classic bug where a condition was never evaluated because the
+    planner "helpfully" planned all groups regardless.
 
     The writer itself is a later task. The non-dry path therefore ends
     with a clear ``NotImplementedError`` rather than a silent no-op.
@@ -762,6 +870,9 @@ def _generate(
         blueprint: The loaded, validated document. Provides ``files[]``
             and ``conditional_files[]`` to the planner.
         inputs: Validated, immutable inputs from ``_resolve_variables``.
+        conditional_groups: Surviving groups from
+            ``ConditionalEvaluator.evaluate``. Passed through to the
+            planner unchanged; the planner does not re-evaluate.
         dry_run: If ``True``, render the plan and return without writing.
         overwrite: If ``True``, allow overwriting existing files. Checked
             here as a pre-flight for the future writer; the writer will
@@ -787,8 +898,19 @@ def _generate(
     # blueprint declared it, which would be unusual but legal. This is
     # consistent with the resolver's contract: only what the blueprint
     # declares flows through the variable pipeline.
+    #
+    # ``conditional_groups`` carries the surviving groups from the
+    # evaluator. When empty (no conditional files, or all conditions
+    # false), the planner plans only the unconditional files — the
+    # exact same code path as a blueprint that has no conditional
+    # files at all, so there is no "conditional but nothing
+    # survived" branch to diverge.
     # ------------------------------------------------------------------
-    plan_result = FileMapper().map(blueprint, inputs.variables.as_dict())
+    plan_result = FileMapper().map(
+        blueprint,
+        inputs.variables.as_dict(),
+        conditional_groups=conditional_groups,
+    )
     if isinstance(plan_result, Err):
         # The planner aggregated every finding (collisions, unsafe
         # paths, empty substitutions) into one ``MappingError``. Route
@@ -883,7 +1005,7 @@ def _render_plan(
 
     ui.info("")
     render_count = sum(1 for p in plan if p.is_render)
-    copy_count = sum(1 for p in plan if p.is_copy)
+    copy_count = sum(1 for p in plan if not p.is_render)
     ui.info(f"Summary: {render_count} rendered, {copy_count} copied")
 
 

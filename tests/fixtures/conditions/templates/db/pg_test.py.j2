@@ -1,0 +1,8 @@
+"""Test stub for the PostgreSQL engine — included conditionally."""
+
+def test_connect_raises() -> None:
+    from db.postgres import connect
+    try:
+        connect()
+    except NotImplementedError:
+        pass
