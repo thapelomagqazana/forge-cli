@@ -6,6 +6,10 @@ helpers are deliberately few and simple:
 - ``print_success`` — green, checkmark prefix, stdout.
 - ``print_warning`` — yellow, warning prefix, stderr.
 - ``print_error`` — red, error prefix, stderr.
+- ``print_error_indented`` — detail line under an error header,
+  bullet prefix, stderr. Used by the exception handler to render
+  structured findings (safety, planning, conditions) beneath the
+  single-line header that names their cause.
 - ``print_info`` — plain text, stdout.
 - ``print_section`` — bold header, stdout. Used by interactive
   wizards to delimit steps, and by any command that groups output.
@@ -54,9 +58,10 @@ Design principles
 2. **Colour is a courtesy, not a requirement.** Every message must be
    readable in plain text (with the prefixes as the signal). Colour is
    additive. ``NO_COLOR`` and ``FORCE_COLOR`` are honoured.
-3. **One console instance.** Rich's ``Console`` handles TTY detection,
-   colour, width, and ``--no-color`` internally. We do not reimplement
-   any of it — we just use one instance per stream.
+3. **One console instance per stream.** Rich's ``Console`` handles TTY
+   detection, colour, width, and ``--no-color`` internally. We do not
+   reimplement any of it — we use one instance for stdout and one for
+   stderr.
 4. **No exceptions leak.** These helpers do not raise. If Rich fails
    (e.g., a broken pipe), the helper catches the failure and falls back
    to ``typer.echo`` so the CLI never crashes because of a formatting
@@ -82,6 +87,50 @@ Design principles
    (prefix/suffix), not by injecting escape codes into the payload
    itself — otherwise the renderer's contract is broken by the
    caller, which is exactly the drift principle 5 exists to prevent.
+
+Why ``print_error_indented`` is a first-class helper
+----------------------------------------------------
+Errors with structured findings (safety refusals, collisions, planning
+errors, condition errors) render as a *header* plus zero or more
+*detail lines*. The header names the cause; each detail names one
+concrete violation. Rendering both with ``print_error`` would give
+every detail its own ``✗`` prefix, and the report would read as six
+independent failures rather than one failure with six symptoms.
+
+The helper's job is to make that distinction visible:
+
+    ✗ Filesystem collision detected:                 ← print_error
+        • [collision.exists] src/a.py: destination … ← print_error_indented
+        • [collision.exists] README.md: destination … ← print_error_indented
+        hint: Re-run with --overwrite to replace …    ← print_hint
+
+Three things are load-bearing about the indented form:
+
+* **The prefix is a bullet (``•``), not the error symbol.** A bullet
+  says "part of a list"; the error symbol says "the error itself".
+  Using ``✗`` on every line would make a five-finding report look like
+  five failures, which is the opposite of what a grouped report says.
+* **The stream is stderr**, matching the header. Findings belong to
+  the error report; splitting them onto stdout would break the
+  "product vs commentary" contract that the whole module exists to
+  enforce.
+* **The caller supplies the message, including its own prefix, if it
+  wants one.** The helper does *not* prepend ``  • `` — the caller
+  does, because the caller knows what shape of detail it is emitting.
+  A helper that prepends a prefix would be surprising (callers that
+  want ``•`` get ``• •``) and would fight the caller for the layout
+  the caller is trying to produce.
+
+Why the caller's message is *not* prefixed by the helper:
+
+    Different callers use different detail prefixes. The exception
+    handler uses ``  • [code] path: message``; a future dry-run
+    renderer might use ``    [render] dest ← src`` for its detail
+    lines. If the helper prepended its own ``•``, the dry-run
+    renderer would need a special "don't prefix" variant — exactly
+    the drift principle 5 prohibits. Keeping the helper a pure
+    stream-selector-plus-nothing lets every caller produce the
+    detail format it needs.
 
 Why ``print_section`` is a first-class helper
 ----------------------------------------------
@@ -128,18 +177,18 @@ import sys
 from rich.console import Console
 
 # -----------------------------------------------------------------------------
-# The console
+# The consoles
 # -----------------------------------------------------------------------------
-# A single console instance for the whole CLI. Rich handles:
-#   - TTY detection (colour only if stdout is a terminal).
+# Two console instances — one per stream. Rich handles:
+#   - TTY detection (colour only if the stream is a terminal).
 #   - ``NO_COLOR`` and ``FORCE_COLOR`` environment variables.
 #   - Terminal width detection.
 #   - Unicode fallback on terminals that cannot render it.
 #
-# ``stderr=False`` is the default (Console writes to stdout unless told
-# otherwise). We create *two* consoles: one for stdout, one for stderr.
-# The helpers pick the right one. This is the standard Rich pattern for
-# CLIs that must separate product from commentary.
+# ``stderr=True`` on the second instance is what makes the split work:
+# Rich writes to the right stream based on construction, so the helper
+# bodies never pass ``file=`` explicitly. That is the single point of
+# decision this module's "two streams, one rule" principle reduces to.
 _stdout_console = Console(highlight=False, soft_wrap=False)
 _stderr_console = Console(stderr=True, highlight=False, soft_wrap=False)
 
@@ -201,11 +250,6 @@ def print_warning(message: str) -> None:
       stdout; if the result set is empty (a *valid* outcome), a
       warning goes to stderr and the pipeline still succeeds.
 
-    Mixing warnings and errors into one helper would force callers to
-    decide between "prefix this with the alarming symbol" and "use the
-    wrong exit code" — both wrong, and both would drift into
-    workarounds.
-
     Args:
         message: The message to print. Rendered as ``⚠ <message>``.
     """
@@ -229,6 +273,51 @@ def print_error(message: str) -> None:
     """
     try:
         _stderr_console.print(f"[red]✗[/red] {message}")
+    except (BrokenPipeError, OSError):
+        typer_echo_safe(message, err=True)
+
+
+def print_error_indented(message: str) -> None:
+    """Print a detail line under an error header, on stderr.
+
+    Structured error reports — safety refusals, collisions, planning
+    errors, condition errors — have a header (rendered by
+    ``print_error``) plus zero or more detail lines, one per finding.
+    This helper renders those details.
+
+    The message is emitted **verbatim** (aside from a small dim
+    colour), so the caller owns the full detail format — including
+    any bullet prefix (``  • ``) or code tag (``[collision.exists]``)
+    they want to include. The helper's only job is:
+
+    * **stream selection** — stderr, matching the header. Splitting
+      findings onto stdout would break the product-vs-commentary
+      contract that the rest of this module enforces.
+    * **broken-pipe safety** — same fallback as the other helpers.
+
+    Rendering the message with ``[dim]`` (rather than ``[red]``) is
+    deliberate: the *header* carries the error colour and the error
+    symbol, so the user's eye lands there first. Detail lines are
+    subordinate; dimming them establishes the visual hierarchy that
+    makes a five-finding report read as one failure with five
+    symptoms, not five separate failures.
+
+    Why no bullet prefix from the helper itself:
+        Different callers use different detail formats. The exception
+        handler uses ``  • [code] path: message``; a future dry-run
+        renderer might use ``    [render] dest ← src``. If the helper
+        prepended its own ``•``, callers who want a bullet would get
+        ``• •`` and callers who want a different prefix would need a
+        "don't prefix" variant — exactly the caller-vs-helper friction
+        the module's "caller owns the message" principle exists to
+        prevent.
+
+    Args:
+        message: The detail line to print, including any prefix the
+            caller wants. Rendered in dim text, verbatim otherwise.
+    """
+    try:
+        _stderr_console.print(f"[dim]{message}[/dim]")
     except (BrokenPipeError, OSError):
         typer_echo_safe(message, err=True)
 
@@ -395,6 +484,7 @@ success = print_success
 warning = print_warning
 warn = print_warning
 error = print_error
+error_indented = print_error_indented
 hint = print_hint
 cancelled = print_cancelled
 
@@ -431,10 +521,12 @@ __all__ = [
     "cancelled",
     "emit",
     "error",
+    "error_indented",
     "hint",
     "info",
     "print_cancelled",
     "print_error",
+    "print_error_indented",
     "print_hint",
     "print_info",
     "print_section",

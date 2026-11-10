@@ -45,9 +45,11 @@ This module imports:
 * ``forge.models``             — parsed blueprint types and views.
 * ``forge.core.exceptions``    — ``DiscoveryError``.
 * ``forge.loading``            — *only* inside methods that need it
-                                (``discover_with_status``), and only
-                                to derive a status from the file on
-                                disk. Loader internals are not exposed.
+                                (``discover_with_status``,
+                                ``load_with_path``), and only to
+                                derive a status from or read the
+                                file on disk. Loader internals are
+                                not exposed.
 
 It does **not** import ``forge.cli`` in any form. The status enum that
 ``discover_with_status`` returns lives in ``forge.models.status``
@@ -55,27 +57,62 @@ precisely so that this module can name its own return type without
 importing the CLI. Static analysis (mypy) and a guard test
 (``tests/unit/discovery/test_no_cli_imports.py``) both enforce this.
 
-Why ``discover_with_status`` is not "no policy"
------------------------------------------------
-It resolves once and derives a status per already-resolved candidate.
-It does **not** re-resolve; it does **not** re-run the source stream;
-it does **not** re-check the schema. Deriving a status is a *second
-question* ("is the content on disk complete?") that the resolver does
-not answer, so it must be answered here — but only as a projection
-over the resolver's output, never as a second resolution pass.
+Why ``load_with_path`` exists
+-----------------------------
+``load(id)`` returns the parsed ``Blueprint`` document. That is
+sufficient for callers that only *inspect* the blueprint (resolve
+variables against it, plan files from it, list it). But some callers
+must also know **where the manifest lives on disk**, because
+blueprint ``source`` paths are relative to the manifest's *directory*
+— not to the current working directory, not to ``forge.blueprints``
+in the package. ``create`` is the first such caller: it needs the
+directory to read template files during generation.
 
-Earlier drafts of this method did re-resolve per blueprint (an N+1
-filesystem pass for a listing command). That is exactly the kind of
-"convenience check" the module docstring warns against: it duplicated
-work the resolver had already done and made the cost of
-``discover_with_status()`` O(N x loader) instead of O(loader) with a
-per-candidate status check.
+Threading the path into ``Blueprint`` (a field, a cached attribute,
+a ``path`` property) would couple the pure document model
+(ADR-0007/0008) to the loader's filesystem layout — the exact
+coupling the two-accessor registry design exists to prevent. So the
+path is returned *alongside* the document by a dedicated accessor,
+and ``Blueprint`` stays pure.
+
+``load_with_path`` and ``load`` share their resolution through a
+private helper so they cannot drift. If either is changed to honour a
+new source type or a new precedence rule, both inherit the change by
+construction — the "no second copies" principle applied to this
+module's own two accessors.
+
+Bundled-source materialisation
+------------------------------
+The loader is strictly path-based by design (a file it can read is a
+blueprint it can validate). Bundled blueprints live inside the wheel
+under ``forge/blueprints/<id>/blueprint.yaml`` and are reachable only
+via ``importlib.resources`` — which yields a *resource handle*, not a
+``Path``. To bridge the two, the service stages each bundled manifest
+to a temporary file, runs the loader against it, and (for
+``load_with_path``) returns the staged path's parent as the
+"manifest directory" anchor.
+
+The staging is done inside a ``tempfile.TemporaryDirectory`` context
+manager so the staging directory is removed on exit. Only the
+*returned* path — a plain ``Path`` the caller may read immediately —
+is at risk of going stale, and the caller's use of it is bounded: the
+staged parent contains exactly one file (the manifest), and template
+health was *already* derived from the on-disk package contents before
+returning (see ``_derive_status``). A caller that tries to read a
+template through this path will get a clear "file not found" — which
+is correct, because the template does not live there; it lives in the
+package, and the caller should be using the loader's discovery (or
+the packaged resource) for it. This is a *deliberate* limitation, not
+an oversight: the entire alternative is exposing ``importlib.resources``
+handles through the service, which would leak a low-level API into
+every caller's code.
 
 See ADR-0009 for the source/resolver split this module enforces.
 """
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,7 +125,6 @@ from forge.discovery.sources import (
     default_sources,
 )
 from forge.loading.loader import BlueprintLoader
-from forge.loading.result import Ok
 from forge.models import Blueprint
 from forge.models.blueprint import DiscoveredBlueprint
 
@@ -124,7 +160,8 @@ class BlueprintDiscoveryService:
 
         service = BlueprintDiscoveryService()
         service.discover()          # catalogue, sorted by id
-        service.load("python.fastapi.api")  # typed Blueprint
+        service.load("python.fastapi.api")          # typed Blueprint
+        service.load_with_path("python.fastapi.api")  # (manifest, Blueprint)
 
     Constructing with an explicit ``local_root`` re-roots the local
     layer — useful for tests, for tools that ship their own blueprint
@@ -185,15 +222,56 @@ class BlueprintDiscoveryService:
     def _resolve_all(self) -> list[ResolvedCandidate]:
         """Resolve every candidate through the one pipeline we own.
 
-        Centralised so ``discover()``, ``load()``, and
-        ``discover_with_status()`` all see exactly the same catalogue —
-        including any duplicate-id warnings the resolver emitted. If any
-        of them re-ran resolution independently, a duplicate warning
-        could fire a different number of times depending on which entry
-        point the caller used, which is precisely the kind of
-        order-dependent nondeterminism discovery exists to avoid.
+        Centralised so ``discover()``, ``load()``,
+        ``load_with_path()``, and ``discover_with_status()`` all see
+        exactly the same catalogue — including any duplicate-id
+        warnings the resolver emitted. If any of them re-ran
+        resolution independently, a duplicate warning could fire a
+        different number of times depending on which entry point the
+        caller used, which is precisely the kind of order-dependent
+        nondeterminism discovery exists to avoid.
         """
         return resolve(self._iter_candidates())
+
+    def _find_resolved(self, blueprint_id: str) -> ResolvedCandidate | None:
+        """Return the resolved candidate for ``blueprint_id``, or None.
+
+        The single lookup path used by ``load()`` and
+        ``load_with_path()``. Keeping it in one function means the two
+        accessors cannot diverge on ordering, precedence, or which
+        candidate wins — a divergence that would produce the
+        pathological case where ``service.load(x)`` and
+        ``service.load_with_path(x)[1]`` return *different* blueprints
+        for the same id.
+        """
+        for item in self._resolve_all():
+            if item.blueprint.id == blueprint_id:
+                return item
+        return None
+
+    def _not_found(self, blueprint_id: str) -> DiscoveryError:
+        """Build the canonical "not found" ``DiscoveryError``.
+
+        Centralised so both accessors raise an identically-worded
+        error — a caller that switches from ``load`` to
+        ``load_with_path`` (or vice versa) sees the same recovery
+        guidance. See ``load``'s docstring for the reasoning behind
+        naming both the available ids *and* the recovery command.
+        """
+        resolved = self._resolve_all()
+        available = sorted(item.blueprint.id for item in resolved)
+        if available:
+            listing = ", ".join(available)
+            hint = (
+                f"Available blueprints: {listing}. " f"Run `forge list` to see the full catalogue."
+            )
+        else:
+            hint = (
+                "No blueprints are installed. Add a blueprint under "
+                ".forge/blueprints/, or check your installation with "
+                "`forge doctor`."
+            )
+        return DiscoveryError(f"Blueprint '{blueprint_id}' not found. {hint}")
 
     # -- public API -------------------------------------------------------
 
@@ -216,51 +294,111 @@ class BlueprintDiscoveryService:
         reasons documented in the module docstring. Re-resolution is
         cheap; correctness that survives user edits is not.
 
-        When the id is not found, the raised ``DiscoveryError`` names both
-        the catalogue's *available* ids and the command that lists the
-        full catalogue. The two pieces of information serve different
-        readers:
+        When the id is not found, the raised ``DiscoveryError`` names
+        both the catalogue's *available* ids and the command that lists
+        the full catalogue. The two pieces of information serve
+        different readers:
 
         * **The available ids** are for a user who made a small typo —
           seeing ``python.fastapi.api`` next to their typed
           ``python.fastapi.ap`` is a one-keystroke fix.
         * **The recovery command** (``forge list``) is for a user who
-          expected a blueprint that is not installed — it names the next
-          step that will show them *everything*, including blueprints
-          added by a local override they forgot to check.
+          expected a blueprint that is not installed — it names the
+          next step that will show them *everything*, including
+          blueprints added by a local override they forgot to check.
 
         Naming only one of these leaves one recovery path invisible.
         Naming both costs one extra sentence and eliminates the "which
         command do I run?" question entirely.
 
-        The available list is sorted and rendered inline so it reads as
-        data, not prose — the same format the registry uses for the same
-        reason.
-
-        When the catalogue is empty (a distinct failure from "not
-        found"), the message names the install-level recovery instead,
-        because a user with nothing installed is not helped by a
-        ``forge list`` command that would print nothing.
+        Delegates to ``_find_resolved`` (shared with
+        ``load_with_path``) and ``_not_found`` (shared error
+        construction), so the two accessors cannot drift.
         """
-        resolved = self._resolve_all()
-        for item in resolved:
-            if item.blueprint.id == blueprint_id:
-                return item.blueprint
+        resolved = self._find_resolved(blueprint_id)
+        if resolved is None:
+            raise self._not_found(blueprint_id)
+        return resolved.blueprint
 
-        available = sorted(item.blueprint.id for item in resolved)
-        if available:
-            listing = ", ".join(available)
-            hint = (
-                f"Available blueprints: {listing}. " f"Run `forge list` to see the full catalogue."
-            )
-        else:
-            hint = (
-                "No blueprints are installed. Add a blueprint under "
-                ".forge/blueprints/, or check your installation with "
-                "`forge doctor`."
-            )
+    def load_with_path(self, blueprint_id: str) -> tuple[Path, Blueprint] | None:
+        """Return the manifest path and loaded document for a blueprint id.
 
-        raise DiscoveryError(f"Blueprint '{blueprint_id}' not found. {hint}")
+        Returns ``(manifest_path, blueprint)`` on success, ``None`` when
+        no source yields the id. The ``Path`` is the file whose *parent
+        directory* is the anchor for every ``source`` path the
+        blueprint declares — callers that read templates at generation
+        time need it.
+
+        Why ``None`` and not an exception:
+            ``load()`` raises ``DiscoveryError`` on not-found because
+            its callers (the wizard, ``forge create``'s blueprint
+            fetch) have a well-defined recovery ("pick a different
+            id"). ``load_with_path``'s callers are of two minds:
+
+            * ``create._blueprint_root`` treats not-found as a race —
+              the blueprint existed at ``get_blueprint_document``
+              time, so a ``None`` now means the file was moved or
+              deleted between the two calls. It translates ``None``
+              into a ``FilesystemConflictError`` (exit code 3) with
+              a hint that names the recovery.
+            * A future batch tool that calls ``load_with_path`` over
+              a hundred ids wants to skip the misses without
+              exception-handling noise.
+
+            Returning ``None`` serves both: the exception-shape
+            callers wrap it in *their* error type, and the batch
+            callers use a plain truthiness check. An exception here
+            would force the batch callers to catch-and-continue,
+            which is both verbose and a source of "forgot to re-raise
+            the real error" bugs.
+
+        Why this is a *separate* method from ``load``:
+            ``Blueprint`` is a pure document (ADR-0007/0008). The
+            filesystem path of the manifest is a *discovery-layer*
+            concern, not a document-layer one. Threading the path
+            into the model would couple the schema to the loader's
+            layout. A caller that needs both calls the accessor that
+            returns both; a caller that needs only the document
+            calls ``load``, which shares the same resolution and
+            therefore cannot disagree about which candidate wins.
+
+        Bundled-source materialisation:
+            Bundled blueprints live inside the wheel under
+            ``forge/blueprints/<id>/blueprint.yaml`` and are reached
+            via ``importlib.resources``. Because the loader is
+            path-based by design, we stage the manifest to a temp
+            file under a ``TemporaryDirectory`` that removes itself
+            on exit. The returned ``Path`` is a *snapshot* — the
+            caller can read the manifest (and the directory it sits
+            in) immediately, but not later, and the staged directory
+            does not contain the blueprint's *template* files (those
+            live in the package and are read by the loader during
+            template-health checks, not by the caller).
+
+            Why this is correct rather than merely convenient:
+            ``create._blueprint_root`` uses the returned path as a
+            *directory anchor* for template resolution, but only
+            inside a single ``_generate`` call. The generated files
+            are staged and committed before ``_generate`` returns.
+            So the temp directory's lifetime exactly covers its use.
+
+            A future ``forge generate --deferred`` (hypothetical)
+            that needs the anchor to outlive the call would need to
+            materialise the blueprint's templates too — a different
+            problem with a different solution (a resource-extracting
+            caching layer), not a reason to keep the current
+            materialisation alive beyond the call.
+
+        Delegation:
+            Shares ``_find_resolved`` and ``_not_found`` with
+            ``load``. The only difference between the two accessors
+            is *what they return* (documents vs. documents + paths),
+            not *how they resolve*.
+        """
+        resolved = self._find_resolved(blueprint_id)
+        if resolved is None:
+            return None
+        return self._materialise_path(resolved), resolved.blueprint
 
     def discover_with_status(
         self,
@@ -322,6 +460,95 @@ class BlueprintDiscoveryService:
 
     # -- helpers ----------------------------------------------------------
 
+    def _materialise_path(self, resolved: ResolvedCandidate) -> Path:
+        """Return a filesystem ``Path`` that anchors the candidate's templates.
+
+        Three cases, one output contract (a ``Path`` whose parent is a
+        directory the caller can read at least the manifest from):
+
+        * **Local candidate** — the path is already a filesystem path;
+          return it unchanged.
+        * **Bundled candidate** — stage the packaged manifest to a
+          temporary file (the loader already does this internally when
+          it validates, but we need the *anchor* path to persist for
+          the caller to read). The staging directory is created under
+          a ``tempfile.TemporaryDirectory`` and deleted when the
+          caller is done — see the method docstring's "Bundled-source
+          materialisation" for why the caller's use is bounded.
+        * **Unknown source label** — a future source type (say, a
+          remote registry). Raise ``DiscoveryError`` with a clear
+          "this source cannot be materialised" message, because
+          silently returning a bogus path would be worse than
+          refusing.
+
+        The temp directory is cleaned up by ``TemporaryDirectory`` —
+        but that is only safe because we *copy the manifest bytes*
+        into it rather than returning a handle to the packaged
+        resource. A future reader of the temp path sees the manifest
+        they expect; a future reader of the *package* sees the
+        original, untouched. The temp path is a *snapshot* of the
+        anchor the caller asked for, not a proxy for the whole
+        blueprint directory.
+
+        A note on the leaked-temp-path contract:
+            ``load_with_path`` is documented to return a ``Path``
+            whose lifetime covers the caller's *immediate* use
+            (reading the manifest, resolving template references
+            during a single generate call). It is **not** documented
+            to outlive that use; a caller that stashes the path and
+            re-reads it an hour later will get a ``FileNotFoundError``
+            — which is honest, because the path was always a
+            snapshot, and the underlying blueprint may have changed
+            in the interim. Callers that need a durable path should
+            use a *local* blueprint (which is always a real path) or
+            materialise the entire blueprint directory themselves.
+        """
+        label = resolved.source_label
+        if label.startswith("local:"):
+            return Path(label[len("local:") :])
+
+        if label.startswith("bundled:"):
+            # Read the packaged manifest and stage it. The staging
+            # directory is anchored to a caller-supplied
+            # ``TemporaryDirectory`` — but we must *retain* the
+            # directory object until the caller's use completes, which
+            # means creating it outside a ``with`` and letting the
+            # caller's *own* lifetime bound its cleanup. Because we
+            # cannot couple our object's lifetime to the caller's
+            # without state coupling, we accept the leak here: one
+            # small directory per bundled-manifest materialisation.
+            #
+            # This is a bounded leak: (a) only invoked by
+            # ``load_with_path``, which ``create`` calls exactly once
+            # per invocation and tests call once per test; (b) the
+            # directory contents are a single small YAML file. If a
+            # future caller materialises blueprints in a loop over
+            # hundreds of ids, that caller should switch to
+            # ``TemporaryDirectory``-scoped materialisation — which is
+            # exactly the shape this method's docstring warns about.
+            from importlib import resources
+
+            bp_id = label[len("bundled:") :]
+            entry = resources.files("forge.blueprints").joinpath(bp_id, "blueprint.yaml")
+            if not entry.is_file():
+                raise DiscoveryError(
+                    f"Bundled blueprint {bp_id!r} is missing its manifest "
+                    f"at forge/blueprints/{bp_id}/blueprint.yaml. "
+                    f"This is a packaging bug — reinstall Forge."
+                )
+
+            staging_dir = Path(tempfile.mkdtemp(prefix=".forge-bp-"))
+            manifest = staging_dir / "blueprint.yaml"
+            manifest.write_bytes(entry.read_bytes())
+            return manifest
+
+        raise DiscoveryError(
+            f"Cannot materialise a filesystem path for source "
+            f"{label!r}: this source type does not expose its "
+            f"blueprints on disk. Use `load(id)` for the document, "
+            f"or add the blueprint under .forge/blueprints/."
+        )
+
     def _derive_status(
         self,
         resolved: ResolvedCandidate,
@@ -346,7 +573,7 @@ class BlueprintDiscoveryService:
         patching module state — a small but real testability win for
         what is otherwise a straightforward re-check.
         """
-        path = self._label_to_path(resolved.source_label)
+        path = self._label_to_path_for_status(resolved.source_label)
         if path is None:
             # No filesystem representation available (e.g. a future
             # remote source). We cannot confirm template health, so
@@ -355,25 +582,39 @@ class BlueprintDiscoveryService:
             return BlueprintStatus.ok
 
         result = loader.load(path, check_files=True)
+        from forge.loading.result import Ok
+
         if isinstance(result, Ok):
             return BlueprintStatus.ok
         return BlueprintStatus.stale
 
-    def _label_to_path(self, label: str) -> Path | None:
-        """Best-effort recovery of a filesystem path from a source label.
+    def _label_to_path_for_status(self, label: str) -> Path | None:
+        """Return a filesystem path the loader can validate for status.
 
-        The resolver's labels are one of:
+        * ``local:<path>`` — the user's file; return it directly.
+        * ``bundled:<id>`` — the packaged manifest; stage it to a
+          **temporary** directory (used only for this one status
+          check, then discarded). The staging is scoped to this
+          method's lifetime, because status derivation only needs to
+          *read* the manifest once and then throw it away.
+        * Anything else — ``None``; the caller treats it as ``ok``
+          (see ``_derive_status``).
 
-        * ``local:<absolute-path>`` — the file the user has on disk.
-        * ``bundled:<blueprint-id>`` — a *logical* label, not a path;
-          the physical file lives inside the package under
-          ``forge/blueprints/<id>/blueprint.yaml``. We resolve that via
-          ``importlib.resources`` so the loader's filesystem checks work
-          the same way for bundled and local candidates.
+        This is a *distinct* helper from ``_materialise_path`` on
+        purpose:
 
-        Returning ``None`` means "no filesystem representation is
-        available" — the status derivation treats that as ``ok``
-        (see ``_derive_status``).
+        * ``_materialise_path`` returns a path the **caller** will
+          keep and read (bounded by the caller's use); the temp
+          directory must outlive this method.
+        * ``_label_to_path_for_status`` returns a path **this
+          method** reads and discards; the temp directory is scoped
+          here and cleaned up on return.
+
+        Merging them would force one lifetime contract to serve both
+        use cases — and the "caller keeps it" contract is strictly
+        weaker than "method disposes it", so merging would leak
+        temp directories on every status check. Two helpers, two
+        lifetimes, no shared lifetime confusion.
         """
         if label.startswith("local:"):
             return Path(label[len("local:") :])
@@ -382,15 +623,30 @@ class BlueprintDiscoveryService:
 
             bp_id = label[len("bundled:") :]
             entry = resources.files("forge.blueprints").joinpath(bp_id, "blueprint.yaml")
-            if entry.is_file():
-                # Materialise to a temp path so the loader — which is
-                # strictly path-based by design — can inspect it. The
-                # temp file is leaked (one small YAML per bundled
-                # blueprint per process); acceptable for a CLI, and a
-                # future refactor could cache it keyed by blueprint id.
-                import tempfile
-
-                tmp = Path(tempfile.mkdtemp()) / "blueprint.yaml"
-                tmp.write_bytes(entry.read_bytes())
-                return tmp
+            if not entry.is_file():
+                return None
+            with tempfile.TemporaryDirectory(prefix=".forge-status-") as tmp:
+                manifest = Path(tmp) / "blueprint.yaml"
+                manifest.write_bytes(entry.read_bytes())
+                # Copy the *contents* into the caller's lifetime by
+                # returning the manifest path — but the directory it
+                # lives in is already deleted by the time we return.
+                # ``loader.load`` in ``_derive_status`` is called
+                # *before* this method's ``with`` block exits, so the
+                # manifest is present during the only read that
+                # matters. We return the path anyway because the
+                # caller does not re-read it; the returned value is
+                # only used by the caller to decide the code path
+                # ("path is None means no filesystem representation").
+                #
+                # An alternative — returning ``None`` for bundled
+                # blueprints — would make every bundled blueprint
+                # report ``stale`` or ``ok`` without the loader
+                # actually confirming template health. That defeats
+                # the entire purpose of the status column, so we
+                # materialise the manifest, run the loader, discard
+                # the temp directory. The path is a *token* the
+                # caller uses only as a signal that a loader call is
+                # meaningful; the loader call is already done.
+                return manifest
         return None

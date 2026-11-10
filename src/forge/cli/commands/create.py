@@ -4,13 +4,51 @@ This command is the primary entry point for project generation. It
 takes a blueprint ID (e.g., ``python.fastapi.api``), resolves it from
 the discovered blueprints, resolves the variables (from CLI flags,
 interactive prompts, or blueprint defaults), evaluates conditional
-file groups against those variables, plans the file manifest, and —
-once the writer lands — commits the project atomically.
+file groups against those variables, plans the file manifest, validates
+the plan against the destination filesystem, and commits the project
+atomically through a staging directory.
+
+The seven-phase pipeline
+------------------------
+Every ``forge create`` invocation walks these phases in order. Each
+phase is a pure function (or a context manager) that either returns a
+result or raises a typed error the CLI handler classifies.
+
+    1. **Load** the blueprint document (``get_blueprint_document``).
+       Fails with exit code 2 on malformed/missing blueprints.
+    2. **Resolve** project name and variables (this module +
+       ``VariableResolver``). Fails with exit code 1 on user input
+       errors.
+    3. **Evaluate** conditional file groups against the resolved
+       variables (``ConditionalEvaluator``). Fails with exit code 1 on
+       broken conditions.
+    4. **Plan** the file manifest (``FileMapper``). Fails with exit
+       code 1 on collisions or unsafe destinations.
+    5. **Validate** the plan against the filesystem (``forge.safety``).
+       Fails with exit code 3 on structural refusals, exit code 6 on
+       collisions.
+    6. **Back up** existing files if ``--overwrite`` was passed
+       (``forge.safety.backup_existing``). Fails with exit code 3 on
+       any I/O error during backup, and rolls back partial backups
+       so the filesystem is left exactly as it was at phase entry.
+    7. **Stage and commit** (``StagingArea``). Renders each planned
+       file into a staging directory, then atomically renames them
+       into place. Fails with exit code 4 on template errors.
+
+The ordering is not incidental. Phase 5 is a *pre-flight* — it
+validates the plan before any file is touched, so a plan with a
+traversal attempt fails without ever opening a write handle. Phase 6
+is a *data-preservation* gate — it copies every file about to be
+replaced before any write occurs, so an interrupted phase 7 leaves
+the originals intact. Phase 7 is the *only* phase that mutates the
+destination, and it does so through ``StagingArea`` — the same
+guarantee that the safety layer's ADR-0017 makes: *no write escapes
+staging*.
 
 Dual-mode input handling
 ------------------------
-The command supports two input modes, dispatched once at the top of
-``create`` (see ADR-0006):
+The command supports two input modes, dispatched once in
+``_resolve_variables`` (see ADR-0006):
 
 - **Non-interactive** — ``--no-interactive`` was passed, or stdin is
   not a TTY. All required values must come from flags. If any are
@@ -45,28 +83,17 @@ is to put the command's function on the app as a **callback**:
     @app.callback()
     def create(…): …
 
-A ``Typer`` with a callback and no subcommands is the canonical
-"single-command app" shape. **The registry (``forge.cli.registry``)
-detects this shape and registers the callback's function directly on
-the root app as a leaf command**, under the name in ``app.info.name``.
-That is what makes ``forge create python.fastapi.api --name my-api``
-parse with ``python.fastapi.api`` as the callback's ``blueprint``
-argument — not as a subcommand.
-
-The ``invoke_without_command`` and ``no_args_is_help`` constructor
-flags on ``typer.Typer`` are **not** the mechanism for this. That
-flag only controls whether the callback runs when a subcommand *is*
-invoked with no arguments; it does not remove the ``COMMAND
-[ARGS]...`` slot from the app's signature. Placing it on the
-constructor or on the decorator produces the same misleading
-``Missing argument 'BLUEPRINT'`` error either way. The actual fix is
-in the registry's ``_is_single_command_app``; this file only needs to
-expose the shape.
+The registry (``forge.cli.registry``) detects this shape and registers
+the callback's function directly on the root app as a leaf command
+under the name in ``app.info.name``. That is what makes
+``forge create python.fastapi.api --name my-api`` parse with
+``python.fastapi.api`` as the callback's ``blueprint`` argument — not
+as a subcommand.
 
 Do **not** "simplify" this by converting ``@app.callback()`` to
 ``@app.command()`` and adding a second ``Typer`` layer, or by
 re-adding ``invoke_without_command`` in the hope that it fixes the
-nesting. It does not, and the previous two test runs are the proof.
+nesting. It does not.
 
 Why ``name`` is not marked required at the Typer layer
 ------------------------------------------------------
@@ -85,30 +112,24 @@ The fix is to move the requirement from Typer to the domain:
 
 The *contract* ("a project must have a name") is unchanged. Only the
 *enforcement point* moves — from the parser, where it prevents the
-wizard, to the domain, where it can coexist with the wizard. This is
-deliberate and load-bearing; do not "simplify" it back to ``...``.
+wizard, to the domain, where it can coexist with the wizard.
 
 Why the project name is validated *outside* the resolver
 --------------------------------------------------------
 The resolver's contract is "resolve the variables the *blueprint*
 declares" (ADR-0011). ``project_name`` is not one of them — it is a
 command argument that happens to share a name with a well-known
-variable id. Threading it through the resolver would either:
-
-- require every blueprint to declare a variable it does not
-  semantically own (a schema-level change that breaks every
-  blueprint that does not use the name), or
-- leave ``resolved["project_name"]`` as a ``KeyError`` for any
-  blueprint that does not (the exact bug an earlier revision of
-  this command hit).
+variable id. Threading it through the resolver would either require
+every blueprint to declare a variable it does not semantically own,
+or leave ``resolved["project_name"]`` as a ``KeyError`` for any
+blueprint that does not.
 
 So the project name is collected here and validated here, using the
 *same* named validator (``resolution.names.project_name``) that the
 resolver would apply if ``project_name`` were a blueprint variable.
 One rule, two enforcement points — interactive prompt (real-time
 UX) and non-interactive check (scripted correctness) — both backed
-by the same function. That is the invariant this command must
-maintain, and the tests pin it in both modes.
+by the same function.
 
 Why the command calls ``get_blueprint_document``, not ``get_blueprint``
 ---------------------------------------------------------------------
@@ -118,36 +139,21 @@ have different needs:
 * ``get_blueprint(blueprint_id) -> BlueprintEntry`` — a catalogue
   view (``id``, ``display_name``, raw ``variables`` tuple).
   Sufficient for ``forge list`` and for the wizard's *selection*
-  menu; **not** sufficient to resolve values against (the resolver
-  needs a ``Blueprint``, not an entry).
+  menu; **not** sufficient to resolve values against.
 
 * ``get_blueprint_document(blueprint_id) -> Blueprint`` — the
   loaded, schema-validated, model-validated document. That is what
-  any caller that *does something with* the blueprint needs:
-  resolving variables (here), planning files (here), rendering
-  templates (future), verifying checks (future).
+  any caller that *does something with* the blueprint needs.
 
-``create`` needs the second. An earlier revision of this file called
-``get_blueprint`` (the entry accessor) and then tried to reach
-through ``entry.path`` to the loader — but ``BlueprintEntry``
-deliberately has no ``path`` attribute (it is a catalogue view, not
-a filesystem handle), and the attempt failed with
-``AttributeError: 'BlueprintEntry' object has no attribute 'path'``.
-The fix is to use the accessor that matches the need, not to widen
-the entry's shape. Widening ``BlueprintEntry`` would drag the
-loader's types into the catalogue view — the exact coupling the
-two-accessor design exists to prevent.
-
-The two accessors share the same ``_make_discovery_service()`` seam
-in the registry, so tests patch *one* thing and both are
-substituted. The distinction is about *what the caller gets back*,
-not about *where the data comes from*.
+``create`` needs the second. Widening ``BlueprintEntry`` to carry a
+``path`` would drag the loader's types into the catalogue view — the
+exact coupling the two-accessor design exists to prevent.
 
 Conditional file inclusion
 --------------------------
 Conditional file groups are evaluated *after* variable resolution and
 *before* file planning, so the planner only sees the groups whose
-conditions hold (ADR-0016). The flow is:
+conditions hold (ADR-0016).
 
     variables ──► ConditionalEvaluator.evaluate ──► surviving groups
                                                             │
@@ -159,16 +165,7 @@ Its failures (undefined variable in a condition, invalid condition
 syntax) are aggregated into a single ``ConditionError`` and routed
 through the same ``UserInputError`` channel the resolver and planner
 use, so a broken condition surfaces as a user error (exit 1) with
-actionable hints — exactly like a broken variable. That consistency
-is deliberate: from the user's perspective, both are "the blueprint
-or my inputs are wrong."
-
-Do **not** skip the evaluator when the blueprint has no
-``conditional_files`` — the evaluator short-circuits on empty input
-and the pipeline stays uniform. A special case here would be the
-one place conditions *were* skipped when they should have run, and
-that class of bug is exactly what the explicit phase exists to
-prevent.
+actionable hints — exactly like a broken variable.
 
 Why no ``try`` / ``except`` around the command body
 ---------------------------------------------------
@@ -183,8 +180,6 @@ of a ``try`` block is intentional and is the correct contract.
 
 Variable resolution — the current pipeline
 -----------------------------------------
-The flow is:
-
     blueprint  ──┐
     cli_vars   ──┼──►  VariableResolver.resolve  ──►  ResolvedValues
     prompts    ──┘                                    (immutable,
@@ -195,60 +190,113 @@ The flow is:
 (CLI flags > prompt answers > blueprint defaults) and validates each
 value against its ``VariableDefinition`` (type coercion, pattern,
 enum, named validators). Its output type ``ResolvedValues`` is
-immutable and resolver-owned, so downstream code (the renderer, the
-planner, the generator) can require it in their signatures and be
-confident that unvalidated input never reaches them — the KPI this
-command exists to deliver.
+immutable and resolver-owned, so downstream code can require it in
+their signatures and be confident that unvalidated input never
+reaches them — the KPI this command exists to deliver.
 
-The command does not call ``validate_blueprint_inputs`` any more.
-The blueprint itself is validated by the *loader* when it is fetched
-(``get_blueprint_document`` delegates to discovery, which delegates
-to ``BlueprintLoader.load``, ADR-0010), so the document is already
-schema- and model-valid by the time this command sees it.
+Safety is a *gate*, not a *phase of planning*
+---------------------------------------------
+The plan is pure — it describes what *would* be written. Safety is
+the gate that asks "is it safe to write *here*?" The two are
+deliberately separated:
 
-Planning — where the plan comes from
------------------------------------
-``forge.planning.FileMapper`` (ADR-0015) turns the resolved variables
-and the blueprint's ``files[]`` / *surviving* ``conditional_files[]``
-into a sorted, deduplicated ``list[PlannedFile]``. The planner is
-pure, total, and tested independently of this command; this command's
-job is to *invoke* it with the right inputs and hand the resulting
-plan to the next phase.
+* ``FileMapper`` (phase 4) answers "does the plan make sense?" —
+  collisions *within* the plan, unsafe *destinations* from variable
+  substitution. It is pure and has no filesystem access.
 
-There are two use sites, one for each mode:
+* ``forge.safety`` (phase 5) answers "is it safe to write *to this
+  filesystem*?" — does the destination exist? is a symlink in the
+  way? is the parent writable? It *does* touch the filesystem, but
+  only to *read* (``lstat``, ``os.access``); no writes happen until
+  phase 7.
 
-- **``--dry-run``** — the plan is rendered as a human-readable
-  listing. Nothing is written. A plan that reports collisions or
-  path problems is shown with those problems, because a dry run's
-  job is to surface them, not to hide them behind a green check.
+Collapsing them would either make planning impure (breaking its
+testability — you cannot unit-test a plan that needs a filesystem)
+or make safety inconsistent (the same traversal check reimplemented
+inside the planner — the divergence ADR-0015 explicitly forbids).
 
-- **Non-dry-run** — the plan is handed to ``_generate``'s writer
-  hand-off, which is still a later task. The command therefore does
-  *not* silently no-op: it builds the plan (which exercises the
-  planner's guarantees against real input), and then raises a clear
-  ``NotImplementedError`` explaining that only the writer is missing.
-  A no-op would look like success to a script; a plan-then-fail is
-  honest about what is and is not complete.
+Why two safety error types (``SafetyError`` vs ``CollisionError``)
+------------------------------------------------------------------
+Structural safety failures (traversal, absolute path, symlink escape,
+unwritable parent) cannot be fixed by ``--overwrite`` — the flag
+consents to replacing a file, not to writing outside the root. They
+surface as ``SafetyError`` with exit code 3.
 
-Planning failures surface as a ``UserInputError`` whose message is the
-planner's aggregated ``MappingError`` rendering, which already includes
-per-finding hints. Exit code is 1 (user error) because a collision is
-almost always a blueprint authoring problem, not an internal bug.
+Collisions *can* be fixed by ``--overwrite`` (with backups). They
+surface as ``CollisionError`` with exit code 6. The distinction is
+load-bearing: CI scripts branch on the exit code to decide whether
+to retry with ``--overwrite`` or fail for human review. Merging the
+two would force every caller to inspect a message to make that
+decision.
 
-Why the command does not import the loader
------------------------------------------
-The loader is a discovery-layer concern (ADR-0010). ``create``
-should not know how a blueprint document is obtained, only that it
-*is* obtained. The registry is the command layer's façade over
-discovery — it exposes ``get_blueprint_document`` precisely so that
-commands can ask for a document without reaching into the loader.
-An earlier revision of this file imported ``BlueprintLoader``
-directly and called it with a path derived from the discovery
-entry; that coupled ``create`` to the loader's API and to
-``BlueprintEntry``'s shape simultaneously, and the coupling broke
-the moment either changed. The current design keeps ``create``
-importing exactly one discovery-layer name
-(``get_blueprint_document``), which is the minimum surface it needs.
+Why the pre-flight conflict check is not duplicated
+---------------------------------------------------
+``forge.safety.detect_collisions`` already reports existing files.
+The pre-flight check in this command does *not* repeat it — the
+authoritative check is in phase 5. A pre-flight here would be a
+second source of truth for the same question, and the two would
+drift (the pre-flight checking ``destination.exists()`` on the
+*directory* while the safety layer checks individual *files* is a
+concrete example of drift that produces confusing errors).
+
+The command's ``--overwrite`` flag is threaded into the safety
+layer's collision detection, so the layer can decide what to do
+with its own findings. The command never inspects findings
+directly; it only translates ``CollisionError``/``SafetyError``
+into the exit code (which the CLI handler then renders).
+
+Why the safety errors are translated, not re-raised verbatim
+------------------------------------------------------------
+``forge.safety.errors.SafetyError`` and ``CollisionError`` are
+*implementation* types — they carry ``Finding`` objects with
+internal detail (``root``, raw paths, etc.). The CLI contract is
+``forge.core.exceptions.SafetyError`` / ``CollisionError``, whose
+findings shape is stable and CLI-appropriate. The translation is a
+lossy projection (four fields per finding, not five) that:
+
+* keeps ``forge.safety`` free of any dependency on ``forge.cli`` or
+  ``forge.core`` — it is a primitive; primitives do not depend on
+  their consumers;
+* puts the exit code where ADR-0005 says it belongs: in
+  ``core.exceptions``, not in the safety layer;
+* gives the CLI handler a ``ForgeError`` subclass to dispatch on,
+  consistent with every other error category.
+
+Why the ``NotImplementedError`` is gone
+---------------------------------------
+An earlier revision of this command ended the non-dry path with
+``NotImplementedError`` because the writer had not yet landed. The
+writer is now the safety layer + staging area (tasks 1.3.4-1.3.7).
+The command therefore runs the full pipeline end to end. If a future
+writer (say, a "commit hooks" phase) is not yet ready, it must go
+through the same pattern: build the plan, run the safety checks,
+raise a typed error for the missing phase — never a silent no-op.
+
+Why ``_stage_one`` has a ``# type: ignore[no-any-unimported]``
+--------------------------------------------------------------
+``TemplateRenderer`` is imported from ``forge.rendering``, whose
+façade lazy-imports the concrete class from ``forge.rendering.renderer``,
+which in turn imports ``jinja2`` — a package that is gated behind
+``ignore_missing_imports`` in ``pyproject.toml``. Mypy can therefore
+see the *name* ``TemplateRenderer`` but cannot resolve the class's
+shape, and treats a parameter annotated with it as ``Any``. Strict
+mode's ``[no-any-unimported]`` check flags that.
+
+The suppression is narrowly scoped to the ``def`` line and only
+covers ``[no-any-unimported]``. It does not weaken:
+
+    * the parameter's *runtime* contract (``renderer`` must be a
+      ``TemplateRenderer``; passing anything else fails at
+      ``.render(...)`` with a clear ``AttributeError``),
+    * the return type (``None``), which mypy still checks,
+    * any other argument or any other function in this module.
+
+If ``jinja2`` ever gains type stubs (or the project drops
+``ignore_missing_imports`` for it), the suppression becomes unused
+and mypy's ``unused-ignore`` check — on under strict mode — will
+force its removal in the same PR that lands the stubs. That is the
+desired signal: the ignore is a *placeholder for an external
+dependency's gap*, not a permanent part of this file's contract.
 """
 
 from __future__ import annotations
@@ -256,7 +304,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import typer
 
@@ -265,47 +313,40 @@ from forge.cli.registry import get_blueprint_document
 from forge.conditions import ConditionalEvaluator
 from forge.conditions.errors import ConditionError
 from forge.core.exceptions import (
+    CollisionError as CoreCollisionError,
+)
+from forge.core.exceptions import (
     FilesystemConflictError,
     MissingRequiredFlagsError,
+    TemplateRenderError,
     UserInputError,
+)
+from forge.core.exceptions import (
+    SafetyError as CoreSafetyError,
 )
 from forge.loading.errors import ValidationError
 from forge.loading.result import Err
 from forge.models import Blueprint, VariableDefinition
 from forge.planning import FileMapper, MappingError, PlannedFile
+from forge.rendering import TemplateRenderer
 from forge.resolution import ResolvedValues, VariableResolver
 from forge.resolution.names import NAMED_VALIDATORS
+from forge.safety import (
+    StagingArea,
+    backup_existing,
+    detect_collisions,
+    safe_resolve,
+    validate_destination,
+)
 
 if TYPE_CHECKING:
-    # Type-only import: ``SurvivingGroup`` is the return type of
-    # ``ConditionalEvaluator.evaluate`` and is threaded through
-    # ``_resolve_variables`` and ``_generate``. Importing it at
-    # module scope would pull ``forge.conditions`` (and its parser,
-    # evaluator, and ast modules) into the CLI's import cost, which
-    # the command does not need for its *type* — only for its
-    # *runtime* behaviour. The runtime import is already present via
-    # ``ConditionalEvaluator``; the type-only alias just gives the
-    # annotations below a name to point at.
     from forge.conditions.evaluator import SurvivingGroup
+    from forge.rendering.errors import TemplateRenderError as _RenderError
+    from forge.safety.errors import Finding as _SafetyFinding
 
 # -----------------------------------------------------------------------------
 # Command module contract
 # -----------------------------------------------------------------------------
-# Every command module exposes a module-level ``app`` attribute of type
-# ``typer.Typer``. The registry (``forge.cli.registry``) discovers this
-# attribute and mounts it on the root CLI under ``name``.
-#
-# This app is a *single-command app*: it has a callback and no
-# subcommands. The registry detects this shape and registers the
-# callback as a leaf command — see the module docstring's "Why the
-# callback, and how ``forge create`` becomes a leaf command" section
-# for the full mechanism and for why the constructor's
-# ``invoke_without_command`` flag is *not* the answer.
-#
-# The explicit ``name=`` and ``help=`` are what the user sees in
-# ``forge --help`` and ``forge create --help``, so they must be
-# deliberate, not incidental. The registry uses ``app.info.name`` as
-# the command name — do not remove ``name=``.
 app = typer.Typer(
     name="create",
     help="Create a project from a blueprint.",
@@ -315,11 +356,6 @@ app = typer.Typer(
 # -----------------------------------------------------------------------------
 # Command
 # -----------------------------------------------------------------------------
-# The callback *is* the command. Its arguments are the command's
-# arguments; the registry registers this function directly as a leaf
-# command under the name ``create``. Do not convert it to
-# ``@app.command()`` — that would nest the command inside a group and
-# change the invocation to ``forge create create <blueprint>``.
 @app.callback()
 def create(
     blueprint: str = typer.Argument(
@@ -339,10 +375,6 @@ def create(
             "Python package name (e.g., 'payments-api'). Prompted for in "
             "interactive mode if omitted; required in non-interactive mode."
         ),
-        # See the module docstring: this is intentionally *not* ``...``.
-        # A parser-level requirement would block the interactive wizard.
-        # The requirement is enforced in ``_resolve_variables`` below,
-        # where the interactive fallback exists.
     ),
     output: Path = typer.Option(
         Path("."),
@@ -388,7 +420,9 @@ def create(
         "--overwrite",
         help=(
             "Allow overwriting existing files. Without this flag, the "
-            "command fails if any target file already exists."
+            "command fails if any target file already exists. When "
+            "enabled, every replaced file is copied to a timestamped "
+            "backup before any write."
         ),
     ),
 ) -> None:
@@ -400,12 +434,12 @@ def create(
     - 1 — User error (missing required variable, invalid input,
       cancellation, planning collision, broken condition).
     - 2 — Blueprint error (not found, invalid, incompatible).
-    - 3 — Filesystem conflict (destination exists, permission denied).
+    - 3 — Filesystem safety refusal (traversal, absolute path, symlink
+      escape, unwritable parent). ``--overwrite`` cannot help.
+    - 4 — Template error (a template failed to render).
     - 5 — Internal error (unexpected exception).
-
-    The ``--json`` flag will be added in the JSON output task, not
-    here. This command does not declare it yet, so the flag's absence
-    is not a breaking change when it lands.
+    - 6 — Collision (a destination already exists and ``--overwrite``
+      was not passed). Retry with ``--overwrite``, or edit the plan.
     """
     blueprint_document, inputs, surviving_groups = _resolve_variables(
         blueprint_id=blueprint,
@@ -451,8 +485,6 @@ def _parse_var_flags(var_flags: list[str]) -> dict[str, str]:
         if not key:
             raise UserInputError(f"--var expects a non-empty key before '=', got {raw!r}.")
         if key in parsed:
-            # Last-wins would be surprising; duplicate flags are almost
-            # always a copy-paste mistake in a shell script.
             raise UserInputError(
                 f"--var key {key!r} was provided more than once. "
                 f"Provide each variable at most once."
@@ -462,7 +494,7 @@ def _parse_var_flags(var_flags: list[str]) -> dict[str, str]:
 
 
 # -----------------------------------------------------------------------------
-# Variable resolution
+# Variable resolution (unchanged from previous revision)
 # -----------------------------------------------------------------------------
 def _resolve_variables(
     *,
@@ -474,110 +506,35 @@ def _resolve_variables(
 ) -> tuple[Blueprint, _ResolvedInputs, list[SurvivingGroup]]:
     """Collect user input, resolve variables, evaluate conditional groups.
 
-    Returns three things, because the caller needs all three and
-    separating them into phases would force this function to hold
-    state or the caller to re-enter the pipeline:
+    See the module docstring's "Dual-mode input handling" and "Why the
+    project name is validated *outside* the resolver" sections for the
+    design rationale. This function is the "collect and validate"
+    half of the command; ``_generate`` is the "plan and commit" half.
 
-    1. ``blueprint`` — the loaded, validated document. Required by the
-       resolver (for variable definitions) and by the planner (for
-       ``files[]``/``conditional_files[]``). Returning it here means
-       the caller does not need to re-fetch or re-validate.
-    2. ``_ResolvedInputs`` — the resolver's output plus the project
-       name. Immutable, ready for downstream phases.
-    3. ``surviving_groups`` — the conditional groups whose conditions
-       held, in the shape ``FileMapper.map`` expects
-       (``list[SurvivingGroup]`` = ``list[tuple[Expression,
-       list[FileEntry]]]``). Passing them explicitly (rather than
-       letting the planner re-evaluate) is the safe-by-default rule
-       from ADR-0015: the planner *never* includes conditional files
-       unless the caller opts in by handing them the evaluator's
-       output.
-
-    Two modes, one resolver for *blueprint variables*, one explicit
-    handling of the *project name* (a command argument, not a variable):
-
-    - **Non-interactive** — ``--name`` is required
-      (``MissingRequiredFlagsError``) and validated against the same
-      ``project_name`` named validator the resolver uses. Every
-      required blueprint variable must be supplied as ``--var``; the
-      resolver aggregates *all* missing/invalid values into one
-      ``Err(errors)`` so the user fixes everything in one edit.
-    - **Interactive** — the wizard prompts only for what the flags did
-      not supply. Flags win; supplied values are never re-asked. The
-      prompt's inline validator gives real-time feedback using the
-      same named validator.
-
-    In both cases the collected blueprint inputs flow through
-    ``VariableResolver.resolve`` — the single validation funnel for
-    *blueprint variables* (ADR-0011). The project name is validated
-    alongside, by the *same* named validator, so the two paths cannot
-    disagree on what a legal name is. Conditional groups are then
-    evaluated against the *resolved* variables, so a condition can
-    reference any value the resolver produced — never a raw flag.
+    Returns:
+        ``(blueprint, inputs, surviving_groups)`` — everything
+        ``_generate`` needs, with no re-fetching and no re-validation.
     """
-    # Load the blueprint *first*, before any prompts. Three reasons:
-    #   1. A bad blueprint ID fails fast with exit code 2, before we
-    #      make the user answer questions for a project that cannot
-    #      be generated.
-    #   2. The blueprint's variable definitions drive both the wizard's
-    #      prompts and the resolver's validation rules, so we need the
-    #      loaded document regardless of mode.
-    #   3. The blueprint's conditional_files drive the evaluator's
-    #      input, so we cannot evaluate conditions before loading it.
     blueprint = get_blueprint_document(blueprint_id)
 
     interactive = prompts.is_interactive() and not no_interactive
 
-    # ------------------------------------------------------------------
-    # 1. Resolve the project name — a *command argument*, not a blueprint
-    #    variable. Collected here, validated here, by the same named
-    #    validator the resolver would apply if ``project_name`` were a
-    #    declared variable.
-    # ------------------------------------------------------------------
+    # Phase 2a: project name (command argument, not blueprint variable).
     if not interactive:
-        # Fail fast, fail complete: aggregate every missing flag into one
-        # error so a scripted caller fixes them in a single edit. This
-        # also produces the flag-shaped message (``--name``) rather than
-        # the resolver's ``required.missing`` for a variable the
-        # blueprint never declared.
         _require_flags(command="create", values={"--name": cli_name})
-        # After ``_require_flags`` raises on ``None``, mypy still sees
-        # ``cli_name: str | None``; the assertion narrows it. Under
-        # ``python -O`` the assert is stripped, but the branch is
-        # unreachable in that mode because ``_require_flags`` would
-        # have raised first — the narrowing is structural, not
-        # defensive.
         assert cli_name is not None  # noqa: S101
         project_name = cli_name
-        # The project name is a command argument, so it does not flow
-        # through ``VariableResolver.resolve`` — but it still must be
-        # validated. Use the *same* named validator the wizard uses,
-        # so a name that would be rejected interactively is also
-        # rejected non-interactively. Without this step, an invalid
-        # name would slip through to ``_generate`` and produce a
-        # confusing "unexpected internal error" (exit 5) instead of
-        # the correct "invalid project name" (exit 1).
         _validate_project_name(project_name)
     else:
-        # Flags win: a supplied --name is never re-asked. Muscle memory
-        # matters, and a wizard that re-asks answered questions feels
-        # broken. The prompt's validator gives real-time feedback using
-        # the same named validator the non-interactive path applies.
         project_name = cli_name or prompts.ask_text(
             "Project name",
             validator=_prompt_validator_for("project_name"),
         )
 
-    # ------------------------------------------------------------------
-    # 2. Resolve the blueprint's own variables via the resolver.
-    #    ``cli_vars`` contains only ``--var`` flags — NOT the project
-    #    name (see "Why the project name is validated outside the
-    #    resolver" in the module docstring).
-    # ------------------------------------------------------------------
+    # Phase 2b: blueprint variables (resolver).
     prompt_values = (
         _collect_interactive_answers(blueprint, already_supplied=cli_vars) if interactive else {}
     )
-
     resolver = VariableResolver()
     result = resolver.resolve(
         blueprint,
@@ -585,50 +542,21 @@ def _resolve_variables(
         prompt_answers=prompt_values,
     )
     if isinstance(result, Err):
-        # All errors aggregated by the resolver. Raise a single
-        # ``UserInputError`` whose message joins every error's
-        # ``format()`` rendering, so the CLI handler can render them
-        # all with one exception.
         raise _as_user_input_error(result.error, source=f"blueprint:{blueprint_id}")
 
-    # ------------------------------------------------------------------
-    # 3. Evaluate conditional file groups against the *resolved*
-    #    variables.
-    #
-    #    Running the evaluator unconditionally (even when the blueprint
-    #    declares no conditional groups) is deliberate: the evaluator
-    #    short-circuits on empty input, and uniformity here means the
-    #    pipeline has exactly one shape. A "skip when empty" special
-    #    case would be the one place conditions *were* skipped when
-    #    they should have run — the exact bug class the explicit phase
-    #    exists to prevent (ADR-0016).
-    #
-    #    The evaluator sees the resolver's output, not the raw flags,
-    #    so a condition comparing to a variable sees the *validated,
-    #    coerced* value (e.g. ``include_docker == true`` compares to
-    #    ``True``, never to the string ``"true"``). That is what makes
-    #    conditions type-safe in the same way the resolver makes
-    #    variables type-safe.
-    # ------------------------------------------------------------------
+    # Phase 3: conditional groups (against resolved variables).
     evaluation = ConditionalEvaluator().evaluate(blueprint, result.value.as_dict())
     if isinstance(evaluation, Err):
-        # Aggregate condition errors into the same ``UserInputError``
-        # channel the resolver and planner use, so a broken condition
-        # surfaces as a user error (exit 1) with actionable hints —
-        # exactly like a broken variable. From the user's perspective,
-        # both are "my inputs or the blueprint are wrong."
         raise _as_user_input_error_from_conditions(
             evaluation.error, source=f"blueprint:{blueprint_id}"
         )
     surviving_groups = evaluation.value
 
-    # ------------------------------------------------------------------
-    # 4. Combine: project_name (command arg) + resolver output
-    #    (blueprint variables). The result is a fresh, immutable
-    #    ``ResolvedValues`` so downstream code continues to get the
-    #    compile-time guarantee — a plain ``dict`` here would silently
-    #    undo the KPI for anything that reads ``inputs.variables``.
-    # ------------------------------------------------------------------
+    # Phase 4 (partial): combine project_name into the resolved set.
+    # The planner will see this combined set — the project name is
+    # available for destination substitution even though it is not a
+    # blueprint variable, because the planner consumes *what it needs*
+    # from the mapping without caring which source it came from.
     combined = dict(result.value.as_dict())
     combined["project_name"] = project_name
 
@@ -642,40 +570,16 @@ def _resolve_variables(
 
 
 def _validate_project_name(value: str) -> None:
-    """Reject ``value`` with ``UserInputError`` if it fails the shared rule.
-
-    Uses the *same* named validator (``resolution.names.project_name``)
-    that the wizard and the resolver use, so the three enforcement
-    points cannot disagree about what counts as a legal name.
-
-    The exception is a ``UserInputError`` — the domain class the CLI
-    handler routes to exit code 1 with a friendly message. That is the
-    exact exception shape the wizard's prompt loop would have produced
-    (the prompt engine's ``_guard`` raises ``PromptCancelledError`` on
-    cancellation, but a *validation* failure is re-prompted rather
-    than raised; here in non-interactive mode, we raise directly
-    because there is no loop to re-prompt into).
-    """
+    """Reject ``value`` with ``UserInputError`` if it fails the shared rule."""
     problem = NAMED_VALIDATORS["project_name"](value)
     if problem is None:
         return
     message, hint = problem
-    # ``UserInputError`` folds message and hint into one string for the
-    # CLI handler to render. Keeping the hint adjacent to the message
-    # (rather than as a separate field) is the current contract of
-    # that exception — if it ever grows a ``hint`` attribute, this
-    # call site is the one that simplifies.
     raise UserInputError(f"{message} Hint: {hint}")
 
 
 def _require_flags(*, command: str, values: dict[str, str | None]) -> None:
-    """Raise ``MissingRequiredFlagsError`` if any value is ``None``.
-
-    Aggregates every missing flag into a single error (fail fast, fail
-    complete). An ``assert``-based narrowing would vanish under
-    ``python -O``; this helper simply *raises*, which survives any
-    optimization flag.
-    """
+    """Raise ``MissingRequiredFlagsError`` if any value is ``None``."""
     missing = [flag for flag, value in values.items() if value is None]
     if missing:
         raise MissingRequiredFlagsError(
@@ -685,20 +589,7 @@ def _require_flags(*, command: str, values: dict[str, str | None]) -> None:
 
 
 def _as_user_input_error(errors: list[ValidationError], *, source: str) -> UserInputError:
-    """Convert resolver errors into one ``UserInputError`` for the handler.
-
-    The CLI handler renders the exception's message; until a structured
-    error renderer exists, we join the formatted errors so the user
-    sees every problem in one pass. ``ValidationError.format()``
-    produces a single-line rendering that already carries the hint,
-    so joining them preserves the actionable text for each error.
-
-    ``source`` is threaded into the message so batch callers (a future
-    ``forge validate`` invocation over many files) can attribute the
-    error to the right input. For a single ``create`` invocation it is
-    always the blueprint id, but the signature keeps the call site
-    honest about what it is attributing.
-    """
+    """Convert resolver errors into one ``UserInputError`` for the handler."""
     if not errors:
         return UserInputError(f"Input validation failed for {source} (no details available).")
     joined = "\n  ".join(err.format() for err in errors)
@@ -706,31 +597,7 @@ def _as_user_input_error(errors: list[ValidationError], *, source: str) -> UserI
 
 
 def _as_user_input_error_from_conditions(error: ConditionError, *, source: str) -> UserInputError:
-    """Convert a ``ConditionError`` into a ``UserInputError``.
-
-    Condition errors carry the same structured shape as loader and
-    planner errors (``condition``, ``message``, ``hint``, ``code``).
-    We render each finding on its own line so a blueprint with several
-    broken conditions produces one message the user can act on in one
-    pass — the same "fail complete" contract the resolver provides.
-
-    Kept as a dedicated function (rather than a shared
-    ``_as_user_input_error`` overload) so the wording can stay specific
-    to conditions ("condition errors", not "input errors") and a
-    future structured error renderer has a clear seam to plug into.
-
-    Why the per-finding line is built from fields, not a ``format()``
-    call: ``Finding`` is a frozen dataclass with four string fields
-    (``condition``, ``message``, ``hint``, ``code``) and no rendering
-    method. The prior ``f.format()`` call was a leftover from
-    ``ValidationError`` (which *does* have ``format()``) — a
-    copy-paste that only surfaced under mypy strict once this
-    function's parameter gained a concrete type (``ConditionError``),
-    because before that the body operated on ``Any`` and mypy had no
-    basis to complain. Rendering from fields here makes the line's
-    shape explicit and keeps the function total over any ``Finding``
-    the evaluator produces, present or future.
-    """
+    """Convert a ``ConditionError`` into a ``UserInputError``."""
     findings = error.findings
     if not findings:
         return UserInputError(f"Condition evaluation failed for {source} (no details available).")
@@ -744,25 +611,11 @@ def _collect_interactive_answers(
     *,
     already_supplied: dict[str, str],
 ) -> dict[str, object]:
-    """Prompt for every blueprint variable not already supplied by a flag.
-
-    Flags win, always: a variable present in ``already_supplied`` is
-    skipped, so a user who typed ``--var author=alice`` is never
-    asked for the author again. This is the behaviour that makes the
-    wizard feel like an *assistant*, not a re-asking form.
-
-    Each prompt wires the same named validator the resolver uses (for
-    ids that have one), so a value the wizard accepts will not be
-    rejected by the resolver later, and vice versa. Pattern and enum
-    checks run in the resolver after the prompt returns — the prompt
-    engine only offers real-time feedback for *named* validators
-    because they are pure string predicates, which is the honest
-    boundary (see ``_prompt_validator``).
-    """
+    """Prompt for every blueprint variable not already supplied by a flag."""
     answers: dict[str, object] = {}
     for var in blueprint.variables:
         if var.id in already_supplied:
-            continue  # flag wins; never re-ask
+            continue
         validator = _prompt_validator(var)
         if var.type.value == "boolean":
             answers[var.id] = prompts.ask_confirm(f"{var.id}?", default=bool(var.default))
@@ -779,40 +632,14 @@ def _collect_interactive_answers(
 
 
 def _prompt_validator(var: VariableDefinition) -> prompts.Validator | None:
-    """Adapt a blueprint variable's rules to the prompt engine's signature.
-
-    Only *named* validators can give real-time feedback today, because
-    they are pure string predicates. Pattern and enum checks are
-    applied by the resolver after the prompt returns — acceptable UX
-    for v1 (the user gets the error before scaffolding) and honest:
-    we do not pretend a check the prompt cannot perform.
-
-    The named-validator lookup is delegated to
-    ``_prompt_validator_for`` so the wizard and the non-interactive
-    path share exactly one adapter implementation. Two call sites, one
-    function — the same "one rule, one source" principle the
-    resolution layer exists to enforce.
-    """
+    """Adapt a blueprint variable's rules to the prompt engine's signature."""
     if var.id not in NAMED_VALIDATORS:
         return None
     return _prompt_validator_for(var.id)
 
 
 def _prompt_validator_for(named: str) -> prompts.Validator:
-    """Adapt a named validator from ``resolution.names`` to the prompt engine.
-
-    The prompt engine accepts a validator that returns ``None`` on
-    success or a message string on failure (``cli.prompts.Validator``).
-    The named validators in ``resolution.names`` return ``None`` or a
-    ``(message, hint)`` tuple. This adapter picks the *hint* as the
-    user-facing message, because the hint is the actionable text and
-    real-time feedback should suggest the fix, not merely restate the
-    problem.
-
-    ``KeyError`` from a missing validator name is deliberately not
-    caught: the caller passes a name defined in ``resolution.names``,
-    and a typo is a programming error, not a user-facing condition.
-    """
+    """Adapt a named validator from ``resolution.names`` to the prompt engine."""
     validator = NAMED_VALIDATORS[named]
 
     def _validate(value: str) -> str | None:
@@ -823,7 +650,7 @@ def _prompt_validator_for(named: str) -> prompts.Validator:
 
 
 # -----------------------------------------------------------------------------
-# Generation hand-off
+# Generation (plan → validate → backup → stage → commit)
 # -----------------------------------------------------------------------------
 def _generate(
     *,
@@ -833,78 +660,45 @@ def _generate(
     dry_run: bool,
     overwrite: bool,
 ) -> None:
-    """Build the plan, then hand it to the writer (or render it in dry run).
+    """Run the plan-through-commit pipeline.
 
-    The plan is built via ``forge.planning.FileMapper`` (ADR-0015),
-    which is pure, total, and independently tested. This function's
-    job is to invoke it with the right inputs, translate its failures
-    into the command layer's error types, and — depending on
-    ``dry_run`` — either render the plan or hand it to the writer.
+    Five phases, in order:
 
-    ``conditional_groups`` are the *surviving* groups from
-    ``ConditionalEvaluator`` (ADR-0016). Passing them explicitly is
-    the safe-by-default rule from ADR-0015: the planner never
-    includes conditional files unless the caller opts in. The
-    evaluator decided *which* groups survive; the planner decides
-    *how* they are written. Splitting the two responsibilities is
-    what lets each be tested independently and what prevents the
-    classic bug where a condition was never evaluated because the
-    planner "helpfully" planned all groups regardless.
+    1. **Plan** (``FileMapper.map``). Pure; no filesystem access.
+    2. **Dry-run short-circuit.** If ``--dry-run``, render and return.
+       No further phases run — dry-run has no side effects by contract.
+    3. **Safety validation** (``forge.safety``). Reads the filesystem
+       to check structure, existence, and collisions. Raises
+       ``CollisionError`` or ``SafetyError`` (translated to the CLI's
+       equivalents).
+    4. **Backups** (``backup_existing``). Only when ``--overwrite``
+       was passed *and* there are existing destinations to preserve.
+       Atomic; rolls back on failure.
+    5. **Staging and commit** (``StagingArea``). Renders every planned
+       file into a staging directory, then renames them into place.
+       Every write is inside staging until the final commit; every
+       commit is a per-file atomic ``os.replace``.
 
-    The writer itself is a later task. The non-dry path therefore ends
-    with a clear ``NotImplementedError`` rather than a silent no-op.
-    Two reasons:
+    Ordering rationale: each phase is strictly more expensive than the
+    previous, and each phase *fails closed* before the next one
+    starts. A traversal attempt fails at phase 3 without any backup or
+    staging directory having been created. A collision fails at phase
+    3 before any backup runs, so the user sees the collision without
+    paying the backup cost. Backups only run for files about to be
+    replaced, and only after the plan is known-safe. Staging only
+    runs after backups are complete, so a mid-commit failure has a
+    recoverable state (the backups).
 
-        1. **A silent no-op looks like success to a script.** A CI job
-           that runs ``forge create ...`` would exit 0 and produce no
-           directory, which is impossible to debug without reading the
-           source. A loud failure names the missing phase.
-        2. **The plan is real work.** Building it exercises the planner
-           against real input, which means the dry-run path and the
-           future write path share the exact same planning code. If
-           the plan fails (collisions, path problems), the user learns
-           *now*, in the same phase they would learn it with a writer
-           present.
-
-    Args:
-        blueprint: The loaded, validated document. Provides ``files[]``
-            and ``conditional_files[]`` to the planner.
-        inputs: Validated, immutable inputs from ``_resolve_variables``.
-        conditional_groups: Surviving groups from
-            ``ConditionalEvaluator.evaluate``. Passed through to the
-            planner unchanged; the planner does not re-evaluate.
-        dry_run: If ``True``, render the plan and return without writing.
-        overwrite: If ``True``, allow overwriting existing files. Checked
-            here as a pre-flight for the future writer; the writer will
-            re-check at commit time because files can appear between
-            the pre-flight and the commit.
-
-    Raises:
-        UserInputError: The planner found one or more problems (collisions,
-            unsafe paths, empty substitutions). The message is the
-            planner's aggregated rendering, with per-finding hints.
-        FilesystemConflictError: The destination exists and
-            ``overwrite`` is ``False`` *and* this is not a dry run.
-        NotImplementedError: The writer is a later task and is not yet
-            wired in. Raised only for the non-dry path, after the plan
-            has been built successfully.
+    Why the safety validation runs even when ``overwrite`` is True:
+        ``--overwrite`` consents to *replacing existing files*. It
+        does *not* consent to writing outside the root, following
+        symlinks, or writing into an unwritable parent. Those
+        structural refusals are unaffected by ``--overwrite``, so the
+        safety check is the same in both cases; only the collision
+        branch changes (it does not fire when ``overwrite`` is True).
     """
     # ------------------------------------------------------------------
-    # 1. Build the plan.
-    #
-    # The planner requires the resolved *blueprint variables*. The
-    # project name is a command argument, not a blueprint variable, so
-    # we do NOT pass it here — the planner substitutes it only if the
-    # blueprint declared it, which would be unusual but legal. This is
-    # consistent with the resolver's contract: only what the blueprint
-    # declares flows through the variable pipeline.
-    #
-    # ``conditional_groups`` carries the surviving groups from the
-    # evaluator. When empty (no conditional files, or all conditions
-    # false), the planner plans only the unconditional files — the
-    # exact same code path as a blueprint that has no conditional
-    # files at all, so there is no "conditional but nothing
-    # survived" branch to diverge.
+    # Phase 1: plan.
     # ------------------------------------------------------------------
     plan_result = FileMapper().map(
         blueprint,
@@ -912,61 +706,351 @@ def _generate(
         conditional_groups=conditional_groups,
     )
     if isinstance(plan_result, Err):
-        # The planner aggregated every finding (collisions, unsafe
-        # paths, empty substitutions) into one ``MappingError``. Route
-        # it through the same ``UserInputError`` channel the resolver
-        # uses so the CLI handler renders it identically, and the exit
-        # code is 1 (user error), which is the correct classification
-        # — a collision or path problem is almost always a blueprint
-        # authoring mistake, not an internal bug.
         raise _as_user_input_error_from_mapping(
             plan_result.error, source=f"blueprint:{inputs.blueprint_id}"
         )
     plan: list[PlannedFile] = plan_result.value
 
     # ------------------------------------------------------------------
-    # 2. Dry-run: render the plan, do not write.
-    #
-    # A dry run is a *plan*, not a *commit*; refusing to render the
-    # plan because the destination is occupied prevents the user from
-    # ever seeing what would be blocked — which defeats the purpose
-    # of asking for the plan. The rendering names the destination and
-    # lets the user see the intended layout; the pre-flight conflict
-    # check below is skipped for dry runs for this reason.
+    # Phase 2: dry-run short-circuit.
     # ------------------------------------------------------------------
     if dry_run:
         _render_plan(blueprint=blueprint, inputs=inputs, plan=plan)
         return
 
     # ------------------------------------------------------------------
-    # 3. Non-dry-run: pre-flight conflict check, then writer hand-off.
+    # Phase 3: safety validation.
     #
-    # The pre-flight check is *not* the commit-time check — the writer
-    # will re-check because files can appear between this line and the
-    # commit. But a pre-flight catches the common case (destination
-    # directory exists) before the user waits on the planner output
-    # being discarded, and it produces the correct exit code (3)
-    # rather than letting the writer raise a less-specific error.
+    # Two passes:
+    #
+    #   a. Per-file validation — every planned destination must be
+    #      structurally safe (``safe_resolve``) and ready to write
+    #      (``validate_destination``). Findings are aggregated, then
+    #      translated into the CLI's error types.
+    #
+    #   b. Plan-vs-disk collision detection — with ``--overwrite``
+    #      consent threaded through, so the safety layer can decide
+    #      which collisions to raise and which to allow (backups in
+    #      phase 4 preserve the overwritten data either way).
+    #
+    # A structural failure in (a) precludes (b) because there is no
+    # sensible collision check to run against an unsafe destination.
     # ------------------------------------------------------------------
-    if inputs.destination.exists() and not overwrite:
-        raise FilesystemConflictError(
-            f"Destination {str(inputs.destination)!r} already exists.",
-            hint="Choose a different --output, or pass --overwrite.",
-        )
+    safety_findings: list[_SafetyFinding] = []
+    for planned in plan:
+        resolved, finding = safe_resolve(planned.destination, inputs.destination)
+        if finding is not None:
+            safety_findings.append(finding)
+            continue
+        # ``safe_resolve`` returns ``(Path, None)`` on success and
+        # ``(None, Finding)`` on failure. The ``finding is not None``
+        # branch above handles the failure case and ``continue``s;
+        # after the ``continue``, ``resolved`` must be the non-``None``
+        # half of the tuple. mypy's flow analysis cannot infer that on
+        # its own (the return type is a union of two-element tuples,
+        # not a union of element types), so the check below is both a
+        # type-narrowing hint for mypy *and* a runtime contract check.
+        #
+        # A real ``RuntimeError`` — not an ``assert`` — because the
+        # check must survive ``python -O`` (which strips asserts) and
+        # because a ``(None, None)`` return would be a Forge bug, not
+        # a user-facing condition. The earlier ``assert`` was silent
+        # under ``-O``; the subsequent ``validate_destination(None,
+        # ...)`` call would have failed with a confusing
+        # ``AttributeError`` from deep inside the safety layer instead
+        # of the loud, located error below.
+        if resolved is None:
+            raise RuntimeError(
+                "safe_resolve returned (None, None) — a contract violation "
+                f"for destination {planned.destination!r}. This is a bug in "
+                "forge.safety; please report it."
+            )
+        safety_findings.extend(validate_destination(resolved, overwrite=overwrite))
+    safety_findings.extend(detect_collisions(plan, inputs.destination, overwrite=overwrite))
 
-    # TODO: call into ``forge.generation.scaffold_from_plan`` once the
-    # writer lands. The plan is complete and correct; only the commit
-    # phase is missing. Raising here is deliberate — a silent no-op
-    # would look like success to a script and produce an empty
-    # directory the user cannot debug.
-    raise NotImplementedError(
-        "The generation writer is not yet implemented. "
-        "The plan was built successfully "
-        f"({len(plan)} file(s) planned); only the commit phase is missing. "
-        "See the generation-pipeline task for the scaffold hand-off."
+    if safety_findings:
+        _raise_safety_error(safety_findings, operation="create", destination=inputs.destination)
+
+    # ------------------------------------------------------------------
+    # Phase 4: backups (opt-in via --overwrite, and only for existing
+    # files).
+    #
+    # We compute the "targets to back up" set from the plan *plus* the
+    # destination root, not from ``safety_findings`` — because the
+    # safety layer already confirmed which destinations exist (in its
+    # own way). Re-deriving the existing files here keeps this function
+    # honest about what it is about to replace: the plan is the source
+    # of truth, and ``lstat`` on each target is the check.
+    # ------------------------------------------------------------------
+    if overwrite:
+        existing_targets = _existing_targets(plan, inputs.destination)
+        if existing_targets:
+            try:
+                backup_existing(existing_targets)
+            except OSError as exc:
+                raise FilesystemConflictError(
+                    f"Could not back up existing files before overwrite: {exc}",
+                    hint=(
+                        "Check permissions and free disk space, then retry. "
+                        "No files have been modified."
+                    ),
+                ) from exc
+
+    # ------------------------------------------------------------------
+    # Phase 5: staging and commit.
+    #
+    # Two sub-phases:
+    #
+    #   a. Render every planned file into a staging directory. All
+    #      rendering happens here; a template failure aborts the whole
+    #      operation before any commit.
+    #
+    #   b. Commit: move each staged file to its destination via
+    #      ``StagingArea.commit``. Each move is a per-file atomic
+    #      ``os.replace``.
+    #
+    # ``StagingArea.for_root`` creates a hidden ``.forge-stage-*``
+    # directory *inside* the destination root (same filesystem, so
+    # ``os.replace`` is atomic). The context manager removes it on
+    # exit, including on exception. Phase 5 is the *only* phase that
+    # mutates the destination root; phases 1-4 are read-only against
+    # the destination (phase 4 writes only to backup files, which are
+    # new and outside the plan's target set).
+    # ------------------------------------------------------------------
+    renderer = TemplateRenderer()
+    blueprint_root = _blueprint_root(blueprint, inputs.blueprint_id)
+
+    # Ensure destination root exists before staging: ``mkdtemp`` (used
+    # by ``StagingArea.for_root``) requires its parent to exist.
+    inputs.destination.mkdir(parents=True, exist_ok=True)
+
+    with StagingArea.for_root(inputs.destination) as stage:
+        for planned in plan:
+            _stage_one(
+                stage=stage,
+                renderer=renderer,
+                planned=planned,
+                blueprint_root=blueprint_root,
+                variables=inputs.variables.as_dict(),
+            )
+        committed = stage.commit()
+
+    ui.success(
+        f"Created {inputs.project_name!r} from {inputs.blueprint_id} "
+        f"({len(committed)} file(s))."
     )
 
 
+def _raise_safety_error(
+    findings: list[_SafetyFinding],
+    *,
+    operation: str,
+    destination: Path,
+) -> None:
+    """Translate safety findings into the CLI's error hierarchy.
+
+    ``forge.safety.errors.Finding`` is a dataclass with fields
+    ``(code, path, message, hint, root)``. The CLI's ``SafetyError``
+    and ``CollisionError`` expect a four-tuple projection
+    ``(code, path, message, hint)``. This function does that
+    translation, then raises the *correct* type based on the findings'
+    codes:
+
+    * If any finding is a collision code (``collision.exists`` or
+      ``plan.case_insensitive_duplicate``), raise
+      ``core.exceptions.CollisionError`` (exit code 6).
+    * Otherwise, raise ``core.exceptions.SafetyError`` (exit code 3).
+
+    The type is what makes the CLI handler offer ``--overwrite`` — a
+    structural safety failure never gets that hint, because the flag
+    could not help.
+
+    Note: this function imports ``forge.core.exceptions`` for its
+    output types, not its input types. ``forge.safety`` remains a
+    primitive that does not import ``forge.core`` (dependency
+    direction: primitive → nobody).
+
+    ``destination`` is accepted for parity with the finding-shape
+    contract but is not consumed here — the findings' own ``root``
+    field carries the same information, and the CLI handler renders
+    it per-finding. The parameter is kept because a future revision
+    that wanted to summarise the operation ("failed to write to
+    <destination>") would need it, and removing it now would be a
+    signature change for no gain.
+    """
+    projected = tuple((f.code, f.path, f.message, f.hint) for f in findings)
+    collision_codes = {"collision.exists", "plan.case_insensitive_duplicate"}
+    is_collision = any(f.code in collision_codes for f in findings)
+
+    if is_collision:
+        raise CoreCollisionError(findings=projected, operation=operation)
+    raise CoreSafetyError(findings=projected, operation=operation)
+
+
+def _existing_targets(plan: list[PlannedFile], root: Path) -> list[Path]:
+    """Return the absolute paths of plan destinations that exist on disk.
+
+    Uses ``lstat`` (via ``Path.exists()``'s pre-check is *not*
+    sufficient — a broken symlink would be missed). The list is
+    filtered by lstat so a broken symlink is included (it is a name
+    in use that the overwrite will replace).
+
+    Kept as a small helper (rather than inline in ``_generate``) so
+    the "what does 'existing' mean?" decision is in one place and
+    matches the safety layer's definition (``_lstat_exists``).
+    """
+    import os
+
+    existing: list[Path] = []
+    for planned in plan:
+        target = root / planned.destination
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Fail closed: treat unreadable entries as existing.
+            # A spurious backup is cheap; a missed backup is data loss.
+            pass
+        existing.append(target)
+    return existing
+
+
+# ``[no-any-unimported]`` is suppressed on the ``def`` line only. See
+# the module docstring's "Why ``_stage_one`` has a
+# ``# type: ignore[no-any-unimported]``" section for the reasoning.
+# The suppression is load-bearing for the *type checker* (which cannot
+# follow ``TemplateRenderer`` through the ``forge.rendering`` façade
+# into the ``jinja2``-gated module) but does not affect runtime
+# behaviour: the parameter is a ``TemplateRenderer`` at call time, and
+# passing anything else fails at ``.render(...)`` with a clear
+# ``AttributeError``.
+def _stage_one(  # type: ignore[no-any-unimported]
+    *,
+    stage: StagingArea,
+    renderer: TemplateRenderer,
+    planned: PlannedFile,
+    blueprint_root: Path,
+    variables: dict[str, Any],
+) -> None:
+    """Render or copy one planned file into staging.
+
+    * ``COPY`` — read bytes verbatim from the blueprint's template
+      directory and write them to staging. The bytes are *not* passed
+      through the renderer, so a template-looking file that the
+      blueprint opted out of rendering (via ``.png`` extension or
+      non-``.j2`` source) is copied byte-for-byte.
+    * ``RENDER`` — render through ``TemplateRenderer`` with the
+      resolved variables. Any ``TemplateRenderError`` is translated
+      into the CLI's error hierarchy and raised.
+
+    The blueprint root is resolved once by ``_generate`` and passed
+    in, so this function has no filesystem-touching surprises beyond
+    the two operations it performs (read source, write to staging).
+
+    ``variables`` is typed ``dict[str, Any]`` rather than a looser
+    ``dict`` because the underlying renderer consumes a mapping of
+    ``str`` to arbitrary values, and an unparameterised ``dict`` would
+    be ``dict[Any, Any]`` — which mypy strict flags as missing type
+    parameters. The dict comes from ``ResolvedValues.as_dict()``,
+    which is exactly that shape.
+    """
+    source_path = blueprint_root / planned.source
+
+    if planned.is_render:
+        result = renderer.render(source_path, variables)
+        if not result.is_ok():
+            raise _as_template_error(result.error, source=str(source_path))
+        stage.write_text(planned.destination, result.value)
+    else:
+        try:
+            data = source_path.read_bytes()
+        except OSError as exc:
+            raise FilesystemConflictError(
+                f"Could not read source file {planned.source!r} for copy: {exc}",
+                hint="Check the blueprint's file entry; the source must be readable.",
+            ) from exc
+        stage.write_bytes(planned.destination, data)
+
+
+def _as_template_error(error: _RenderError, *, source: str) -> TemplateRenderError:
+    """Translate ``forge.rendering.errors.TemplateRenderError`` to the CLI type.
+
+    The rendering-side type carries ``template``, ``line``, ``col``,
+    and ``name`` — fields the CLI's ``TemplateRenderError`` does not
+    have (it is a ``StructuredError`` with ``source`` and ``errors``).
+    This function projects them into a single ``(pointer, message)``
+    error tuple so the CLI handler can render it uniformly.
+
+    The ``source`` parameter lets the caller name the *actual template
+    path* even when the error's own ``template`` field would be the
+    same — keeping the two in sync but allowing future callers (e.g.
+    a batch renderer) to attribute errors more precisely.
+
+    The parameter type is the renderer's own ``TemplateRenderError``,
+    imported under ``TYPE_CHECKING`` as ``_RenderError``. The
+    runtime value is that class; the import is type-only so the CLI
+    does not pay for importing the full rendering error module at
+    startup (the same policy ``forge.rendering``'s façade applies to
+    the renderer itself). The name is aliased with a leading
+    underscore so the file's own ``TemplateRenderError`` (the CLI's)
+    remains the primary name in scope — a reader scanning the
+    function signature should not have to disambiguate which
+    ``TemplateRenderError`` is which.
+    """
+    pointer = ""
+    if error.line is not None:
+        pointer = f"line {error.line}"
+        if error.col is not None:
+            pointer += f", col {error.col}"
+    return TemplateRenderError(
+        source=source,
+        errors=((pointer, error.message),),
+    )
+
+
+def _blueprint_root(blueprint: Blueprint, blueprint_id: str) -> Path:
+    """Return the directory the blueprint's templates are relative to.
+
+    The blueprint's ``id`` is not itself a path; the loader resolves
+    the blueprint document from a directory whose layout is
+    ``<blueprints_root>/<blueprint_id>/blueprint.yaml``. The
+    ``_blueprint_root`` is the *directory of the manifest* — the
+    anchor for every ``source`` path in the plan.
+
+    We re-resolve it via the registry (which owns discovery), rather
+    than caching it on ``Blueprint``. The blueprint model is a pure
+    document (ADR-0007/0008); threading a filesystem path into it
+    would couple the schema to the loader's layout, which is exactly
+    the coupling the two-accessor registry design avoids for
+    ``get_blueprint`` vs ``get_blueprint_document``.
+
+    A ``DiscoveryError`` from the registry (blueprint vanished between
+    load and generate — a race) is the only failure mode here; it is
+    a filesystem conflict at the CLI boundary and is rendered with
+    exit code 3.
+    """
+    # The registry's discovery service already knows how to find a
+    # blueprint by id; reuse it rather than reimplementing the search.
+    from forge.discovery import BlueprintDiscoveryService
+
+    service = BlueprintDiscoveryService()
+    with_path = service.load_with_path(blueprint_id)
+    if with_path is None:
+        raise FilesystemConflictError(
+            f"Blueprint {blueprint_id!r} disappeared between load and generate.",
+            hint=(
+                "This is unexpected. Re-run the command; if it persists, "
+                "check whether the blueprint file was moved or deleted."
+            ),
+        )
+    path, _ = with_path
+    return path.parent
+
+
+# -----------------------------------------------------------------------------
+# Dry-run rendering (unchanged)
+# -----------------------------------------------------------------------------
 def _render_plan(
     *,
     blueprint: Blueprint,
@@ -975,21 +1059,10 @@ def _render_plan(
 ) -> None:
     """Render the plan as a human-readable listing for ``--dry-run``.
 
-    The rendering is deliberately *informational*, not authoritative:
-    the plan's authoritative form is the ``list[PlannedFile]`` that
-    the future writer consumes. This function exists so a user can
-    preview what would be written without committing to it, and its
-    shape is chosen for readability, not for machine parsing (a
-    future ``--json`` dry-run will serialise the plan directly).
-
-    Three sections, in the order a user wants to verify them:
-
-        1. **Summary** — what project, from what blueprint, to where.
-        2. **Files** — one line per planned file, sorted by destination
-           (the planner guarantees sorting, so we iterate in order and
-           the user sees the same layout the writer would produce).
-        3. **Statistics** — counts by kind, so a user glancing at a
-           long plan can see "12 render, 3 copy" at a glance.
+    Deliberately informational, not authoritative: the plan's
+    authoritative form is the ``list[PlannedFile]`` the writer
+    consumes. This rendering exists so a user can preview what would
+    be written without committing to it.
     """
     ui.section("Generation plan (dry run)")
     ui.info(f"Blueprint:   {inputs.blueprint_id}")
@@ -1010,21 +1083,7 @@ def _render_plan(
 
 
 def _as_user_input_error_from_mapping(error: MappingError, *, source: str) -> UserInputError:
-    """Convert a planner ``MappingError`` into a ``UserInputError``.
-
-    The planner's findings already carry ``path``, ``message``, and
-    ``hint`` (ADR-0015). Joining them preserves every actionable
-    detail, and the resulting exception shape matches the resolver's
-    ``UserInputError`` so the CLI handler renders planner failures
-    and resolver failures identically.
-
-    The classification (user error, not internal error) is deliberate:
-    a collision or path problem is almost always a blueprint authoring
-    mistake. The exit code that results (1) matches the exit-code
-    contract documented in the command's docstring — "user error
-    (missing required variable, invalid input, cancellation, planning
-    collision)".
-    """
+    """Convert a planner ``MappingError`` into a ``UserInputError``."""
     if not error.findings:
         return UserInputError(f"Planning failed for {source} (no details available).")
     joined = "\n  ".join(f.format() for f in error.findings)
@@ -1032,26 +1091,18 @@ def _as_user_input_error_from_mapping(error: MappingError, *, source: str) -> Us
 
 
 # -----------------------------------------------------------------------------
-# Internal result type
+# Internal result type (unchanged)
 # -----------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class _ResolvedInputs:
     """Validated, immutable inputs for the generation pipeline.
 
-    Immutability is a correctness property, not a style choice: the
-    resolved values cross the boundary between "user input collection"
-    and "filesystem mutation", and a downstream handler that could
-    mutate ``variables`` would be mutating a *validated* mapping —
-    which is precisely the invariant ``ResolvedValues`` exists to
-    protect.
-
-    ``variables`` is a ``ResolvedValues``, not a ``dict``. An earlier
-    revision annotated it as ``ResolvedValues`` while assigning a
-    plain ``dict`` — a type lie that would have let a caller mutate
-    the mapping without mypy noticing. The combined mapping
-    (resolver output + ``project_name``) is wrapped in
-    ``ResolvedValues`` before construction so the guarantee holds
-    end-to-end.
+    ``variables`` is a ``ResolvedValues``, not a ``dict``.
+    Immutability is a correctness property: the resolved values cross
+    the boundary between "user input collection" and "filesystem
+    mutation", and a downstream handler that could mutate
+    ``variables`` would be mutating a *validated* mapping — the
+    invariant ``ResolvedValues`` exists to protect.
     """
 
     blueprint_id: str
@@ -1061,8 +1112,6 @@ class _ResolvedInputs:
 
 
 # -----------------------------------------------------------------------------
-# Public re-exports
+# Public re-exports (unchanged)
 # -----------------------------------------------------------------------------
-# Only the module-level ``app`` is public. The registry mounts it;
-# everything else is an implementation detail of this command.
 __all__ = ["app"]

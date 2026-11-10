@@ -2,48 +2,46 @@ r"""Render a destination template and validate the result.
 
 This module owns exactly one thing: turning a destination *template*
 (``src/{{ name }}/main.py``) plus a variable mapping into a resolved,
-validated destination string. It composes:
+validated destination string.
 
-    * ``TemplateRenderer.render_inline`` for the substitution — the
-      same sandbox and allowlist as file bodies, so path substitution
-      gains no capability that body rendering denies.
-    * ``planning.paths._safety_check`` for the safety rules — the
-      same rules the loader applies to source paths (ADR-0015).
+It composes
+-----------
+* ``TemplateRenderer.render_inline`` — the substitution step, using the
+  same sandbox and filter allowlist as file-body rendering so path
+  substitution gains no capability that body rendering denies.
+* ``planning.paths._safety_check`` — the validation step, using the
+  same rules the loader applies to source paths (ADR-0015).
 
-The safety rules themselves live in ``planning.paths`` rather than
-here so that the *loader* can import them without pulling in the
-renderer. This module is the only place in the codebase that imports
-both the renderer and the safety rule, because it is the only place
-that *needs* both: substitution (renderer) and validation (rule). The
-loader needs only the rule; the planner needs only ``resolve()``.
+The safety rules live in ``planning.paths`` rather than here so the
+*loader* can import them without pulling in the renderer. See
+``planning/paths.py``'s docstring for the circular-import history that
+motivated the split.
 
-Why the rule is *not* defined here
-----------------------------------
-Putting ``_safety_check`` and ``is_safe_relative`` in this module
-created a circular import:
+What stays here
+---------------
+* ``resolve`` — the composed operation. The only place in the codebase
+  that needs both the renderer *and* the safety rule simultaneously.
+* ``normalise`` — the canonical form used for collision detection. It
+  is a *planner* concern (only the planner compares destinations), so
+  it does not belong in ``paths`` where the loader would inherit it
+  for no reason.
+* Re-exports of ``MAX_PATH_LENGTH`` and ``is_safe_relative`` — for
+  callers and tests that historically imported them from this module.
+  The definitions are in ``paths``; the re-exports are one line each.
 
-    loading.fs_checks → planning.destinations → rendering
-        → loading (façade) → loading.loader → loading.fs_checks
+What does *not* stay here
+-------------------------
+* The rule itself. See ``planning/paths.py``. This module re-exports
+  only what historic callers need; the *implementation* moves, the
+  *contract* does not.
+* Anything the loader needs. The loader imports ``paths`` directly;
+  the dependency graph is now:
 
-The cycle existed because ``destinations`` imports the renderer, and
-the renderer's façade imports ``forge.loading.result``, and
-``forge.loading.__init__`` imports the loader, which imports
-``fs_checks``. The rule itself has no rendering dependency, so it
-belongs in a module that has no rendering dependency. That module is
-``planning.paths``.
+      loader ──► paths          (rule)
+      planner ──► destinations ──► paths + renderer  (composition)
+                              └──► (nothing else)
 
-What this module still owns
----------------------------
-* ``resolve`` — the composed substitution + validation operation.
-* ``normalise`` — the canonical form used for collision detection
-  (see ``collisions.py``). Kept here, not in ``paths``, because it is
-  a planner concern (only the planner compares destinations); the
-  loader has no reason to normalise and moving it to ``paths`` would
-  put planner logic in a module the loader imports.
-* Re-exports of ``is_safe_relative`` and ``MAX_PATH_LENGTH`` — for
-  callers (tests, future tools) that currently import them from
-  ``planning.destinations``. The re-exports are thin; the definitions
-  live in ``planning.paths``.
+  Each module imports only what it uses. No cycles.
 """
 
 from __future__ import annotations
