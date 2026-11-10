@@ -16,7 +16,7 @@
 #
 # Usage:
 #   make            # print help
-#   make check      # run the full quality gate (lint + format + type + test + security)
+#   make check      # run the full quality gate (lint + format + type + test + security + models + adr)
 #   make fix        # auto-fix lint and format issues
 # =============================================================================
 
@@ -29,7 +29,7 @@ SHELL := bash
 .PHONY: help install sync update lock check lint format format-check type \
         test test-unit test-integration test-contract test-e2e test-security \
         test-file coverage security audit fix build clean docs pre-commit \
-        adr adr-index adr-check
+        adr adr-index adr-check models models-check
 
 # -----------------------------------------------------------------------------
 # Default target: print help.
@@ -74,7 +74,26 @@ lock: ## Regenerate uv.lock from pyproject.toml
 # -----------------------------------------------------------------------------
 # Quality gate — the one command you should always run before pushing.
 # -----------------------------------------------------------------------------
-check: lint format-check type test security adr-check ## Run the full quality gate (CI mirror)
+# The composition is deliberate and must match the CI workflow's job
+# list exactly. If a gate is added to one and not the other, local
+# `make check` and CI disagree, which is the source of "works on my
+# machine" failures that erode trust in the gate.
+#
+# The current composition:
+#
+#   lint          — Ruff, exit-non-zero-on-fix (a fix would be a diff)
+#   format-check  — Ruff format, --check (a rewrite would be a diff)
+#   type          — mypy --strict
+#   test          — pytest, with coverage gate enforced
+#   security      — Bandit + pip-audit
+#   models-check  — Pydantic models in sync with the JSON Schema
+#   adr-check     — ADR index in sync with the ADR files
+#
+# The two `*-check` targets are checks-without-writes: they fail if the
+# working tree *would* change, which is the correct semantics for a CI
+# mirror. `make adr-index` and `make models` are the write variants,
+# run manually when the user wants to update the artefacts.
+check: lint format-check type test security models-check adr-check ## Run the full quality gate (CI mirror)
 	@echo ""
 	@echo "✅ All quality gates passed."
 
@@ -96,6 +115,19 @@ type: ## Type-check with mypy (strict)
 # -----------------------------------------------------------------------------
 # Testing
 # -----------------------------------------------------------------------------
+# `test` runs every test pytest collects, which includes the adversarial
+# suite (`tests/adversarial/`). That is deliberate: the adversarial tests
+# are ordinary pytest tests and they run under `-m` filters as expected.
+# They are *also* runnable in isolation via `test-security` (below) for
+# CI jobs that want to distinguish "the safety layer's specific threats"
+# from "the rest of the suite".
+#
+# `test-security` used to point at `tests/security/`, which is a
+# directory that does not exist in this project — pytest exits with
+# code 5 ("no tests collected"), which the `|| true`-free `check` chain
+# would have caught if the target were actually wired in. It is
+# corrected here to point at `tests/adversarial/`, which is the
+# security-relevant test surface.
 test: ## Run the full test suite with coverage (the coverage gate is enforced here)
 	uv run pytest
 
@@ -111,8 +143,8 @@ test-contract: ## Run only contract tests
 test-e2e: ## Run only end-to-end tests
 	uv run pytest tests/e2e -m e2e
 
-test-security: ## Run only security tests
-	uv run pytest tests/security -m security
+test-security: ## Run only security tests (the adversarial suite)
+	uv run pytest tests/adversarial -v
 
 test-file: ## Run a single test file without the coverage gate (usage: make test-file FILE=tests/unit/core/test_version.py)
 	@if [ -z "$(FILE)" ]; then \
@@ -223,14 +255,36 @@ adr-check: ## Verify the ADR index is up to date (CI gate — fails on drift)
 	fi
 	@echo "✅ ADR index is up to date."
 
+# -----------------------------------------------------------------------------
+# Pydantic model generation
+# -----------------------------------------------------------------------------
+# `scripts/generate_models.py` regenerates `src/forge/models/blueprint.py`
+# from `src/forge/schemas/blueprint.schema.json`. It is the anti-drift
+# mechanism for the schema↔model parity test (see
+# `tests/unit/models/test_schema_model_parity.py` and ADR-0008).
+#
+# `models` writes the regenerated file (run after editing the schema).
+# `models-check` verifies the on-disk file matches what the script would
+# produce — it exits 1 if there is a diff, which is what CI and
+# `make check` use as the gate.
+#
+# The `PY` variable allows overriding the interpreter (e.g. `make models
+# PY=python3`), and defaults to `uv run python` so the invocation is
+# consistent with the rest of the Makefile.
 PY ?= uv run python
 
-.PHONY: models models-check
-models:
+models: ## Regenerate Pydantic models from the JSON Schema (writes changes)
 	$(PY) scripts/generate_models.py
+	@echo "✅ Models regenerated. Review with 'git diff' before committing."
 
-models-check:
-	$(PY) scripts/generate_models.py --check
+models-check: ## Verify Pydantic models are in sync with the JSON Schema (CI gate)
+	@if ! $(PY) scripts/generate_models.py --check; then \
+		echo "" >&2; \
+		echo "❌ Pydantic models are stale." >&2; \
+		echo "   Run 'make models' to regenerate them, then re-stage and commit." >&2; \
+		exit 1; \
+	fi
+	@echo "✅ Models in sync with schema."
 
 # -----------------------------------------------------------------------------
 # Cleanup
