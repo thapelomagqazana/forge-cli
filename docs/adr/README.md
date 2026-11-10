@@ -24,6 +24,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0012](0012-cli-output-is-a-versioned-dto-consumed-by-pluggable-renderer.md) | CLI Output Is a Versioned DTO Consumed by Pluggable Renderers | Accepted | 2026-11-09 |
 | [0013](0013-exit-codes-are-a-public-contract-forge-validate-uses-typed-d.md) | Exit Codes Are A Public Contract Forge Validate Uses Typed D | — | — |
 | [0014](0014-templates-render-in-a-sandboxed-strictly-undefined-determini.md) | Templates Render in a Sandboxed, Strictly-Undefined, Deterministic Environment with a Documented Filter Allowlist | Accepted | 2026-11-10 |
+| [0015](0015-planning-is-a-pure-total-function-destination-paths-have-one.md) | Planning Is a Pure, Total Function; Destination Paths Have One Resolver and One Safety Net | Accepted | 2026-11-10 |
 
 ## Creating a new ADR
 

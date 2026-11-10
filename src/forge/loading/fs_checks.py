@@ -24,15 +24,27 @@ failures, we get three properties that matter operationally:
 
 What is checked
 ---------------
-For every file the blueprint declares, three conditions must hold:
+For every file the blueprint declares, four conditions must hold:
+
+    * **Safe** — the reference is a syntactic path that cannot escape
+      the blueprint directory. `planning.paths.is_safe_relative` is the
+      single definition of this rule (ADR-0015); the loader delegates
+      to it rather than re-implementing the checks. This is what "one
+      safety net" means in practice: a rule cannot be fixed in one
+      place and forgotten in the other.
 
     * **Contained** — the resolved template path stays inside the
-      blueprint's own directory. A blueprint that points at
-      `../../etc/passwd` is a security problem, not just a
-      configuration one; we refuse it explicitly rather than letting
-      the renderer read arbitrary files.
+      blueprint's own directory. This is *not* the same check as
+      "safe": a lexically-safe path can still resolve outside the root
+      if a symlink points out. `Path.resolve()` + `relative_to` is what
+      catches that case. The two checks together are defence in depth —
+      the lexical check gives a precise message for the common
+      `../` mistake, and the resolved check catches symlink
+      escapes that the lexical check cannot see.
+
     * **Exists** — the path names an actual file (not a directory,
       not a dangling symlink).
+
     * **Readable** — the CLI can open it. A file that exists but is
       mode `000` would fail during rendering; better to catch it here
       with a message that names permissions as the cause.
@@ -74,6 +86,37 @@ in a hypothetical monorepo layout. The check lives here, at the point
 where the path is *interpreted*, so the security boundary is where the
 filesystem access happens.
 
+Two layers exist for two distinct threats:
+
+    * **Lexical safety** (`is_safe_relative`) rejects `..` segments,
+      absolute paths, empty segments, NUL bytes, and control characters
+      *before* touching the filesystem. It is cheap, it produces a
+      precise message that names the syntactic problem, and it does not
+      depend on the resolution behaviour of the host filesystem. This
+      is the primary user-facing check.
+
+    * **Resolved containment** (`relative_to`) rejects any path that
+      resolves to a location outside the blueprint root, *including*
+      the symlink case the lexical check cannot detect. This is the
+      primary security check, and it runs only after the path has
+      already passed lexical safety — so its error means something
+      subtle happened (a symlink, a case-folding quirk), not a
+      user typo.
+
+Both are required. Removing either would leave a real gap:
+
+    * Without `is_safe_relative`, a path like `../../etc/passwd` would
+      be caught by containment, but the error message would be the
+      generic "escapes the blueprint directory" rather than the more
+      actionable "may not contain '..' segments" that names the
+      syntactic problem. The lexical check gives the user a shorter
+      path to the fix.
+
+    * Without containment, a path like `templates/evil.j2` where
+      `templates` is a symlink to `/etc` would pass the lexical check
+      and then read `/etc/evil.j2`. The containment check is what
+      closes that hole.
+
 `Path.relative_to` is used (rather than string prefix comparison)
 because it handles all the edge cases correctly on case-insensitive
 filesystems, handles normalisation, and raises `ValueError` for the
@@ -86,6 +129,14 @@ callers want every filesystem problem in the batch, not just the first.
 So `check_templates` walks every declared file in every declared
 location and accumulates errors, returning the full list. An empty list
 means success.
+
+A single entry produces at most one error. The check order
+(safe → contained → exists → readable) is chosen so that the *first*
+thing that can go wrong is what the user is told about. Running the
+existence check on a path we have already refused to read would be
+wasted work, and reporting both "escapes directory" and "file missing"
+for the same entry would be confusing — the entry has one problem and
+one fix.
 
 Why `files` and `conditional_files` are handled together
 --------------------------------------------------------
@@ -116,6 +167,39 @@ from pathlib import Path
 
 from forge.loading.errors import ValidationError
 from forge.models import Blueprint
+
+# Import the shared safety rule from `planning.paths` rather than
+# re-implementing it here. ADR-0015 mandates exactly one definition of
+# "is this path safe?" across the codebase; the loader and the planner
+# are the two callers that must agree. A previous version of this
+# module re-implemented the check inline, and the two drifted (the
+# planner rejected NUL bytes, the loader did not) — the kind of
+# divergence that produces a blueprint that validates but cannot be
+# planned. Delegation makes that class of bug impossible.
+#
+# Why `planning.paths` and not `planning.destinations`:
+#
+# `is_safe_relative` used to live in `planning.destinations`, alongside
+# `resolve()`. That module imports `TemplateRenderer`, which imports
+# the rendering façade, which imports `forge.loading.result`, which
+# triggers `forge.loading.__init__`, which imports `BlueprintLoader`,
+# which imports *this module*. The cycle was:
+#
+#     loading.fs_checks → planning.destinations → rendering
+#         → loading → loading.loader → loading.fs_checks
+#
+# which failed at import time with "cannot import name
+# 'is_safe_relative' from partially initialized module".
+#
+# The rule itself has no rendering dependency; only `resolve()` does.
+# Splitting them so the rule lives in a module with no rendering
+# dependency (`planning.paths`) and the composition lives in a module
+# that needs both (`planning.destinations`) breaks the cycle at the
+# correct seam: the loader depends on the *rule*, not on the
+# planner's composition machinery. `planning.paths` imports only
+# `forge.planning.errors` (a pure dataclass module) and stdlib, so
+# nothing this module imports can cycle back into it.
+from forge.planning.paths import is_safe_relative
 
 
 def check_templates(
@@ -157,11 +241,11 @@ def check_templates(
     order; users read errors in the order their file declares the
     references, which matches how they will fix them.
 
-    A single `files` entry can produce at most one error (containment
-    failure precludes existence/readability checks, since they would
-    be checking a path we have already refused). This keeps the report
-    proportional to the number of distinct problems, not the number of
-    checks.
+    A single `files` entry can produce at most one error (lexical
+    safety failure precludes containment, existence, and readability
+    checks; each subsequent check only runs if the previous passed).
+    This keeps the report proportional to the number of distinct
+    problems, not the number of checks.
     """
     errors: list[ValidationError] = []
 
@@ -200,48 +284,85 @@ def _check_one(
 ) -> None:
     """Validate a single template reference, appending errors to `sink`.
 
-    Extracted so the containment, existence, and readability checks live
-    in one place and are exercised identically for static and conditional
-    files. The `sink` pattern (rather than returning a list) keeps the
-    caller readable: it is a sequence of `_check_one(...)` calls, not a
-    sequence of `errors.extend(...)` calls with intermediate variables.
+    Extracted so the safety, containment, existence, and readability
+    checks live in one place and are exercised identically for static
+    and conditional files. The `sink` pattern (rather than returning a
+    list) keeps the caller readable: it is a sequence of
+    `_check_one(...)` calls, not a sequence of `errors.extend(...)` calls
+    with intermediate variables.
+
+    Check order (each short-circuits on failure):
+
+        1. Lexical safety — cheap, no filesystem access, catches typos
+           and absolute paths before we try to resolve anything.
+        2. Resolved containment — catches symlink escapes that lexical
+           safety cannot see.
+        3. Existence — is there actually a file at the resolved path?
+        4. Readability — can the CLI open it?
+
+    Ordering is chosen so that the first failure the user sees is the
+    one that, once fixed, will most likely make the rest of the checks
+    pass — an entry that fails safety cannot meaningfully fail
+    "readable" in a way that helps the user.
     """
     # ------------------------------------------------------------------
-    # Resolve both paths once.
+    # Layer 1: lexical safety.
     #
-    # Resolving the root every iteration is wasted work in a batch of
-    # dozens of files. Resolving the candidate is required for both the
-    # containment check and the existence check, so we do it up front.
+    # Delegated to `is_safe_relative` so the loader and the planner
+    # apply *identical* rules — this is what "one safety net" (ADR-0015)
+    # means in code. The rules include: no absolute paths, no `..`/`.`
+    # segments, no empty segments, no NUL bytes or control characters,
+    # length within bounds.
     #
-    # `strict=False` (the default) means a broken symlink resolves to its
-    # declared target — which then fails `is_file()`. That is the correct
-    # behaviour: we want to report "missing template" rather than
-    # propagate a `RuntimeError` from `resolve()`.
+    # We report the check as "not safe" rather than enumerating which
+    # specific rule failed, because the shared function returns a
+    # boolean and threading the specific finding through would require
+    # this module to know about `Finding`, which is the planner's error
+    # type, not the loader's. The hint names the most common cause
+    # (traversal) and points at the reference; the user fixes it in one
+    # pass either way.
+    # ------------------------------------------------------------------
+    if not is_safe_relative(relpath):
+        sink.append(
+            ValidationError(
+                path=path_prefix,
+                message=f"template path is not safe: {relpath!r}",
+                hint=(
+                    "Template paths must be relative, must not contain "
+                    "'..' or '.' segments, and must not be absolute. "
+                    "Reference only files inside the blueprint's own "
+                    "folder."
+                ),
+                source=source,
+            )
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # Layer 2: resolved containment.
+    #
+    # `is_safe_relative` passed, so the path is lexically well-formed.
+    # But the filesystem can turn a safe-looking path into an escape:
+    # `templates/evil.j2` where `templates` is a symlink to `/etc`.
+    # `resolve()` follows symlinks, and `relative_to` fails if the
+    # resolved target is outside the root.
+    #
+    # We resolve the root every iteration rather than once, because the
+    # cost is negligible at blueprint scale (a dozen files) and passing
+    # a pre-resolved root around would make the function signature
+    # misleading — callers would wonder which form they should pass.
+    # Resolving here is cheap, correct, and self-documenting.
     # ------------------------------------------------------------------
     root_resolved = blueprint_root.resolve()
     candidate = (blueprint_root / relpath).resolve()
 
-    # ------------------------------------------------------------------
-    # Containment check.
-    #
-    # `relative_to` raises `ValueError` if `candidate` is not under
-    # `root_resolved`. This catches:
-    #   * `../` traversal,
-    #   * absolute paths that happen to fall outside the root,
-    #   * symlinks pointing outside the root (because we resolved).
-    #
-    # We do NOT report "path escape" for the trivial case
-    # `candidate == root_resolved` — that would mean a file reference
-    # pointing at the blueprint directory itself, which is invalid
-    # (it is not a file) but is better reported as "not a file" below.
-    # ------------------------------------------------------------------
     try:
         candidate.relative_to(root_resolved)
     except ValueError:
         sink.append(
             ValidationError(
                 path=path_prefix,
-                message=(f"template path escapes the blueprint directory: " f"{relpath!r}"),
+                message=f"template path escapes the blueprint directory: {relpath!r}",
                 hint=(
                     "Reference only files inside the blueprint's own "
                     "folder. To share a template, copy it into the "
@@ -253,7 +374,7 @@ def _check_one(
         return
 
     # ------------------------------------------------------------------
-    # Existence check.
+    # Layer 3: existence.
     #
     # `is_file()` (not `exists()`) because a directory at the target
     # path is just as unusable as a missing file, and its message would
@@ -282,7 +403,7 @@ def _check_one(
         return
 
     # ------------------------------------------------------------------
-    # Readability check.
+    # Layer 4: readability.
     #
     # `os.access` is technically racy (permissions can change between
     # the check and the read) and on some platforms it reflects real

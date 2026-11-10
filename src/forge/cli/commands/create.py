@@ -3,8 +3,8 @@
 This command is the primary entry point for project generation. It
 takes a blueprint ID (e.g., ``python.fastapi.api``), resolves it from
 the discovered blueprints, resolves the variables (from CLI flags,
-interactive prompts, or blueprint defaults), runs the generation
-pipeline (staging → validation → commit), and renders a summary.
+interactive prompts, or blueprint defaults), plans the file manifest,
+and — once the writer lands — commits the project atomically.
 
 Dual-mode input handling
 ------------------------
@@ -123,8 +123,8 @@ have different needs:
 * ``get_blueprint_document(blueprint_id) -> Blueprint`` — the
   loaded, schema-validated, model-validated document. That is what
   any caller that *does something with* the blueprint needs:
-  resolving variables (here), rendering templates (future),
-  verifying checks (future).
+  resolving variables (here), planning files (here), rendering
+  templates (future), verifying checks (future).
 
 ``create`` needs the second. An earlier revision of this file called
 ``get_blueprint`` (the entry accessor) and then tried to reach
@@ -168,9 +168,9 @@ The flow is:
 value against its ``VariableDefinition`` (type coercion, pattern,
 enum, named validators). Its output type ``ResolvedValues`` is
 immutable and resolver-owned, so downstream code (the renderer, the
-generator) can require it in their signatures and be confident that
-unvalidated input never reaches them — the KPI this command exists
-to deliver.
+planner, the generator) can require it in their signatures and be
+confident that unvalidated input never reaches them — the KPI this
+command exists to deliver.
 
 The command does not call ``validate_blueprint_inputs`` any more.
 The blueprint itself is validated by the *loader* when it is fetched
@@ -178,7 +178,35 @@ The blueprint itself is validated by the *loader* when it is fetched
 to ``BlueprintLoader.load``, ADR-0010), so the document is already
 schema- and model-valid by the time this command sees it.
 
-Why ``create`` does not import the loader
+Planning — where the plan comes from
+-----------------------------------
+``forge.planning.FileMapper`` (ADR-0015) turns the resolved variables
+and the blueprint's ``files[]`` / ``conditional_files[]`` into a
+sorted, deduplicated ``list[PlannedFile]``. The planner is pure, total,
+and tested independently of this command; this command's job is to
+*invoke* it and hand the resulting plan to the next phase.
+
+There are two use sites, one for each mode:
+
+- **``--dry-run``** — the plan is rendered as a human-readable
+  listing. Nothing is written. A plan that reports collisions or
+  path problems is shown with those problems, because a dry run's
+  job is to surface them, not to hide them behind a green check.
+
+- **Non-dry-run** — the plan is handed to ``_generate``'s writer
+  hand-off, which is still a later task. The command therefore does
+  *not* silently no-op: it builds the plan (which exercises the
+  planner's guarantees against real input), and then raises a clear
+  ``NotImplementedError`` explaining that only the writer is missing.
+  A no-op would look like success to a script; a plan-then-fail is
+  honest about what is and is not complete.
+
+Planning failures surface as a ``UserInputError`` whose message is the
+planner's aggregated ``MappingError`` rendering, which already includes
+per-finding hints. Exit code is 1 (user error) because a collision is
+almost always a blueprint authoring problem, not an internal bug.
+
+Why the command does not import the loader
 -----------------------------------------
 The loader is a discovery-layer concern (ADR-0010). ``create``
 should not know how a blueprint document is obtained, only that it
@@ -212,6 +240,7 @@ from forge.core.exceptions import (
 from forge.loading.errors import ValidationError
 from forge.loading.result import Err
 from forge.models import Blueprint, VariableDefinition
+from forge.planning import FileMapper, MappingError, PlannedFile
 from forge.resolution import ResolvedValues, VariableResolver
 from forge.resolution.names import NAMED_VALIDATORS
 
@@ -325,23 +354,28 @@ def create(
 
     - 0 — Project created successfully (or dry-run completed).
     - 1 — User error (missing required variable, invalid input,
-      cancellation).
+      cancellation, planning collision).
     - 2 — Blueprint error (not found, invalid, incompatible).
-    - 3 — Filesystem conflict (collision, permission denied).
+    - 3 — Filesystem conflict (destination exists, permission denied).
     - 5 — Internal error (unexpected exception).
 
     The ``--json`` flag will be added in the JSON output task, not
     here. This command does not declare it yet, so the flag's absence
     is not a breaking change when it lands.
     """
-    inputs = _resolve_variables(
+    blueprint_document, inputs = _resolve_variables(
         blueprint_id=blueprint,
         cli_name=name,
         cli_vars=_parse_var_flags(var),
         output=output,
         no_interactive=no_interactive,
     )
-    _generate(inputs, dry_run=dry_run, overwrite=overwrite)
+    _generate(
+        blueprint=blueprint_document,
+        inputs=inputs,
+        dry_run=dry_run,
+        overwrite=overwrite,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -392,8 +426,17 @@ def _resolve_variables(
     cli_vars: dict[str, str],
     output: Path,
     no_interactive: bool,
-) -> _ResolvedInputs:
+) -> tuple[Blueprint, _ResolvedInputs]:
     """Collect user input and resolve it through the variable resolver.
+
+    Returns *both* the loaded blueprint document and the resolved inputs.
+    The caller needs both: the resolver validates *against* the
+    blueprint's variable definitions, and the planner (invoked later,
+    in ``_generate``) needs the blueprint's ``files[]`` and
+    ``conditional_files[]`` to build the plan. Returning them together
+    makes the coupling explicit and prevents ``_generate`` from
+    re-fetching the document — which would re-run validation for no
+    benefit and could disagree with the document the wizard saw.
 
     Two modes, one resolver for *blueprint variables*, one explicit
     handling of the *project name* (a command argument, not a variable):
@@ -426,7 +469,8 @@ def _resolve_variables(
         no_interactive: ``True`` if the user passed ``--no-interactive``.
 
     Returns:
-        A validated, immutable ``_ResolvedInputs`` ready for generation.
+        ``(blueprint_document, resolved_inputs)`` — both immutable,
+        both needed downstream.
 
     Raises:
         MissingRequiredFlagsError: Non-interactive mode, missing
@@ -525,12 +569,13 @@ def _resolve_variables(
     combined = dict(result.value.as_dict())
     combined["project_name"] = project_name
 
-    return _ResolvedInputs(
+    inputs = _ResolvedInputs(
         blueprint_id=blueprint.id,
         project_name=project_name,
         destination=output / project_name,
         variables=ResolvedValues(MappingProxyType(combined)),
     )
+    return blueprint, inputs
 
 
 def _validate_project_name(value: str) -> None:
@@ -684,66 +729,184 @@ def _prompt_validator_for(named: str) -> prompts.Validator:
 # Generation hand-off
 # -----------------------------------------------------------------------------
 def _generate(
-    inputs: _ResolvedInputs,
     *,
+    blueprint: Blueprint,
+    inputs: _ResolvedInputs,
     dry_run: bool,
     overwrite: bool,
 ) -> None:
-    """Run the generation pipeline.
+    """Build the plan, then hand it to the writer (or render it in dry run).
 
-    Kept as a separate function so tests can monkeypatch it to assert
-    on the resolved inputs without exercising the filesystem. The
-    real implementation lands in the generation-pipeline task; this
-    version fails loudly with a TODO so it cannot be mistaken for a
-    working generator.
+    The plan is built via ``forge.planning.FileMapper`` (ADR-0015), which
+    is pure, total, and independently tested. This function's job is to
+    invoke it with the right inputs, translate its failures into the
+    command layer's error types, and — depending on ``dry_run`` — either
+    render the plan or hand it to the writer.
+
+    The writer itself is a later task. The non-dry path therefore ends
+    with a clear ``NotImplementedError`` rather than a silent no-op.
+    Two reasons:
+
+        1. **A silent no-op looks like success to a script.** A CI job
+           that runs ``forge create ...`` would exit 0 and produce no
+           directory, which is impossible to debug without reading the
+           source. A loud failure names the missing phase.
+        2. **The plan is real work.** Building it exercises the planner
+           against real input, which means the dry-run path and the
+           future write path share the exact same planning code. If
+           the plan fails (collisions, path problems), the user learns
+           *now*, in the same phase they would learn it with a writer
+           present.
 
     Args:
-        inputs: Validated inputs from ``_resolve_variables``.
-        dry_run: If ``True``, print the plan and exit without writing.
-        overwrite: If ``True``, allow overwriting existing files.
+        blueprint: The loaded, validated document. Provides ``files[]``
+            and ``conditional_files[]`` to the planner.
+        inputs: Validated, immutable inputs from ``_resolve_variables``.
+        dry_run: If ``True``, render the plan and return without writing.
+        overwrite: If ``True``, allow overwriting existing files. Checked
+            here as a pre-flight for the future writer; the writer will
+            re-check at commit time because files can appear between
+            the pre-flight and the commit.
 
     Raises:
+        UserInputError: The planner found one or more problems (collisions,
+            unsafe paths, empty substitutions). The message is the
+            planner's aggregated rendering, with per-finding hints.
         FilesystemConflictError: The destination exists and
             ``overwrite`` is ``False`` *and* this is not a dry run.
+        NotImplementedError: The writer is a later task and is not yet
+            wired in. Raised only for the non-dry path, after the plan
+            has been built successfully.
     """
-    # The pre-flight conflict check is skipped for dry runs. A dry
-    # run is a *plan*, not a *commit*; refusing to render the plan
-    # because the target is occupied prevents the user from ever
-    # seeing what would be blocked — which defeats the purpose of
-    # asking for the plan. The future plan output will list the
-    # conflict explicitly; today it just prints the intended
-    # destination and lets the user infer the conflict.
+    # ------------------------------------------------------------------
+    # 1. Build the plan.
     #
-    # For a non-dry run, the check is a pre-flight — the pipeline
-    # re-checks at commit time, because files can appear between the
-    # pre-flight and the commit.
-    if not dry_run and inputs.destination.exists() and not overwrite:
+    # The planner requires the resolved *blueprint variables*. The
+    # project name is a command argument, not a blueprint variable, so
+    # we do NOT pass it here — the planner substitutes it only if the
+    # blueprint declared it, which would be unusual but legal. This is
+    # consistent with the resolver's contract: only what the blueprint
+    # declares flows through the variable pipeline.
+    # ------------------------------------------------------------------
+    plan_result = FileMapper().map(blueprint, inputs.variables.as_dict())
+    if isinstance(plan_result, Err):
+        # The planner aggregated every finding (collisions, unsafe
+        # paths, empty substitutions) into one ``MappingError``. Route
+        # it through the same ``UserInputError`` channel the resolver
+        # uses so the CLI handler renders it identically, and the exit
+        # code is 1 (user error), which is the correct classification
+        # — a collision or path problem is almost always a blueprint
+        # authoring mistake, not an internal bug.
+        raise _as_user_input_error_from_mapping(
+            plan_result.error, source=f"blueprint:{inputs.blueprint_id}"
+        )
+    plan: list[PlannedFile] = plan_result.value
+
+    # ------------------------------------------------------------------
+    # 2. Dry-run: render the plan, do not write.
+    #
+    # A dry run is a *plan*, not a *commit*; refusing to render the
+    # plan because the destination is occupied prevents the user from
+    # ever seeing what would be blocked — which defeats the purpose
+    # of asking for the plan. The rendering names the destination and
+    # lets the user see the intended layout; the pre-flight conflict
+    # check below is skipped for dry runs for this reason.
+    # ------------------------------------------------------------------
+    if dry_run:
+        _render_plan(blueprint=blueprint, inputs=inputs, plan=plan)
+        return
+
+    # ------------------------------------------------------------------
+    # 3. Non-dry-run: pre-flight conflict check, then writer hand-off.
+    #
+    # The pre-flight check is *not* the commit-time check — the writer
+    # will re-check because files can appear between this line and the
+    # commit. But a pre-flight catches the common case (destination
+    # directory exists) before the user waits on the planner output
+    # being discarded, and it produces the correct exit code (3)
+    # rather than letting the writer raise a less-specific error.
+    # ------------------------------------------------------------------
+    if inputs.destination.exists() and not overwrite:
         raise FilesystemConflictError(
             f"Destination {str(inputs.destination)!r} already exists.",
             hint="Choose a different --output, or pass --overwrite.",
         )
 
-    if dry_run:
-        ui.section("Generation plan (dry run)")
-        ui.info(f"Blueprint:   {inputs.blueprint_id}")
-        ui.info(f"Name:        {inputs.project_name}")
-        ui.info(f"Destination: {inputs.destination}")
-        if len(inputs.variables):
-            ui.info("Variables:")
-            for key in sorted(inputs.variables):
-                ui.info(f"  {key} = {inputs.variables[key]}")
-        return
-
-    # TODO: call into ``forge.generation.scaffold_project`` once the
-    # generation pipeline lands. Until then, this command cannot
-    # silently no-op — a no-op would look like success to a script
-    # and produce an empty directory the user cannot debug. Raise a
-    # clear internal error so the missing implementation is loud.
+    # TODO: call into ``forge.generation.scaffold_from_plan`` once the
+    # writer lands. The plan is complete and correct; only the commit
+    # phase is missing. Raising here is deliberate — a silent no-op
+    # would look like success to a script and produce an empty
+    # directory the user cannot debug.
     raise NotImplementedError(
-        "The generation pipeline is not yet implemented. "
-        "This command is wired for dual-mode input handling only; "
-        "see the generation-pipeline task for the scaffold hand-off."
+        "The generation writer is not yet implemented. "
+        "The plan was built successfully "
+        f"({len(plan)} file(s) planned); only the commit phase is missing. "
+        "See the generation-pipeline task for the scaffold hand-off."
     )
+
+
+def _render_plan(
+    *,
+    blueprint: Blueprint,
+    inputs: _ResolvedInputs,
+    plan: list[PlannedFile],
+) -> None:
+    """Render the plan as a human-readable listing for ``--dry-run``.
+
+    The rendering is deliberately *informational*, not authoritative:
+    the plan's authoritative form is the ``list[PlannedFile]`` that
+    the future writer consumes. This function exists so a user can
+    preview what would be written without committing to it, and its
+    shape is chosen for readability, not for machine parsing (a
+    future ``--json`` dry-run will serialise the plan directly).
+
+    Three sections, in the order a user wants to verify them:
+
+        1. **Summary** — what project, from what blueprint, to where.
+        2. **Files** — one line per planned file, sorted by destination
+           (the planner guarantees sorting, so we iterate in order and
+           the user sees the same layout the writer would produce).
+        3. **Statistics** — counts by kind, so a user glancing at a
+           long plan can see "12 render, 3 copy" at a glance.
+    """
+    ui.section("Generation plan (dry run)")
+    ui.info(f"Blueprint:   {inputs.blueprint_id}")
+    ui.info(f"Name:        {inputs.project_name}")
+    ui.info(f"Destination: {inputs.destination}")
+    ui.info("")
+
+    ui.section(f"Files ({len(plan)})")
+    for planned in plan:
+        marker = "render" if planned.is_render else "  copy"
+        ui.info(f"  [{marker}] {planned.destination}")
+        ui.info(f"           ← {planned.source}")
+
+    ui.info("")
+    render_count = sum(1 for p in plan if p.is_render)
+    copy_count = sum(1 for p in plan if p.is_copy)
+    ui.info(f"Summary: {render_count} rendered, {copy_count} copied")
+
+
+def _as_user_input_error_from_mapping(error: MappingError, *, source: str) -> UserInputError:
+    """Convert a planner ``MappingError`` into a ``UserInputError``.
+
+    The planner's findings already carry ``path``, ``message``, and
+    ``hint`` (ADR-0015). Joining them preserves every actionable
+    detail, and the resulting exception shape matches the resolver's
+    ``UserInputError`` so the CLI handler renders planner failures
+    and resolver failures identically.
+
+    The classification (user error, not internal error) is deliberate:
+    a collision or path problem is almost always a blueprint authoring
+    mistake. The exit code that results (1) matches the exit-code
+    contract documented in the command's docstring — "user error
+    (missing required variable, invalid input, cancellation, planning
+    collision)".
+    """
+    if not error.findings:
+        return UserInputError(f"Planning failed for {source} (no details available).")
+    joined = "\n  ".join(f.format() for f in error.findings)
+    return UserInputError(f"Planning failed for {source}:\n  {joined}")
 
 
 # -----------------------------------------------------------------------------

@@ -121,18 +121,45 @@ CheckId = Annotated[
 ]
 
 # ``source`` and ``destination`` share a path-safety constraint in the
-# schema: relative, no leading slash, no ``..`` segment. Keeping them as
-# one alias makes it obvious that the two fields are governed by the same
-# rule — a change to path safety is a one-line edit.
+# schema: relative, no leading separator, no ``..`` segment, no Windows
+# drive-letter prefix. Keeping them as one alias makes it obvious that
+# the two fields are governed by the same rule — a change to path safety
+# is a one-line edit here, not two.
 #
-# The negative lookahead ``(?!...)`` is the reason ``regex_engine`` is
-# set to ``python-re`` on ``_BlueprintModel``: the default engine (Rust
+# The pattern is deliberately platform-independent. An earlier version
+# only checked ``/``, which left Windows-style absolute paths
+# (``C:\Users\x``, ``\\Windows\system32\x``) accepted by the model — a
+# real safety gap that `test_path_traversal.py` surfaced with four
+# failing cases. The current pattern treats ``\`` as a separator
+# uniformly, because:
+#
+#   * Blueprints authored on Windows contain ``\`` separators, and the
+#     schema does not (and cannot) forbid them.
+#   * A path that is absolute on *one* platform and relative on another
+#     is not safe by either platform's standards — the same blueprint
+#     must behave the same way everywhere.
+#   * ``planning.paths.is_safe_relative`` already checks both
+#     separators; aligning the model with the runtime check is what
+#     removes the divergence between the two checkpoints.
+#
+# The three negative lookaheads, in order:
+#
+#     (?![\\/])              must not begin with ``/`` or ``\``
+#                            (POSIX and Windows absolute-path forms)
+#     (?!.*:(?:[\\/]|$))     must not contain a drive letter
+#                            (``C:\``, ``C:/``, ``C:`` at end of string)
+#     (?!.*\.\.(?:[\\/]|$))  must not contain a ``..`` segment, where a
+#                            segment is terminated by either separator
+#                            or end of string
+#
+# The negative lookaheads are the reason ``regex_engine`` is set to
+# ``python-re`` on ``_BlueprintModel``: the default engine (Rust
 # ``regex``) does not support lookarounds and would silently fail to
 # enforce this pattern.
 SafeRelativePath = Annotated[
     str,
     StringConstraints(
-        pattern=r"^(?!/)(?!.*\.\.(?:/|$)).+$",
+        pattern=r"^(?![\\/])(?!.*:(?:[\\/]|$))(?!.*\.\.(?:[\\/]|$)).+$",
         min_length=1,
         max_length=400,
     ),
@@ -255,7 +282,10 @@ class FileEntry(_BlueprintModel):
 
     Both paths are relative and must not escape the blueprint or project
     root; path traversal is rejected at parse time so scaffolding can
-    trust these values as-is.
+    trust these values as-is. The rejection is *platform-independent*:
+    ``C:\\Users\\x`` and ``\\\\Windows\\x`` are rejected on POSIX and
+    Windows alike, because a blueprint must behave identically on every
+    host.
     """
 
     source: SafeRelativePath
