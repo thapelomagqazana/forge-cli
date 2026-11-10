@@ -9,14 +9,30 @@ These tests cover the acceptance criteria of Task 1.1.6 directly:
 4. The wizard validates input in real-time.
 5. The wizard allows cancellation (Ctrl+C) and exits cleanly.
 
-The generation pipeline is stubbed (``NotImplementedError``) and
-intentionally not exercised here — testing that the command fails
-with ``NotImplementedError`` after validation is a property of the
-pipeline task, not of the input handling. What these tests assert is
-that the *input handling* works correctly in both modes. The one
-place the pipeline is stubbed (``_generate``) is because the test
-wants to inspect the *inputs* the pipeline would receive, not the
-pipeline itself.
+The generation pipeline is not stubbed here — the tests for it exercise
+the *real* pipeline (plan → safety → backup → staging → commit). An
+earlier version of the ``TestGeneratePreFlight`` class stubbed the
+writer with ``NotImplementedError`` and asserted the pre-flight
+directory check. Both reflected a pipeline that did its own
+collision detection and then hit a stub. That contract is gone: the
+safety layer owns collision detection (ADR-0017), and the writer is
+the staging-and-commit pipeline. The tests now pin the *new* contract
+— ``CollisionError`` (exit code 6) for collisions, and a timestamped
+backup for every overwritten file.
+
+The rest of the file still tests *input handling* in isolation, for
+the reasons below. The two concerns are separated by test class:
+
+- ``TestDispatch`` and the interactive/non-interactive classes
+  exercise ``_resolve_variables`` and the parser — the input side.
+- ``TestGeneratePreFlight`` exercises the safety layer's contract
+  through ``_generate`` — the pipeline side.
+
+The one place input handling fakes a boundary is ``_generate`` in
+``capture_generate``: those tests want to inspect the *inputs* the
+pipeline would receive, not the pipeline itself. That remains the
+correct shape — the test is about what flows *into* the pipeline,
+not what the pipeline does with it.
 
 Test design
 -----------
@@ -108,18 +124,13 @@ boundary means:
 
 The fixture's *return shape* is the loaded ``Blueprint``, not a
 ``BlueprintEntry``. That is the shape ``get_blueprint_document``
-returns, and it is what the resolver consumes. An earlier revision
-had fixtures returning a fake ``BlueprintEntry``-shaped object;
-that shape stopped being correct when the command started requiring
-the document, and the tests had to move with it.
+returns, and it is what the resolver consumes.
 
 A test that fakes *both* the input and the output of the thing it is
-testing is testing itself. So the resolver is **not** faked here — it
-is a pure function, the tests already control every input it sees,
-and letting it run is the only way to prove it is actually wired up.
-The one fake is ``_generate``, which is the boundary to the
-unimplemented pipeline; faking it is honest because the test is not
-about generation.
+testing is testing itself. So the resolver is **not** faked in the
+resolution tests — it is a pure function, the tests already control
+every input it sees, and letting it run is the only way to prove it
+is actually wired up.
 
 Why some tests do not assert on ``result.output``
 -------------------------------------------------
@@ -163,6 +174,46 @@ to accept a shape it was designed to reject. The helper
 ``_resolved_inputs(...)`` below is that fix, and its existence is
 the constant reminder: fake the *boundary*, not the *type*.
 
+The pipeline boundary: two ``blueprint_root`` fixtures
+------------------------------------------------------
+``_generate`` re-resolves the blueprint's manifest directory via
+``create_module._blueprint_root``, which calls
+``BlueprintDiscoveryService.load_with_path``. Discovery is not what
+the ``TestGeneratePreFlight`` tests are about — they are about the
+safety layer's collision and backup contract. Patching
+``_blueprint_root`` at its definition site is the honest boundary:
+the test says "assume the blueprint root is here" and exercises
+everything downstream of that assumption (the planner, the safety
+layer, the staging pipeline, the overwrite backups).
+
+There are two fixtures, not one, because the tests need two
+different things from the stub:
+
+    * ``_stub_blueprint_root`` — returns ``None``, sets up the
+      monkeypatch. For tests that only need the stub to *exist*
+      (the collision and backup tests do not write into the
+      blueprint root; the destination directory is what they
+      collide against). Applied via
+      ``@pytest.mark.usefixtures("_stub_blueprint_root")``
+      (``PT004``/``PT019``).
+
+    * ``blueprint_root`` — returns the ``Path`` to the stub
+      directory. For tests that need to write a template *into*
+      the root (the dry-run test, which resolves the plan's source
+      reference). Named without an underscore because it returns a
+      value (``PT005``); injected as a parameter because the test
+      body uses it.
+
+The two fixtures delegate to the same ``monkeypatch.setattr`` call
+via a private helper, so there is exactly one place that describes
+*how* the stub is installed. The split is about *what the fixture
+returns*, which is what ``PT004`` and ``PT005`` are actually about.
+
+The alternative — mocking ``BlueprintDiscoveryService`` — would drag
+the discovery module's internal layout into the test, coupling the
+test to the loader's package structure. The current shape couples to
+one function's return type (a ``Path``) and nothing else.
+
 Lint conventions
 ----------------
 This file obeys the project's Ruff configuration, including the
@@ -174,9 +225,11 @@ That has three consequences a reader will notice:
   underscore for fixtures that return ``None``; ``PT019`` requires
   that such fixtures not be injected as test parameters. The two
   rules are complementary — satisfying one without the other
-  produces a lint error for the other. The ``usefixtures`` form
-  matches the convention in ``conftest.py`` for
-  ``_empty_discovery``.
+  produces a lint error for the other.
+- **Fixtures that *do* return a value have no leading underscore**
+  (``PT005``). If a test needs a value-only fixture, it must be
+  named as a value and injected as a parameter, not applied via
+  ``usefixtures``.
 - **Temp directories come from ``tmp_path``, not ``/tmp``.**
   ``S108`` flags hardcoded ``/tmp`` because it is world-writable and
   shared across users; ``tmp_path`` is per-test and uniquely owned.
@@ -200,8 +253,8 @@ from forge.cli import prompts
 from forge.cli.commands import create as create_module
 from forge.core.exceptions import (
     BlueprintError,
+    CollisionError,
     ExitCode,
-    FilesystemConflictError,
     MissingRequiredFlagsError,
     PromptCancelledError,
     UserInputError,
@@ -220,13 +273,24 @@ from forge.resolution.names import NAMED_VALIDATORS
 # -----------------------------------------------------------------------------
 # Fixtures and helpers
 # -----------------------------------------------------------------------------
-def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
+def _make_blueprint(
+    *,
+    variables: list[VariableDefinition],
+    files: list[dict[str, str]] | None = None,
+) -> Blueprint:
     """Build a minimal valid ``Blueprint`` for testing.
 
     Centralised so the two fixtures (``_fake_blueprint`` and
     ``_fake_blueprint_with_vars``) stay in lockstep on all fields they
     are *not* testing. A future field addition to ``Blueprint`` needs
     one edit here, not two.
+
+    ``files`` is optional because most tests (input collection,
+    cancellation, blueprint variables) do not touch the planner —
+    only the ``TestGeneratePreFlight`` tests need a plan with a
+    destination to conflict against. Passing ``None`` keeps the
+    existing behaviour (empty ``files[]``, zero planned files) for
+    every test that does not care.
 
     The blueprint is deliberately a *real model instance*, not a
     duck-typed fake. The resolver, the loader, the planner, and every
@@ -236,7 +300,8 @@ def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
     dependency on the model.
 
     ``conditional_files`` is intentionally empty: these tests exercise
-    input collection, not conditional evaluation. ``_generate``'s
+    input collection (and the safety layer's collision/backup
+    contract), not conditional evaluation. ``_generate``'s
     ``conditional_groups`` argument is therefore supplied as ``[]``
     by every test that calls it.
     """
@@ -248,6 +313,7 @@ def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
         description="Fake blueprint for tests.",
         category=Category.api,
         variables=variables,
+        files=files or [],
         verification=[{"id": "ok", "type": "required_file", "path": "README.md"}],
         compatibility=Compatibility(min_forge_version="1.0.0"),
     )
@@ -341,11 +407,12 @@ def _fake_blueprint_with_vars(monkeypatch: pytest.MonkeyPatch) -> None:
 def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Stub ``_generate`` so the test can inspect the resolved inputs.
 
-    ``_generate`` is the boundary to the unimplemented pipeline. The
-    stub records its arguments and returns; the test asserts on the
-    arguments. Faking the boundary is honest because the test is
-    about input collection, not generation — the pipeline's own
-    tests will exercise the real ``_generate``.
+    ``_generate`` is the boundary between *input handling* and the
+    *pipeline*. The tests in this class exercise input handling, so
+    they stub the pipeline and assert on what it *would* receive.
+    Faking the boundary is honest because the test is about input
+    collection, not generation — the pipeline's own tests
+    (``TestGeneratePreFlight``) exercise the real ``_generate``.
 
     The stub signature mirrors the *current* signature of
     ``create_module._generate``: keyword-only ``blueprint``,
@@ -384,6 +451,63 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(create_module, "_generate", _fake)
     return captured
+
+
+def _install_blueprint_root_stub(monkeypatch: pytest.MonkeyPatch, blueprint_root: Path) -> None:
+    """Shared body of the two ``blueprint_root``-stubbing fixtures.
+
+    Extracted so the two public fixtures (``_stub_blueprint_root`` and
+    ``blueprint_root``) describe *the same* monkeypatch. A future change
+    to how ``_blueprint_root`` is patched touches this one function.
+
+    The extraction is *not* about avoiding duplication — it is about
+    making the difference between the two fixtures legible: they differ
+    only in *return value*, and both delegate to the same install step.
+    Reading the two fixtures side by side now shows the difference
+    immediately.
+    """
+    monkeypatch.setattr(create_module, "_blueprint_root", lambda _bp, _id: blueprint_root)
+
+
+@pytest.fixture()
+def _stub_blueprint_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install the ``_blueprint_root`` stub without returning its ``Path``.
+
+    For tests that only need the stub to *exist* — they do not write
+    into the blueprint root, so they do not need the ``Path``.
+
+    Returns ``None`` (leading underscore, applied via
+    ``@pytest.mark.usefixtures`` per ``PT004`` and ``PT019``).
+
+    The directory is created empty; a test that needs a template file
+    in it should use ``blueprint_root`` (below) instead, which returns
+    the same directory so the test can write into it.
+    """
+    blueprint_root = tmp_path / "blueprint-root"
+    blueprint_root.mkdir()
+    _install_blueprint_root_stub(monkeypatch, blueprint_root)
+
+
+@pytest.fixture()
+def blueprint_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Install the ``_blueprint_root`` stub *and* return its ``Path``.
+
+    For tests that need to write a template file into the root (the
+    dry-run test resolves the plan's source reference against this
+    directory).
+
+    Returns the ``Path`` (no leading underscore per ``PT005``),
+    injected as a parameter because the test body uses it.
+
+    Both fixtures create a directory at ``tmp_path / "blueprint-root"``
+    and install the same monkeypatch. A test that needs both (a stub
+    *and* the path) uses this one; a test that needs only the stub uses
+    the other.
+    """
+    blueprint_root = tmp_path / "blueprint-root"
+    blueprint_root.mkdir()
+    _install_blueprint_root_stub(monkeypatch, blueprint_root)
+    return blueprint_root
 
 
 @pytest.fixture()
@@ -743,9 +867,10 @@ class TestInteractiveWizard:
         raise — because with ``cli_name`` supplied and no blueprint
         variables, the wizard should fire *no* prompt at all.
         """
-        _raise_if_called = lambda *a, **k: (_ for _ in ()).throw(  # noqa: E731
-            AssertionError("a prompt fired despite --name being supplied")
-        )
+
+        def _raise_if_called(*_a: Any, **_k: Any) -> str:
+            raise AssertionError("a prompt fired despite --name being supplied")
+
         monkeypatch.setattr(prompts, "ask_text", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
@@ -776,9 +901,10 @@ class TestInteractiveWizard:
         over the TTY check, or the wizard would fire despite the
         explicit request not to.
         """
-        _raise_if_called = lambda *a, **k: (_ for _ in ()).throw(  # noqa: E731
-            AssertionError("wizard fired despite --no-interactive")
-        )
+
+        def _raise_if_called(*_a: Any, **_k: Any) -> str:
+            raise AssertionError("wizard fired despite --no-interactive")
+
         monkeypatch.setattr(prompts, "ask_text", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
@@ -1107,19 +1233,19 @@ class TestBlueprintVariablesThroughResolver:
 
 
 # -----------------------------------------------------------------------------
-# Generation pre-flight (filesystem)
+# Generation pipeline (safety layer contract)
 # -----------------------------------------------------------------------------
 # These tests do not go through ``_resolve_variables`` — the resolver
 # is deliberately pure and does not check the filesystem. The
-# destination-conflict check lives in ``_generate``, and that is the
-# layer these tests exercise.
+# collision and overwrite contract is enforced by ``forge.safety``
+# inside ``_generate``, and that is the layer these tests exercise.
 #
 # ``_generate`` takes the blueprint document as a keyword-only
 # argument alongside the inputs, because the *planner* needs the
 # document to read ``files[]`` and ``conditional_files[]``. The
 # blueprint used here is a real ``Blueprint`` instance (from
-# ``_make_blueprint``) rather than a fake, so the planner (which
-# ``_generate`` calls) validates against the actual type.
+# ``_make_blueprint``) with at least one ``files[]`` entry, so the
+# pipeline has a destination to collide against.
 #
 # ``conditional_groups`` is passed as ``[]``: the fake blueprint has
 # no conditional files, so the evaluator would return an empty list
@@ -1131,61 +1257,147 @@ class TestBlueprintVariablesThroughResolver:
 # ``inputs.variables`` must be a real ``ResolvedValues``, not a plain
 # ``dict``: ``_generate`` calls ``.as_dict()`` on it, and that method
 # is the type boundary the resolver exists to enforce. The
-# ``_resolved_inputs`` helper constructs the correct shape — see its
-# docstring for why a duck-typed fake is not acceptable here.
+# ``_resolved_inputs`` helper constructs the correct shape.
+#
+# ``_stub_blueprint_root`` (for tests that only need the stub) or
+# ``blueprint_root`` (for tests that need to write into it) is the
+# one fake: ``_blueprint_root`` resolves the manifest directory via
+# discovery, which is not what these tests are about. Everything
+# downstream of that function — the planner, the safety layer, the
+# staging pipeline, the overwrite backups — runs for real. That is
+# what makes these tests the KPI-guard for the pipeline contract.
 # -----------------------------------------------------------------------------
 class TestGeneratePreFlight:
-    """``_generate`` refuses to run against an existing destination."""
+    """``_generate`` enforces the safety layer's collision contract.
+
+    The exit-code contract distinguishes two classes of failure that
+    the pipeline can refuse:
+
+    * **Collision** — a destination already exists and ``--overwrite``
+      was not passed. ``CollisionError`` (exit code **6**). The
+      remediation is "retry with ``--overwrite``, or edit the plan",
+      and CI can branch on 6 specifically.
+    * **Structural safety** — a path escapes the root, is absolute,
+      traverses a symlink, or the parent is unwritable.
+      ``SafetyError`` (exit code **3**). ``--overwrite`` cannot help;
+      the plan must be edited.
+
+    The tests here pin the *collision* contract because it is the one
+    with the ``--overwrite`` remediation. The structural contract is
+    exercised by the adversarial suite (``tests/adversarial/``), where
+    each attack class has its own test.
+    """
 
     @pytest.mark.unit()
-    def test_existing_destination_without_overwrite_raises(self, tmp_path: Path) -> None:
-        """A non-empty destination without ``--overwrite`` → exit 3.
+    @pytest.mark.usefixtures("_stub_blueprint_root")
+    def test_existing_destination_without_overwrite_raises_collision(self, tmp_path: Path) -> None:
+        """An existing destination without ``--overwrite`` → ``CollisionError``.
 
-        The check is in ``_generate``, not in the resolver, because
-        the *input* (a destination path) is valid regardless of
-        whether the path is occupied. The conflict is a *target*
-        problem, not an *input* problem — a distinction that lets
-        scripts distinguish "fix your flags" (exit 1) from "fix your
-        target" (exit 3).
+        Setup: a blueprint that plans one file (``out.txt``) whose
+        destination already exists on disk. Without ``--overwrite``,
+        the safety layer's ``detect_collisions`` finds the existing
+        destination and refuses.
+
+        The assertion is on the *type* (``CollisionError``) and on
+        the *exit code* (6), not on ``FilesystemConflictError`` — a
+        distinction that pins the exit-code contract from ADR-0017.
+        A future regression that folded collisions back into the
+        generic safety class would fail this test.
         """
+        # Destination with a pre-existing file — what the pipeline
+        # will collide against.
         target = tmp_path / "occupied"
         target.mkdir()
-        (target / "existing.txt").write_text("present")
+        (target / "out.txt").write_text("pre-existing")
 
+        blueprint = _make_blueprint(
+            variables=[],
+            files=[{"source": "src.txt", "destination": "out.txt"}],
+        )
         inputs = _resolved_inputs(destination=target)
 
-        with pytest.raises(FilesystemConflictError):
+        with pytest.raises(CollisionError) as info:
             create_module._generate(
-                blueprint=_make_blueprint(variables=[]),
+                blueprint=blueprint,
                 inputs=inputs,
                 conditional_groups=[],
                 dry_run=False,
                 overwrite=False,
             )
 
+        # Exit code 6 is the contract — a script that retries with
+        # ``--overwrite`` branches on this code specifically.
+        assert info.value.exit_code == ExitCode.COLLISION
+
     @pytest.mark.unit()
-    def test_existing_destination_with_overwrite_reaches_not_implemented(
-        self, tmp_path: Path
+    def test_existing_destination_with_overwrite_creates_backup(
+        self, tmp_path: Path, blueprint_root: Path
     ) -> None:
-        """``--overwrite`` skips the conflict check and hits the stub."""
+        """``--overwrite`` replaces the file and backs up the original.
+
+        Two guarantees, both tested:
+
+        1. **The pipeline completes** — no exception, the destination
+        now has the new content.
+        2. **A backup exists** — the original content is preserved
+        in a ``*.bak.<timestamp>`` sibling, matching ADR-0017's
+        "every overwrite is backed up" contract.
+
+        The test asserts on the *content* of both files, not just
+        their existence. Existence alone would pass even if the
+        backup held the wrong bytes, or if the destination were left
+        unchanged (a different but equally broken outcome).
+
+        The ``blueprint_root`` fixture (rather than
+        ``_stub_blueprint_root``) is used because the pipeline reads
+        the plan's source template from that directory during staging.
+        Without the ``src.txt`` file present there, the copy branch of
+        ``_stage_one`` would raise ``FilesystemConflictError`` — the
+        test would then fail on the *pipeline setup*, not on the
+        overwrite/backup contract it exists to pin.
+
+        The content written to ``src.txt`` is ``"new body"`` so the
+        assertion ``(target / "out.txt").read_text() == "new body"``
+        names the property being tested (the destination has the
+        *source's* content), not merely "some content".
+        """
+        # Source template the pipeline will copy into the destination.
+        (blueprint_root / "src.txt").write_text("new body")
+
+        # Destination with a pre-existing file — what the pipeline
+        # will overwrite (and back up).
         target = tmp_path / "occupied"
         target.mkdir()
-        (target / "existing.txt").write_text("present")
+        (target / "out.txt").write_text("pre-existing body")
 
+        blueprint = _make_blueprint(
+            variables=[],
+            files=[{"source": "src.txt", "destination": "out.txt"}],
+        )
         inputs = _resolved_inputs(destination=target)
 
-        with pytest.raises(NotImplementedError):
-            create_module._generate(
-                blueprint=_make_blueprint(variables=[]),
-                inputs=inputs,
-                conditional_groups=[],
-                dry_run=False,
-                overwrite=True,
-            )
+        create_module._generate(
+            blueprint=blueprint,
+            inputs=inputs,
+            conditional_groups=[],
+            dry_run=False,
+            overwrite=True,
+        )
+
+        # The destination now has the *source's* content.
+        assert (target / "out.txt").read_text() == "new body"
+
+        # The original content survives in a timestamped backup.
+        backups = list(target.glob("out.txt.bak.*"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "pre-existing body"
 
     @pytest.mark.unit()
     def test_dry_run_renders_plan_even_for_conflicted_destination(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        blueprint_root: Path,
     ) -> None:
         """``--dry-run`` renders the plan for a conflicted destination.
 
@@ -1194,15 +1406,27 @@ class TestGeneratePreFlight:
         must not fail on the conflict, and it must not silently
         return. The assertion is on the *rendered plan* (its presence
         in stdout), not on the absence of an exception.
+
+        The ``blueprint_root`` fixture is required because the
+        pipeline resolves the plan's source reference even in dry-run
+        mode — the plan's rendering includes the source path, and
+        the source is resolved against the blueprint root. Without
+        the fixture, ``_blueprint_root`` would call discovery and
+        fail (there is no discovery layout in a unit test).
         """
+        (blueprint_root / "src.txt").write_text("body")
         target = tmp_path / "occupied"
         target.mkdir()
-        (target / "existing.txt").write_text("present")
+        (target / "out.txt").write_text("pre-existing")
 
+        blueprint = _make_blueprint(
+            variables=[],
+            files=[{"source": "src.txt", "destination": "out.txt"}],
+        )
         inputs = _resolved_inputs(destination=target)
 
         create_module._generate(
-            blueprint=_make_blueprint(variables=[]),
+            blueprint=blueprint,
             inputs=inputs,
             conditional_groups=[],
             dry_run=True,
