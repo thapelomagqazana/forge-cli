@@ -1,0 +1,57 @@
+# EXERCISES: multi-group-filtering, aggregation
+# Several condition groups whose survival depends on independent
+# variables. Used to prove the evaluator filters each group
+# independently and that survivors preserve declaration order.
+schema_version: "1.0.0"
+id: sample.conditions.mixed
+name: Mixed Conditions Demo
+version: 1.0.0
+description: |
+  Multiple independent conditional groups. The test suite toggles each
+  variable to verify per-group filtering and stable ordering.
+category: api
+
+variables:
+  - id: database
+    type: enum
+    description: Database engine.
+    required: false
+    default: "postgresql"
+    validation:
+      enum: ["postgresql", "sqlite"]
+  - id: include_docker
+    type: boolean
+    description: Whether to scaffold a Dockerfile.
+    required: false
+    default: true
+  - id: include_ci
+    type: boolean
+    description: Whether to scaffold a CI workflow.
+    required: false
+    default: false
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: database == 'postgresql'
+    files:
+      - source: templates/db/pg.py.j2
+        destination: db/postgres.py
+  - condition: include_docker == true
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+  - condition: include_ci == true
+    files:
+      - source: templates/pyproject.toml.j2
+        destination: .github/workflows/ci.yml
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

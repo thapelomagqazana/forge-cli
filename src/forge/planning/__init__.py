@@ -28,7 +28,7 @@ three concrete benefits:
 Public API
 ----------
     FileMapper          — the planning orchestrator
-                          ``map(blueprint, variables)``
+                          ``map(blueprint, variables, *, conditional_groups=None)``
                               -> ``Result[list[PlannedFile], MappingError]``
 
     PlannedFile         — one row in the plan (immutable DTO)
@@ -63,14 +63,31 @@ Not public
 
 The pure-function contract
 --------------------------
-Planning is a pure, total function of ``(blueprint, variables)``. There
-is **no I/O** in the planner: it does not read template sources (the
-loader already verified they exist), does not render file bodies (that
-is the writer's job), and does not touch the filesystem at all. That
-purity is what makes ADR-0015's determinism guarantee possible, and it
-is what lets the façade expose a single, small API — if the planner
-needed more context, the façade would have to expose more context, and
-the surface would grow.
+Planning is a pure, total function of ``(blueprint, variables,
+conditional_groups)``. There is **no I/O** in the planner: it does not
+read template sources (the loader already verified they exist), does not
+render file bodies (that is the writer's job), and does not touch the
+filesystem at all. That purity is what makes ADR-0015's determinism
+guarantee possible, and it is what lets the façade expose a single, small
+API — if the planner needed more context, the façade would have to expose
+more context, and the surface would grow.
+
+Conditional groups
+------------------
+Conditional files are *explicit opt-in* by the caller. The
+``conditional_groups`` parameter carries the surviving groups produced
+by ``forge.conditions.ConditionalEvaluator``; each entry is
+``(parsed_ast, files)`` — the AST is opaque to the planner. When the
+parameter is omitted (default ``None``), conditional files are **not**
+planned. This is the safe-by-default rule from ADR-0015: silently
+including optional components because a caller forgot to filter them is
+exactly the class of bug the planner exists to prevent.
+
+Deliberately, ``forge.planning`` does **not** import
+``forge.conditions``. The evaluator produces the groups; the planner
+plans them. One-way dependency graph preserved. That means a future
+condition source (e.g. a manifest-driven variant) can plug in without
+touching this module.
 
 The one impurity (renderer import)
 ----------------------------------
@@ -147,6 +164,11 @@ if TYPE_CHECKING:
 # needs to inspect a `PlannedFile` or handle a `MappingError`. The lazy
 # attribute keeps `import forge.planning` cheap and defers the renderer
 # dependency to the moment a caller actually plans something.
+#
+# Note: `FileMapper` is the only entry here today. If a future addition
+# (e.g. `PlanComparator`, `DryRunPreview`) also pulls a heavy dependency,
+# it belongs in this dict too — the rule is "anything whose *import*
+# cost the caller should not pay unless they use it".
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "FileMapper": ("forge.planning.mapper", "FileMapper"),
 }

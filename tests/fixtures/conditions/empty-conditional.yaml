@@ -1,0 +1,29 @@
+# EXERCISES: empty-conditional-files (regression)
+# A blueprint with no conditional groups. The evaluator must short-circuit
+# and the planner must produce the same plan as if conditions had never
+# been involved. This fixture pins the "no special case for empty" rule
+# documented in the create command.
+schema_version: "1.0.0"
+id: sample.conditions.empty
+name: Empty Conditions Demo
+version: 1.0.0
+description: |
+  No conditional groups. Exists to prove the pipeline runs the
+  evaluator unconditionally and short-circuits cleanly on empty input.
+category: api
+
+variables: []
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files: []
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

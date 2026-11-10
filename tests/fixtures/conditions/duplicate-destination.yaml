@@ -1,0 +1,45 @@
+# EXPECTED-FAILURE: destination.collision between README.md (unconditional)
+# and README_OVERRIDE.md — no, between the two files that both target
+# README.md when `include_override == true`.
+#
+# This fixture exists to prove that collisions *between conditional and
+# unconditional files* (or between two surviving conditional files) are
+# caught by the planner — the evaluator's job is to decide survival; the
+# planner's job is to notice two survivors with the same destination.
+# A collision *within* a single conditional group is caught the same way.
+#
+# The condition is on by default so the fixture collides without needing
+# a flag, matching how a user would discover the bug.
+schema_version: "1.0.0"
+id: sample.conditions.collision
+name: Conditional Collision (expected failure)
+version: 1.0.0
+description: |
+  A conditional file collides with an unconditional file when the
+  condition is true. Planner must reject.
+category: api
+
+variables:
+  - id: include_override
+    type: boolean
+    description: Whether the override is included.
+    required: false
+    default: true
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: include_override == true
+    files:
+      - source: templates/pyproject.toml.j2
+        destination: README.md      # ← collision with the file above
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

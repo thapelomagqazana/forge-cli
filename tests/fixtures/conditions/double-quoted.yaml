@@ -1,0 +1,38 @@
+# EXERCISES: equality-true-double-quote
+# The double-quoted form is documented as semantically identical to the
+# single-quoted form. This fixture pins that claim: the evaluator must
+# not distinguish the two at runtime.
+schema_version: "1.0.0"
+id: sample.conditions.doublequoted
+name: Double-Quoted Condition Demo
+version: 1.0.0
+description: |
+  Uses the double-quoted string variant of the equality operator.
+category: api
+
+variables:
+  - id: database
+    type: enum
+    description: Database engine.
+    required: false
+    default: "postgresql"
+    validation:
+      enum: ["postgresql", "sqlite"]
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: database == "postgresql"
+    files:
+      - source: templates/db/pg.py.j2
+        destination: db/postgres.py
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0

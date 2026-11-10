@@ -1,0 +1,41 @@
+# EXPECTED-FAILURE: condition.syntax on `database = 'postgresql'`
+#
+# The condition uses a single `=` (assignment-like) instead of `==`.
+# The grammar has no assignment form; the parser must reject it.
+#
+# The document still *loads* — conditions are a string field as far as
+# the schema is concerned. Parsing is the evaluator's job.
+schema_version: "1.0.0"
+id: sample.conditions.badsyntax
+name: Bad Condition Syntax (expected failure)
+version: 1.0.0
+description: |
+  Malformed condition. Loader succeeds; evaluator rejects at parse time.
+category: api
+
+variables:
+  - id: database
+    type: enum
+    description: Database engine.
+    required: false
+    default: "postgresql"
+    validation:
+      enum: ["postgresql", "sqlite"]
+
+files:
+  - source: templates/README.md.j2
+    destination: README.md
+
+conditional_files:
+  - condition: database = 'postgresql'
+    files:
+      - source: templates/db/pg.py.j2
+        destination: db/postgres.py
+
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
+
+compatibility:
+  min_forge_version: 1.0.0
