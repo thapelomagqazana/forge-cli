@@ -24,6 +24,12 @@ Guarantees (each backed by a test in `tests/unit/rendering/`)
    can cause — missing name, syntax error, missing include, sandbox
    denial, *and* bad filter/expression arguments — becomes a structured
    error. A template author's mistake never escapes as a traceback.
+8. **Parity between file and inline rendering.** `render()` (file) and
+   `render_inline()` (string) share a single `_render_text()` core, so
+   the *same* sandbox, the *same* allowlist, the *same* StrictUndefined
+   behaviour, the *same* determinism rules, and the *same* error
+   translation apply to both. If you change one, you cannot accidentally
+   change only one.
 
 What "deterministic" actually means, and what it does not
 ---------------------------------------------------------
@@ -80,7 +86,7 @@ Keeping those four concerns together — and nothing else — is what makes
 this file easy to audit and easy to keep correct.
 
 Why guarantee 7 is stated separately from 1 to 6
----------------------------------------------
+------------------------------------------------
 Guarantees 1 to 6 describe *properties* of a successful or well-understood
 failure. Guarantee 7 describes the *closure* of the exception handler:
 the claim that no template-authored failure escapes as a raw exception.
@@ -92,6 +98,40 @@ guarantee exists to make the closure explicit and testable — a
 ``render()`` that raises on *any* template input, no matter how
 malformed, is the contract that "batch renderers can collect every
 failure in one report" (guarantee 6) actually requires.
+
+Why guarantee 8 exists (the render/render_inline split)
+-------------------------------------------------------
+`render()` renders a *file*; `render_inline()` renders an *inline
+string* (used by the planner to substitute variables into destination
+paths, and by future callers like diagnostic commands that want to
+render a snippet without a backing file). Both go through the same
+`_render_text()` core, which owns everything that matters — sandbox,
+allowlist, StrictUndefined, deterministic context, exception
+translation.
+
+The split exists because the two entry points *legitimately* differ in
+three ways, and only three ways:
+
+    * **Where the template text comes from.** `render()` reads from a
+      file (with its own I/O error handling); `render_inline()` receives
+      a string.
+    * **How the loader is scoped.** `render()` builds a loader rooted
+      at the template's directory (so `{% include "sibling.j2" %}` is
+      confined to the blueprint); `render_inline()` has *no* loader
+      and therefore cannot `{% include %}` at all — an inline string
+      has no directory context, and a `TemplateNotFound` here is a
+      precise error rather than a filesystem guess.
+    * **The `template` field in error messages.** `render()` reports
+      the file path; `render_inline()` reports ``"<inline>"``.
+
+Everything else is deliberately shared. An earlier version of the
+planner shipped its own inline render loop, and the security review
+found it had drifted: it used `Template("...")` from the module-level
+Jinja API, bypassing the allowlist, StrictUndefined, and the sandbox.
+Centralising both paths through `_render_text()` makes that class of
+drift impossible to reintroduce — you cannot add a bypass without
+deleting the shared core, and the tests for both entry points would
+fail at once.
 """
 
 from __future__ import annotations
@@ -109,12 +149,17 @@ from forge.rendering.errors import TemplateRenderError
 
 
 class TemplateRenderer:
-    """Render one template file with a mapping of variables.
+    """Render templates (file-backed or inline) with a variable mapping.
 
-    Stateless and thread-safe. Construct once, call `render()` as often as
-    needed. All environment configuration lives in `environment.py`;
-    this class only orchestrates I/O and error translation.
+    Stateless and thread-safe. Construct once, call `render()` or
+    `render_inline()` as often as needed. All environment configuration
+    lives in `environment.py`; this class only orchestrates I/O and
+    error translation.
     """
+
+    # ------------------------------------------------------------------
+    # Public entry point: file-backed rendering
+    # ------------------------------------------------------------------
 
     def render(
         self,
@@ -186,16 +231,108 @@ class TemplateRenderer:
         root = str(path.parent)
         env = get_environment().overlay(loader=make_loader(root))
 
-        # --- parse and render ----------------------------------------------
-        # Every Jinja exception type that can arise from a *template* is
-        # translated to a structured error. Ordering matters: SecurityError
-        # is a subclass of Exception, not of UndefinedError, so listing it
-        # after UndefinedError would still work — but listing it explicitly
-        # and prominently signals to reviewers that it is expected.
-        #
-        # The final `TypeError`/`ValueError`/`AttributeError` branch is
-        # what makes guarantee 7 hold. See its inline comment for the
-        # reasoning that motivated adding it.
+        return self._render_text(
+            env=env,
+            text=text,
+            variables=variables,
+            display=display,
+            # A file-backed render that hits `{% include %}` may need to
+            # resolve a sibling path. The loader above is what enables
+            # that; nothing else about the core needs to know.
+            loader_kind="file",
+        )
+
+    # ------------------------------------------------------------------
+    # Public entry point: inline (string) rendering
+    # ------------------------------------------------------------------
+
+    def render_inline(
+        self,
+        template_text: str,
+        variables: Mapping[str, Any],
+    ) -> Result[str, TemplateRenderError]:
+        """Render a small inline string (e.g. a destination path).
+
+        Shares the *entire* safety and determinism contract with
+        `render()`: same sandbox, same allowlist, same StrictUndefined
+        behaviour, same recursively-sorted context, same exception
+        translation. The only difference is that there is no backing
+        file, so:
+
+            * the `template` field in errors is ``"<inline>"``;
+            * ``{% include %}`` has no directory context and therefore
+              always fails with `include.not_found` (which is the
+              *correct* behaviour for an inline string — there is no
+              directory an include could be relative to).
+
+        Why no loader at all (rather than a loader rooted at cwd):
+
+        A loader rooted at the caller's cwd would let an inline render
+        reach arbitrary files relative to the process's working
+        directory — a class of escape we do not want to open. A loader
+        rooted at a caller-supplied path would be a new attack surface
+        at every call site. A loader rooted at nothing gives the caller
+        exactly what an inline render *should* have: the sandbox and
+        the allowlist, and no filesystem reach. If a future call site
+        genuinely needs includes from an inline render, it can call
+        `render()` on a real file — that is the honest answer, not a
+        widened API.
+
+        Why the `TemplateNotFound` handling in the shared core is
+        reachable here even without a loader:
+
+        Jinja's `Environment.from_string` does not consult the loader
+        during parsing, so a `{% include "x" %}` inside an inline
+        string parses fine. It is only when the *rendered output* is
+        produced that Jinja resolves the include, and with no loader
+        it raises `TemplateNotFound` — which the shared core's
+        `include.not_found` branch already translates. So the branch
+        is *not* dead code; it is the branch that fires for the only
+        way an inline render can try to reach the filesystem, and it
+        reports a clear, actionable error.
+        """
+        env = get_environment()  # no loader: inline strings need none
+
+        return self._render_text(
+            env=env,
+            text=template_text,
+            variables=variables,
+            display="<inline>",
+            # No loader kind: an inline render cannot legitimately need
+            # one, and the core's error translation is identical either
+            # way. Kept as a keyword for symmetry and future-proofing.
+            loader_kind="inline",
+        )
+
+    # ------------------------------------------------------------------
+    # Shared core — both entry points funnel through here
+    # ------------------------------------------------------------------
+
+    def _render_text(
+        self,
+        *,
+        env: Any,
+        text: str,
+        variables: Mapping[str, Any],
+        display: str,
+        loader_kind: str,  # "file" | "inline" — see module docstring
+    ) -> Result[str, TemplateRenderError]:
+        """Parse and render `text` through `env`, translating every failure.
+
+        Everything that matters for safety, determinism, and actionability
+        lives here. `render()` and `render_inline()` differ only in how
+        they obtain `text` and how they construct `env`; once those two
+        inputs are in hand, the two paths are *indistinguishable* by the
+        core — which is the property guarantee 8 asserts.
+
+        The `loader_kind` parameter is currently used only for the
+        inline case's error message when a `{% include %}` is attempted,
+        but it is threaded through as a *keyword-only* argument so a
+        future change (say, a different hint for inline vs. file) has an
+        obvious place to live. It is deliberately *not* used to gate any
+        behaviour today — that would be the start of a drift surface,
+        which is precisely what this refactor exists to eliminate.
+        """
         try:
             template = env.from_string(text)
             rendered = template.render(**self._deterministic_context(variables))
@@ -209,10 +346,7 @@ class TemplateRenderer:
                     template=display,
                     code="include.not_found",
                     message=f"included template not found: {exc.name}",
-                    hint=(
-                        "{% include %} paths are relative to the blueprint "
-                        "directory; check the filename and directory."
-                    ),
+                    hint=_include_hint(loader_kind),
                 )
             )
         except SecurityError as exc:
@@ -437,33 +571,18 @@ class TemplateRenderer:
         into the hint (``"Add {% endfor %} to close the block"``).
         We deliberately do not: the tag name in the message is
         anchored to Jinja's exact phrasing, and a reword would break
-        the extraction silently (the hint would say "Add {% None %}").
-        The generic-but-accurate phrasing below is stable across
-        versions; a user who needs the specific tag reads it in the
-        error's ``message`` field, which already names it.
-        """
-        # Scan both fields. The concatenation is a cheap way to match
-        # against either without three separate `or` clauses per branch.
+        the extraction silently (the hint would say "Add {% None %}")."""
         haystack = (
             f"{getattr(exc, 'name', '') or ''} " f"{getattr(exc, 'message', '') or ''}"
         ).lower()
 
-        # Unclosed-block errors: Jinja's message contains "end of
-        # template" and typically names the missing tag (``endfor``,
-        # ``endif``, ``endblock``). Any of those keywords is enough to
-        # give the user the specific "close every block" advice.
         if "end of template" in haystack or "unexpected end" in haystack:
             return (
                 "Check that every {% block %}, {% for %}, and {% if %} is "
                 "closed with the matching end tag."
             )
-        # Mismatched or unexpected tags — the parser knows the token was
-        # out of place but cannot suggest a specific fix. Direct the
-        # user at the reported line, which is the best we can do.
         if "unexpected" in haystack:
             return "Check the syntax near the reported line; consult the " "Jinja docs if unsure."
-        # Missing closing brace or tag — again, the reported line is
-        # the actionable location.
         if "expected" in haystack:
             return (
                 "A closing brace or tag is missing; check the construct "
@@ -477,6 +596,35 @@ class TemplateRenderer:
 # and can be reused by future consumers (e.g. an LSP bridge that wants to
 # surface the same name extraction).
 # ---------------------------------------------------------------------------
+
+
+def _include_hint(loader_kind: str) -> str:
+    """Return a loader-aware hint for `{% include %}` failures.
+
+    Extracted so the hint can differ between the two entry points
+    without introducing a branch in the shared core. The *behaviour*
+    is identical (both fail); only the *advice* differs, because the
+    causes differ:
+
+    * **file** — a sibling template genuinely exists but was named
+      wrong, so the actionable fix is to check the filename relative
+      to the blueprint directory.
+
+    * **inline** — an inline render has no directory at all, so the
+      honest answer is that includes are not supported here and the
+      caller should render a real file. Telling an inline caller to
+      "check the filename" would send them on a search for something
+      that cannot exist.
+    """
+    if loader_kind == "inline":
+        return (
+            "Inline templates cannot {% include %} other files. "
+            "Render a real template file instead."
+        )
+    return (
+        "{% include %} paths are relative to the blueprint directory; "
+        "check the filename and directory."
+    )
 
 
 def _sort_mapping(value: object) -> object:

@@ -2,9 +2,10 @@
 
 This module is the *only* supported import surface for rendering. Every
 consumer — scaffolding, ``forge create``, ``forge validate``, future
-``forge render``, tests — imports from here and never from the private
-modules (``renderer``, ``environment``, ``_sandbox``, ``filters``,
-``safe_globals``). That discipline gives us three concrete benefits:
+``forge render``, the file planner, tests — imports from here and never
+from the private modules (``renderer``, ``environment``, ``_sandbox``,
+``filters``, ``safe_globals``). That discipline gives us three concrete
+benefits:
 
     1. **Refactor safety.** We can rename ``renderer.TemplateRenderer``,
        swap out the sandbox implementation, or introduce a new renderer
@@ -24,9 +25,30 @@ modules (``renderer``, ``environment``, ``_sandbox``, ``filters``,
 
 Public API
 ----------
-    TemplateRenderer       — the renderer class (stateless, thread-safe)
+    TemplateRenderer       — the renderer class (stateless, thread-safe).
+                             Exposes **two** entry points, both bound by
+                             the *same* sandbox, allowlist, StrictUndefined,
+                             determinism rules, and error translation:
+
+                                 .render(path, variables)
+                                     — render a file-backed template
+                                 .render_inline(text, variables)
+                                     — render an inline string (used by
+                                       the planner for destination-path
+                                       substitution; shares every
+                                       guarantee of .render except that
+                                       it has no filesystem reach)
+
+                             If you change one, you cannot accidentally
+                             change only the other — the shared core in
+                             ``renderer._render_text`` is the reason.
+
     TemplateRenderError    — structured failure type
+
     RenderResult           — typed alias for Result[str, TemplateRenderError]
+                             (see the shadowing note below for why the
+                             runtime form differs from the static one)
+
     Ok, Err                — Result constructors, re-exported for
                              convenience so callers need one import
 
@@ -35,6 +57,11 @@ Not public
     environment, _sandbox, filters, safe_globals, renderer
         Internal. Import from these modules is rejected in code review
         unless you are working *inside* ``forge/rendering/``.
+
+    In particular, ``get_environment()`` is **not** re-exported. A caller
+    who wants to construct their own Jinja environment is doing something
+    the façade intentionally prevents — the sandbox and filter allowlist
+    are policy, and policy is not a per-caller decision.
 
 Determinism contract
 --------------------
@@ -45,6 +72,36 @@ time/random globals, deterministic JSON. The façade re-exports only what
 callers need to honour that contract on their side (Result, error type,
 renderer); it deliberately does not surface knobs that would let a
 caller break it.
+
+Why the runtime form of ``RenderResult`` differs from the static form
+---------------------------------------------------------------------
+Static type checkers see ``RenderResult`` as
+``Result[str, TemplateRenderError]`` — a *parameterised* generic. Python's
+type system erases parameterisation at runtime, so the runtime object
+must be something concrete. Two options exist:
+
+    (a) Alias to the unparameterised ``Result`` class. Simple, but
+        ``isinstance(x, RenderResult)`` becomes a misleading test:
+        it would be True for *any* ``Result``, including
+        ``Result[int, None]`` from an unrelated module.
+
+    (b) Alias to a ``NewType``-style runtime object that carries no
+        parameterisation but *can* be used for identity comparisons
+        and debugging. Overkill for a case where callers rarely
+        ``isinstance``-check.
+
+We use (a) here, because the alternative would require a runtime
+``__class_getitem__`` shim and a metaclass just to make
+``isinstance(x, RenderResult)`` stricter than ``isinstance(x, Result)`` —
+which no caller needs, since ``Result`` is already a sum type with
+exactly two members (``Ok``/``Err``) whose *inner* types are what a
+caller really wants to check.
+
+The honest statement, and the one this file makes, is: ``RenderResult``
+is a **type alias** for annotation purposes, and at runtime it is the
+``Result`` class itself. Callers who need to inspect a result at runtime
+should use ``isinstance(result, Ok)`` / ``isinstance(result, Err)``
+(already re-exported) rather than ``isinstance(result, RenderResult)``.
 
 Shadowing note (why this file uses ``sys.modules`` instead of ``globals()``)
 --------------------------------------------------------------------------
@@ -99,13 +156,17 @@ if TYPE_CHECKING:
 #:
 #:     def build(tpl: Path, vars: Mapping[str, Any]) -> RenderResult: ...
 #:
-#: Defined as a real runtime ``type`` alias (PEP 604 union), not a
-#: string, because ``from __future__ import annotations`` means the
-#: alias is *used* only in annotations — which are never evaluated at
-#: runtime — so a ``TypeAlias``-style binding is safe and gives the
-#: type checker a concrete expression to check. The previous string
-#: form (``"Result[str, TemplateRenderError]"``) worked but was opaque
-#: to tooling that inspects ``RenderResult.__value__``.
+#: Defined as a real runtime ``type`` alias (PEP 604 union) under
+#: ``TYPE_CHECKING``, because ``from __future__ import annotations``
+#: means the alias is *used* only in annotations — which are never
+#: evaluated at runtime — so a ``TypeAlias``-style binding is safe and
+#: gives the type checker a concrete expression to check. The previous
+#: string form (``"Result[str, TemplateRenderError]"``) worked but was
+#: opaque to tooling that inspects ``RenderResult.__value__``.
+#:
+#: At runtime the name resolves to the unparameterised ``Result`` class;
+#: see the module docstring's "Why the runtime form differs" section for
+#: the reasoning and for guidance on runtime isinstance checks.
 if TYPE_CHECKING:
     RenderResult = _Result[str, TemplateRenderError]
 else:

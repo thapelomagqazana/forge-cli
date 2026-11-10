@@ -35,15 +35,31 @@ There are two families of tests here, deliberately:
   propagates). The parser is not part of what these tests verify,
   so going through it would add indirection without adding coverage.
 
-Both families exercise the *current* shape of the command: the
-project name is a **command argument** resolved outside
-``VariableResolver`` (see ``create.py`` for the reasoning), while
-*blueprint variables* flow through the resolver. Tests that used to
-call ``_resolve_inputs(...)`` now call ``_resolve_variables(...)``
-with the new signature: ``blueprint_id``, ``cli_name``, ``cli_vars``,
-``output``, ``no_interactive``. That rename is not cosmetic — it is
-the whole point of the resolution-layer refactor (ADR-0011): one
-resolver, one place where blueprint-variable rules live.
+Both families exercise the *current* shape of the command:
+
+    * The project name is a **command argument** resolved outside
+      ``VariableResolver`` (see ``create.py`` for the reasoning).
+    * The *blueprint variables* flow through the resolver.
+    * ``_resolve_variables`` returns a **two-tuple**
+      ``(blueprint, inputs)`` — the blueprint document is needed by
+      ``_generate`` to feed the planner, and returning it alongside
+      the resolved inputs is the deliberate coupling the command
+      docstring explains.
+    * ``_generate`` takes the blueprint as a **keyword-only**
+      argument, alongside ``inputs``, ``dry_run``, and ``overwrite``.
+      All four are keyword-only on purpose: a positional call would
+      read as ``_generate(blueprint, inputs, ...)`` and make the
+      order easy to get wrong.
+
+Tests written before this shape change called ``_resolve_variables``
+and expected a single ``_ResolvedInputs`` return value, then passed
+``inputs`` positionally to ``_generate``. Both broke the moment the
+shape changed — which is exactly what the tests are for. The two
+corrections (unpack the tuple, pass the blueprint) are mechanical;
+the *failure* was the diagnostic that told us the shape had changed,
+and keeping that failure legible in the test suite (rather than
+papering over it with a duck-typed shim) is what makes the next
+shape change equally visible.
 
 The right seam: ``create.get_blueprint_document``
 -------------------------------------------------
@@ -115,6 +131,25 @@ in the dispatch tests, the collection logic in ``_resolve_variables``
 tests, the exception type via ``pytest.raises``, and the rendered
 message via ``handle_exception`` + ``capsys``.
 
+``_generate`` inputs must satisfy ``_generate``'s contract
+----------------------------------------------------------
+``_generate`` reads ``inputs.variables.as_dict()`` — a method that
+exists on ``ResolvedValues`` (the resolver's immutable output type)
+but *not* on a plain ``dict``. That is deliberate: the type
+distinction is what prevents an unvalidated ``dict`` from reaching
+the planner, and removing it would silently undo the KPI the whole
+resolver exists to deliver.
+
+An earlier version of these ``TestGeneratePreFlight`` tests
+constructed ``SimpleNamespace(variables={})`` — a fake that happened
+to be dict-shaped but failed ``_generate``'s actual contract. The
+``AttributeError: 'dict' object has no attribute 'as_dict'`` was the
+*directed* symptom, and the correct fix was to make the fixture
+construct the type ``_generate`` requires, not to teach ``_generate``
+to accept a shape it was designed to reject. The helper
+``_resolved_inputs(...)`` below is that fix, and its existence is
+the constant reminder: fake the *boundary*, not the *type*.
+
 Lint conventions
 ----------------
 This file obeys the project's Ruff configuration, including the
@@ -142,7 +177,7 @@ That has three consequences a reader will notice:
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -165,11 +200,12 @@ from forge.models import (
     VariableDefinition,
     VariableType,
 )
+from forge.resolution import ResolvedValues
 from forge.resolution.names import NAMED_VALIDATORS
 
 
 # -----------------------------------------------------------------------------
-# Fixtures
+# Fixtures and helpers
 # -----------------------------------------------------------------------------
 def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
     """Build a minimal valid ``Blueprint`` for testing.
@@ -180,11 +216,11 @@ def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
     one edit here, not two.
 
     The blueprint is deliberately a *real model instance*, not a
-    duck-typed fake. The resolver, the loader, and every consumer
-    validate against this type, so the test should too — a fake that
-    happens to satisfy the attributes the command reads today would
-    silently break the moment the command gains a new dependency on
-    the model.
+    duck-typed fake. The resolver, the loader, the planner, and every
+    other consumer validate against this type, so the test should too
+    — a fake that happens to satisfy the attributes the command reads
+    today would silently break the moment the command gains a new
+    dependency on the model.
     """
     return Blueprint(
         schema_version="1.0.0",
@@ -196,6 +232,40 @@ def _make_blueprint(*, variables: list[VariableDefinition]) -> Blueprint:
         variables=variables,
         verification=[{"id": "ok", "type": "required_file", "path": "README.md"}],
         compatibility=Compatibility(min_forge_version="1.0.0"),
+    )
+
+
+def _resolved_inputs(
+    *,
+    destination: Path,
+    project_name: str = "my-api",
+    blueprint_id: str = "python.fastapi.api",
+    variables: dict[str, Any] | None = None,
+) -> SimpleNamespace:
+    """Build a ``_ResolvedInputs``-shaped object with a real ``ResolvedValues``.
+
+    ``_generate`` calls ``inputs.variables.as_dict()`` — a method
+    that exists on ``ResolvedValues`` but not on a plain ``dict``.
+    That method is the type boundary the resolver exists to enforce
+    (see ``forge.resolution.resolver.ResolvedValues``), and the
+    ``TestGeneratePreFlight`` tests must construct inputs that satisfy
+    it, or they are not exercising ``_generate`` — they are
+    exercising a fake that happens to share some attributes.
+
+    ``SimpleNamespace`` is used (rather than ``_ResolvedInputs``
+    directly) because ``_ResolvedInputs`` is a *private* type in
+    ``create.py``, and reaching into a private type from a test
+    couples the test to an implementation detail. The namespace
+    satisfies the duck-typed contract ``_generate`` actually consumes
+    (``.blueprint_id``, ``.project_name``, ``.destination``,
+    ``.variables``), which is the honest level of coupling for a test
+    of a private helper.
+    """
+    return SimpleNamespace(
+        blueprint_id=blueprint_id,
+        project_name=project_name,
+        destination=destination,
+        variables=ResolvedValues(MappingProxyType(variables or {})),
     )
 
 
@@ -259,6 +329,19 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     about input collection, not generation — the pipeline's own
     tests will exercise the real ``_generate``.
 
+    The stub signature mirrors the *current* signature of
+    ``create_module._generate``: keyword-only ``blueprint``,
+    ``inputs``, ``dry_run``, ``overwrite``. The ``blueprint``
+    parameter is recorded alongside the others so future tests can
+    assert that the *same* document the wizard used was passed
+    through to the planner — a property the command's docstring
+    promises and the tests should pin.
+
+    If ``create_module._generate`` gains a parameter (or renames
+    one), this fixture will raise ``TypeError`` at the next
+    ``cli_runner.invoke`` — the fixture is the trip wire for the
+    signature, not just a recording device.
+
     This fixture *does* return a value (the ``captured`` dict), so
     it does not need a leading underscore and stays a parameter
     (``PT004`` and ``PT019`` only apply to fixtures returning
@@ -266,7 +349,14 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """
     captured: dict[str, Any] = {}
 
-    def _fake(inputs: Any, *, dry_run: bool, overwrite: bool) -> None:
+    def _fake(
+        *,
+        blueprint: Any,
+        inputs: Any,
+        dry_run: bool,
+        overwrite: bool,
+    ) -> None:
+        captured["blueprint"] = blueprint
         captured["inputs"] = inputs
         captured["dry_run"] = dry_run
         captured["overwrite"] = overwrite
@@ -339,6 +429,12 @@ class TestDispatch:
         assert result.exit_code == 0, result.output
         assert capture_generate["inputs"].blueprint_id == "python.fastapi.api"
         assert capture_generate["inputs"].project_name == "my-api"
+        # The blueprint document is passed through *with* the inputs —
+        # the planner needs it, and passing it once (from the resolve
+        # step) rather than re-fetching in `_generate` guarantees the
+        # document the user's answers were validated against is the
+        # document that will be planned.
+        assert capture_generate["blueprint"].id == "python.fastapi.api"
 
     @pytest.mark.unit()
     def test_create_help_shows_leaf_signature(self, cli_runner: CliRunner, forge_app: Any) -> None:
@@ -585,10 +681,18 @@ class TestInteractiveWizard:
         answer. If the fixture ever grew variables, this test would
         fail at ``ask_select`` (which is deliberately not patched),
         making the coupling visible instead of silent.
+
+        ``_resolve_variables`` returns a two-tuple
+        ``(blueprint, inputs)``. We unpack the tuple and ignore the
+        blueprint here — the assertions are on the *inputs*. The
+        blueprint is available and asserted on in
+        ``TestDispatch::test_create_accepts_positional_blueprint_directly``,
+        where its presence in ``capture_generate`` proves the
+        command passes it through to ``_generate``.
         """
         monkeypatch.setattr(prompts, "ask_text", lambda *a, **k: "wizard-api")
 
-        inputs = create_module._resolve_variables(
+        _blueprint, inputs = create_module._resolve_variables(
             blueprint_id="python.fastapi.api",
             cli_name=None,
             cli_vars={},
@@ -619,7 +723,7 @@ class TestInteractiveWizard:
         monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
 
-        inputs = create_module._resolve_variables(
+        _blueprint, inputs = create_module._resolve_variables(
             blueprint_id="python.fastapi.api",
             cli_name="flag-api",
             cli_vars={},
@@ -754,10 +858,13 @@ class TestNamedValidatorIntegration:
         duplicate the old test was designed to police), that test
         would fail here — the inline validator would accept a name
         the resolver rejects, or vice versa.
+
+        The tuple return of ``_resolve_variables`` is unpacked
+        (blueprint ignored) because the assertion is on the *inputs*.
         """
         # A name the resolver accepts, threaded through the wizard.
         for candidate in ("myapi", "my-api", "a1-b2"):
-            inputs = create_module._resolve_variables(
+            _blueprint, inputs = create_module._resolve_variables(
                 blueprint_id="python.fastapi.api",
                 cli_name=candidate,
                 cli_vars={},
@@ -957,7 +1064,7 @@ class TestBlueprintVariablesThroughResolver:
     @pytest.mark.usefixtures("_fake_blueprint_with_vars", "_force_non_interactive")
     def test_supplied_blueprint_variable_passes_through(self, tmp_path: Path) -> None:
         """A supplied blueprint variable lands in ``_ResolvedInputs.variables``."""
-        inputs = create_module._resolve_variables(
+        _blueprint, inputs = create_module._resolve_variables(
             blueprint_id="python.fastapi.api",
             cli_name="my-api",
             cli_vars={"author": "alice"},
@@ -978,6 +1085,19 @@ class TestBlueprintVariablesThroughResolver:
 # is deliberately pure and does not check the filesystem. The
 # destination-conflict check lives in ``_generate``, and that is the
 # layer these tests exercise.
+#
+# ``_generate`` takes the blueprint document as a keyword-only
+# argument alongside the inputs, because the *planner* needs the
+# document to read ``files[]`` and ``conditional_files[]``. The
+# blueprint used here is a real ``Blueprint`` instance (from
+# ``_make_blueprint``) rather than a fake, so the planner (which
+# ``_generate`` calls) validates against the actual type.
+#
+# ``inputs.variables`` must be a real ``ResolvedValues``, not a plain
+# ``dict``: ``_generate`` calls ``.as_dict()`` on it, and that method
+# is the type boundary the resolver exists to enforce. The
+# ``_resolved_inputs`` helper constructs the correct shape — see its
+# docstring for why a duck-typed fake is not acceptable here.
 # -----------------------------------------------------------------------------
 class TestGeneratePreFlight:
     """``_generate`` refuses to run against an existing destination."""
@@ -997,15 +1117,15 @@ class TestGeneratePreFlight:
         target.mkdir()
         (target / "existing.txt").write_text("present")
 
-        inputs = SimpleNamespace(
-            blueprint_id="python.fastapi.api",
-            project_name="my-api",
-            destination=target,
-            variables={},
-        )
+        inputs = _resolved_inputs(destination=target)
 
         with pytest.raises(FilesystemConflictError):
-            create_module._generate(inputs, dry_run=False, overwrite=False)
+            create_module._generate(
+                blueprint=_make_blueprint(variables=[]),
+                inputs=inputs,
+                dry_run=False,
+                overwrite=False,
+            )
 
     @pytest.mark.unit()
     def test_existing_destination_with_overwrite_reaches_not_implemented(
@@ -1016,15 +1136,15 @@ class TestGeneratePreFlight:
         target.mkdir()
         (target / "existing.txt").write_text("present")
 
-        inputs = SimpleNamespace(
-            blueprint_id="python.fastapi.api",
-            project_name="my-api",
-            destination=target,
-            variables={},
-        )
+        inputs = _resolved_inputs(destination=target)
 
         with pytest.raises(NotImplementedError):
-            create_module._generate(inputs, dry_run=False, overwrite=True)
+            create_module._generate(
+                blueprint=_make_blueprint(variables=[]),
+                inputs=inputs,
+                dry_run=False,
+                overwrite=True,
+            )
 
     @pytest.mark.unit()
     def test_dry_run_renders_plan_even_for_conflicted_destination(
@@ -1042,14 +1162,14 @@ class TestGeneratePreFlight:
         target.mkdir()
         (target / "existing.txt").write_text("present")
 
-        inputs = SimpleNamespace(
-            blueprint_id="python.fastapi.api",
-            project_name="my-api",
-            destination=target,
-            variables={},
-        )
+        inputs = _resolved_inputs(destination=target)
 
-        create_module._generate(inputs, dry_run=True, overwrite=False)
+        create_module._generate(
+            blueprint=_make_blueprint(variables=[]),
+            inputs=inputs,
+            dry_run=True,
+            overwrite=False,
+        )
 
         captured = capsys.readouterr()
         assert "python.fastapi.api" in captured.out
