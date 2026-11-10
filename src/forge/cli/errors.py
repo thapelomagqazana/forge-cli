@@ -35,6 +35,10 @@ renderer. The categories are:
    traceback — those could leak internal details or hints about
    vulnerabilities.
 
+See ``forge/core/exceptions.py`` for the domain error hierarchy, the
+exit-code table, and the rationale for each subclass's exit code.
+This module consumes that hierarchy; it does not redefine it.
+
 Why cancellations are checked before ``ForgeError``
 ---------------------------------------------------
 ``PromptCancelledError`` is a ``UserInputError`` and therefore a
@@ -153,6 +157,33 @@ Design principles
    *category* is cancellation. The classifier checks the more
    specific category first, so the rendering follows the intent, not
    just the inheritance tree.
+
+Why this module imports its error types from ``core``
+-----------------------------------------------------
+``MissingRequiredFlagsError`` and ``PromptCancelledError`` are
+defined in ``forge.core.exceptions``, alongside the rest of the
+domain error hierarchy. They live there because:
+
+    * The exit-code contract is a domain decision (ADR-0005), and a
+      subclass's ``exit_code`` is part of that contract regardless
+      of *which* interaction layer raised it.
+    * Moving them here would force ``core`` to import ``cli`` to
+      re-export them for callers that import from ``core`` today —
+      a dependency inversion (leaf importing leaf-down) that is
+      fragile and hard to reason about.
+    * A future non-CLI entry point (a web form, a gRPC service)
+      could legitimately raise ``MissingRequiredFlagsError`` if it
+      chose to model "required fields not provided in a non-
+      interactive request" that way. Keeping the type in ``core``
+      preserves that option without an import cycle.
+
+The handler *renders* these classes with special semantics (the
+cancellation-first branch, the standard error branch) — but
+rendering is a CLI concern, so the rendering lives here. The
+*types* are domain; the *classifier* is CLI. This module owns the
+classifier and re-exports the types for convenience, so a caller
+using ``from forge.cli.errors import handle_exception,
+MissingRequiredFlagsError`` gets both in one import.
 """
 
 from __future__ import annotations
@@ -163,11 +194,28 @@ import click
 import typer
 
 from forge.cli.ui import print_cancelled, print_error, print_hint
+
+# The domain error hierarchy, plus the two interaction-layer subclasses
+# that live alongside it. See ``forge/core/exceptions.py`` for the
+# table of exit codes and the rationale for each subclass. The two
+# subclasses re-exported here are the ones ``handle_exception``
+# treats as *cancellations* and *aggregated-missing-flags* — they
+# appear in this module's imports because the classifier needs them,
+# not because they are defined here.
 from forge.core.exceptions import (
     ExitCode,
     ForgeError,
+    MissingRequiredFlagsError,
     PromptCancelledError,
 )
+
+__all__ = [
+    "ExitCode",
+    "MissingRequiredFlagsError",
+    "PromptCancelledError",
+    "handle_exception",
+]
+
 
 # -----------------------------------------------------------------------------
 # Cancellation set
@@ -211,8 +259,9 @@ from forge.core.exceptions import (
 # (``echo "" | forge create``) hits EOF at the first read; that is
 # a cancellation, not a bug. ``KeyboardInterrupt`` covers Ctrl+C at
 # any non-Typer point. ``PromptCancelledError`` covers the wizard's
-# own cancellation path (see ``PromptCancelledError``'s docstring
-# for why it is not a plain ``UserInputError`` here).
+# own cancellation path (see its docstring in
+# ``forge.core.exceptions`` for why it is a ``UserInputError`` but
+# rendered as a cancellation here).
 _CANCELLATIONS: tuple[type[BaseException], ...] = (
     PromptCancelledError,
     KeyboardInterrupt,
@@ -371,4 +420,9 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
 # -----------------------------------------------------------------------------
 # Public re-exports
 # -----------------------------------------------------------------------------
-__all__ = ["handle_exception"]
+__all__ = [
+    "ExitCode",
+    "MissingRequiredFlagsError",
+    "PromptCancelledError",
+    "handle_exception",
+]

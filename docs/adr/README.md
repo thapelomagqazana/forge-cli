@@ -23,6 +23,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0011](0011-variable-resolution-is-a-pure-function-over-ordered-sources-.md) | Variable Resolution Is a Pure Function over Ordered Sources with a Single Validation Funnel | Accepted | 2026-11-09 |
 | [0012](0012-cli-output-is-a-versioned-dto-consumed-by-pluggable-renderer.md) | CLI Output Is a Versioned DTO Consumed by Pluggable Renderers | Accepted | 2026-11-09 |
 | [0013](0013-exit-codes-are-a-public-contract-forge-validate-uses-typed-d.md) | Exit Codes Are A Public Contract Forge Validate Uses Typed D | — | — |
+| [0014](0014-templates-render-in-a-sandboxed-strictly-undefined-determini.md) | Templates Render in a Sandboxed, Strictly-Undefined, Deterministic Environment with a Documented Filter Allowlist | Accepted | 2026-11-10 |
 
 ## Creating a new ADR
 
