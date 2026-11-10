@@ -48,34 +48,6 @@ severity:
 - ``4`` — the project was generated but is not verified.
 - ``5`` — the tool is broken. Report it.
 
-The ``hint`` attribute
-----------------------
-Every ``ForgeError`` can carry an optional ``hint`` — a one-line
-remediation suggestion. The handler renders the hint on a separate,
-dimmed line, so the user sees the *problem* and the *fix* together.
-
-``hint`` has two legitimate sources:
-
-* **Class-level default.** Set on the subclass
-  (``SchemaValidationError.hint = "See ..."``). Applies when the
-  caller does not override it. Used for stable, type-wide
-  remediation text.
-* **Instance-level override.** Passed as a keyword to the
-  constructor. Subclasses that declare ``hint`` as a dataclass field
-  with a default accept this; classes that keep it a class attribute
-  do not expose the keyword. See the field-vs-attribute rationale
-  below.
-
-The ``SchemaValidationError`` and ``ModelValidationError`` classes
-declare a class-level hint *and* inherit a constructor that accepts
-an override via the base ``ForgeError.__init__`` path — but as
-dataclasses they call ``Exception.__init__`` directly and therefore
-do **not** accept the ``hint=`` keyword. The class-level hint is
-fixed for these two types, by design: their hints do not need
-per-instance context, and a keyword would widen the surface for no
-use case. If a future need emerges, adding ``hint`` as a field is
-non-breaking.
-
 Why the enum lives here, not in ``cli/``
 ----------------------------------------
 The exit code is a **domain decision**, not a CLI decision. Every
@@ -97,9 +69,10 @@ Hierarchy at a glance
     │   └── MalformedBlueprintError    (2) [slotted dataclass]
     ├── FilesystemConflictError        (3)
     ├── VerificationError              (4)
-    └── StructuredError                (5) [slotted dataclass]
-        ├── SchemaValidationError      (1) [slotted dataclass]
-        └── ModelValidationError       (5) [slotted dataclass]
+    ├── StructuredError                (5) [slotted dataclass; not exported]
+    │   ├── SchemaValidationError      (1) [slotted dataclass]
+    │   └── ModelValidationError       (5) [slotted dataclass]
+    └── TemplateRenderError            (5) [see forge.rendering.errors]
 
 Two design rules follow from this tree:
 
@@ -148,13 +121,12 @@ Why ``ForgeError`` itself is *not* slotted
 base class. Two reasons:
 
 * ``Exception`` carries state that must remain settable
-  (``__traceback__``, ``__context__``, ``__cause__``,
-  ``__notes__``). A slotted base would need to declare slots for all
-  of these, which is fragile across Python versions.
+  (``__traceback__``, ``__context__``, ``__cause__``, ``__notes__``).
+  A slotted base would need to declare slots for all of these, which
+  is fragile across Python versions.
 * The base class is instantiated rarely (only for the
-  "unanticipated failure" fallback). The memory saving is
-  negligible; the risk of interfering with exception mechanics is
-  not.
+  "unanticipated failure" fallback). The memory saving is negligible;
+  the risk of interfering with exception mechanics is not.
 
 The ``hint`` field on dataclass subclasses
 ------------------------------------------
@@ -175,8 +147,8 @@ For subclasses that do not need per-instance hint overrides
 (``MalformedBlueprintError``, ``StructuredError`` and its concrete
 subclasses), ``hint`` stays a class attribute. That is correct: a
 caller who wants to override those hints is outside the current
-contract, and adding a field would widen the surface without a
-use case.
+contract, and adding a field would widen the surface without a use
+case.
 
 Stability
 ---------
@@ -771,6 +743,86 @@ class ModelValidationError(StructuredError):
 
 
 # -----------------------------------------------------------------------------
+# Rendering-specific subclass
+# -----------------------------------------------------------------------------
+# The structured-error shape used by the loader (``source`` +
+# ``errors`` tuples) is *reused* here because the two failure modes
+# share the "collect every violation, render one report" contract.
+# What differs is the identity: template failures come from
+# *execution*, not from document validation, and their ``source`` is a
+# template path, not a blueprint manifest.
+#
+# Keeping this class here (rather than in ``forge/rendering/errors.py``)
+# is a deliberate trade. The alternative — a second error tree rooted in
+# ``forge.rendering`` — would mean two places to change when the exit
+# code contract moves, two hierarchies to reason about when handling
+# errors at the CLI boundary, and two ``hint`` semantics to reconcile.
+# The rendering module documents its own failure modes in
+# ``forge/rendering/errors.py`` (``TemplateRenderError``), and that
+# class delegates ``exit_code`` and ``hint`` through this hierarchy for
+# consistency with the CLI handler.
+#
+# Exit code 5 (INTERNAL_ERROR) is intentional: every *template* failure
+# that the renderer can attribute to user input has already been
+# converted to a ValidationError by the loader path (missing variable,
+# missing file, syntax error). What reaches this class is precisely the
+# category of failures we did *not* anticipate — e.g. a sandbox denial
+# of a legitimate template, an internal Jinja error, or an encoding
+# surprise on a file we already validated. Those are Forge bugs, not
+# user mistakes.
+@dataclass(slots=True)
+class TemplateRenderError(StructuredError):
+    """A template failed during rendering.
+
+    **Exit code:** ``ExitCode.INTERNAL_ERROR`` (5). User-attributable
+    template problems (missing variables, syntax errors, missing
+    includes) are caught earlier and reported as
+    ``SchemaValidationError`` or ``UserInputError``. Reaching this
+    class means the renderer tripped on something the earlier stages
+    did not predict — the correct user action is "report it."
+
+    **When raised:** ``forge.rendering.renderer.TemplateRenderer.render``
+    after user-facing failures have been classified. This class exists
+    to give the CLI handler a *typed* target for that residual
+    category, so log lines can say "internal error" without string
+    matching.
+
+    **What the user should do:** Report it with the template path and
+    the sandbox denial. The hint names the two places that usually
+    need to change.
+
+    .. note::
+       ``forge.rendering.errors.TemplateRenderError`` is the *public*
+       rendering-side type. It carries additional fields
+       (``template``, ``line``, ``col``, ``name``) that the CLI's
+       rendering pipeline consumes. This subclass exists solely to
+       satisfy the CLI handler's ``isinstance(exc, ForgeError)``
+       dispatch — the two are kept distinct on purpose so
+       ``forge.rendering`` remains importable without pulling in
+       ``forge.core.exceptions`` (which would create a cycle in the
+       other direction). The CLI's error handler bridges them
+       explicitly (see ``forge.cli.errors.handle_exception``).
+    """
+
+    exit_code = ExitCode.INTERNAL_ERROR
+    hint = (
+        "This is a Forge bug, not an input error. Report it with the "
+        "template path and the offending line; include the "
+        "`forge --version` output."
+    )
+
+    def __str__(self) -> str:
+        """Render with a "template" prefix and a bug-report footer."""
+        if not self.errors:
+            return f"Template '{self.source}' failed to render — this is a " f"Forge bug."
+        lines = [f"Template '{self.source}' failed to render — this is a " f"Forge bug:"]
+        for pointer, message in self.errors:
+            rendered_pointer = pointer if pointer else "/"
+            lines.append(f"  • {rendered_pointer}: {message}")
+        return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
 # Public re-exports
 # -----------------------------------------------------------------------------
 # Adding to ``__all__`` is non-breaking; removing from it is breaking.
@@ -782,6 +834,10 @@ class ModelValidationError(StructuredError):
 # because the correct response differs. The class remains importable
 # (``from forge.core.exceptions import StructuredError``) for handlers
 # that legitimately need to share rendering code across both subtypes.
+#
+# ``TemplateRenderError`` is included because the CLI handler dispatches
+# on it directly; it is a peer of ``ModelValidationError`` (both are
+# internal-error categories with a bug-report footer), not a base class.
 __all__ = [
     "BlueprintError",
     "DiscoveryError",
@@ -793,6 +849,7 @@ __all__ = [
     "ModelValidationError",
     "PromptCancelledError",
     "SchemaValidationError",
+    "TemplateRenderError",
     "UserInputError",
     "VerificationError",
 ]
