@@ -51,7 +51,7 @@ cd payments-api
 forge verify
 ```
 
-That is the intended experience. In the current alpha, `forge list`, `forge validate`, and the engine components they rely on (blueprint discovery, sandboxed template rendering, deterministic file planning) are complete. `forge create` echoes the arguments you passed; `forge verify` reports `not_implemented`. The reasoning behind the alpha's shape is in [Where This Is Today](#where-this-is-today), and the roadmap is in [Status](#status).
+That is the intended experience. In the current alpha, `forge list`, `forge validate`, **and `forge create --dry-run`** are complete, together with the engine components they rely on (blueprint discovery, sandboxed template rendering, variable resolution, deterministic file planning, sandboxed staging). The write path of `forge create` — staging, commit, backups, `--overwrite` — is complete at the *code* level and being finalized at the *test* level. `forge verify` remains a stub. The reasoning behind the alpha's shape is in [Where This Is Today](#where-this-is-today), and the roadmap is in [Status](#status).
 
 ---
 
@@ -59,13 +59,15 @@ That is the intended experience. In the current alpha, `forge list`, `forge vali
 
 Forge CLI is under active development. The **command surface** — `list`, `create`, `validate`, `verify`, `doctor`, `ping` — is complete: every command is registered by the file-based registry, `forge --help` and `forge --version` work end-to-end, and each command's argument shapes, help text, exit-code contract, and `--json` envelope are already final and enforced by the test suite.
 
-The **engine** that will power generation is also complete at the component level — each piece exists today as a tested, bounded module ready for the pipeline to compose them:
+The **engine** that powers generation is also complete — each piece is a tested, bounded module, and the pipeline that composes them is now in place:
 
 - **Blueprint discovery** — layered sources (bundled + local), deterministic precedence, structured warnings. [ADR 0009](docs/adr/0009-blueprint-discovery-and-precedence.md).
 - **Blueprint loading** — safe YAML parse, schema + Pydantic validation, aggregated, actionable errors. [ADR 0010](docs/adr/0010-loader-result-and-error-aggregation.md).
 - **Variable resolution** — flags > prompts > defaults, one validation funnel, `ResolvedValues` as the only type the renderer accepts. [ADR 0011](docs/adr/0011-variable-resolution-precedence-and-validation.md).
 - **Sandboxed Jinja2 rendering** — allowlisted filters, hardened sandbox, deterministic output, structured `TemplateRenderError`. [ADR 0014](docs/adr/0014-sandboxed-deterministic-templates.md).
 - **File planning** — pure, total, sorted `PlannedFile[]` with collision detection and path-safety. [ADR 0015](docs/adr/0015-planning-is-pure-and-total.md).
+- **Filesystem safety layer** — one resolver, one policy, one staging discipline, backups for `--overwrite`, exit-code contract for safety refusals. [ADR 0017](docs/adr/0017-filesystem-safety-layer.md).
+- **Dry-run plan builder** — pure `GenerationPlan` DTO, versioned JSON contract, deterministic output, no filesystem mutations. [ADR 0018](docs/adr/0018-dry-run-is-a-pure-plan-builder.md).
 
 The **command bodies** that orchestrate these components are at different levels of completeness:
 
@@ -79,13 +81,16 @@ The **command bodies** that orchestrate these components are at different levels
 | `forge list --source <s>` | ✅ Complete | Filters the catalogue by layer (`official` or `local`). |
 | `forge validate <path>` | ✅ Complete | Runs the full load pipeline (YAML → schema → model → files); emits human or `--json` reports. Exit `0` valid, `2` blueprint error. |
 | `forge validate --json <path>` | ✅ Complete | Stable JSON envelope with `valid` and `errors[]`. |
-| `forge create` | 🚧 Stub | Echoes the arguments you passed. Planning and rendering components exist; the scaffolding/writer pipeline is a later task. |
+| `forge create --dry-run` | ✅ Complete | Builds the full generation plan, renders it as human text or `--json`, exits `0` on clean plan and `7` on collisions. **Never writes.** |
+| `forge create --dry-run --json` | ✅ Complete | Stable JSON envelope (versioned, deterministic, ANSI-free). |
+| `forge create` | 🚧 In progress | The generation pipeline (plan → safety → backup → stage → commit) is implemented; test coverage for the write path is being finalized this iteration. |
+| `forge create --overwrite` | 🚧 In progress | Backups-before-replace is implemented; test coverage is being finalized this iteration. |
 | `forge verify` | 🚧 Stub | Emits `{"status": "not_implemented"}` in JSON mode. The verification engine is a later task. |
 | `forge doctor` | 🚧 Stub | Emits `{"status": "not_implemented"}` in JSON mode. The diagnostics engine is a later task. |
 
-The stubs are intentional: they are the *contract* that future implementations must satisfy, and the test suite already enforces that contract. A command that prints `TODO: list blueprints` still exits `0`, still accepts every documented flag, and still emits a valid `--json` envelope — so a script written against the *intended* contract does not break when the body lands.
+The stubs are intentional: they are the *contract* that future implementations must satisfy, and the test suite already enforces that contract. A command that prints `TODO: verify` still exits `0` (or `4` per the verification contract), still accepts every documented flag, and still emits a valid `--json` envelope — so a script written against the *intended* contract does not break when the body lands.
 
-The three official blueprints ship today: `forge list` shows them, `forge list --json` serialises them, and `forge list --source local` shows overrides under `.forge/blueprints/`. `forge validate` runs the full validation pipeline against any blueprint, including custom ones.
+The three official blueprints ship today: `forge list` shows them, `forge list --json` serialises them, and `forge list --source local` shows overrides under `.forge/blueprints/`. `forge validate` runs the full validation pipeline against any blueprint, including custom ones. `forge create --dry-run` builds a complete, inspectable plan against any blueprint and any destination — **without ever touching the filesystem.**
 
 ---
 
@@ -162,25 +167,80 @@ A broken blueprint gets every error at once — with a path, a message, and a hi
 
 For CI, add `--json` for a stable envelope (`valid`, `errors[]`) and switch on the exit code (`0` valid, `2` invalid, `1` tool failure). The full contract is in [`docs/reference/CLI_VALIDATE_OUTPUT.md`](docs/reference/CLI_VALIDATE_OUTPUT.md) and [ADR 0013](docs/adr/0013-exit-codes-as-public-contract.md).
 
-### 4. Create a Project
+### 4. Preview a Project (dry-run)
+
+**The safest way to see what `forge create` would do** — including collisions — without writing anything:
 
 ```bash
-forge create python.fastapi.api --name payments-api
+forge create python.fastapi.api \
+    --name payments-api \
+    --var project=payments-api \
+    --no-interactive \
+    --dry-run
 ```
 
-> 🚧 **The `create` command body is a stub in the current alpha.** It echoes the arguments you passed. The generation pipeline — which will plan files, stage them, validate the staging directory, and commit atomically — composes the planning and rendering components that already exist. The *argument contract* is final: `--name` is required, `--output` defaults to `.`, `--dry-run` and `--overwrite` are accepted, and the help text documents every exit code.
+```
+Dry-run: python.fastapi.api v1.0.0
+Destination: /home/user/projects/payments-api
+Mode: no-overwrite
 
-When complete, `forge create` will:
+Would create 11 file(s), skip 0, find 0 collision(s), 0 warning(s).
+
+Files to create:
+  + .dockerignore  (copy; from templates/.dockerignore)
+  + .gitignore  (copy; from templates/.gitignore)
+  + Dockerfile  (render; from templates/Dockerfile.j2)
+  + README.md  (render; from templates/README.md.j2)
+  + compose.yaml  (render; from templates/compose.yaml.j2)
+  + pyproject.toml  (render; from templates/pyproject.toml.j2)
+  + src/payments_api/__init__.py  (copy; from templates/src/{{project}}/__init__.py)
+  + src/payments_api/main.py  (render; from templates/src/{{project}}/main.py.j2)
+  + src/payments_api/settings.py  (render; from templates/src/{{project}}/settings.py.j2)
+  + tests/conftest.py  (copy; from templates/tests/conftest.py)
+  + tests/test_health.py  (render; from templates/tests/test_health.py.j2)
+
+No collisions, no warnings. Re-run without --dry-run to apply.
+```
+
+For CI, use `--json` for a versioned, deterministic envelope and switch on the exit code (`0` clean, `7` collisions, `1`/`2`/`3`/`5` for other error categories):
+
+```bash
+forge create python.fastapi.api \
+    --name payments-api --var project=payments-api \
+    --no-interactive --dry-run --json > plan.json
+case $? in
+  0) echo "plan is clean" ;;
+  7) echo "collisions detected — inspect plan.json" ; exit 1 ;;
+  *) echo "dry-run failed" ; exit 1 ;;
+esac
+```
+
+The dry-run **never writes** to the destination. Filesystem state before and after every dry-run is byte-identical (verified by a fingerprint test). The full contract — schema, guarantees, exit codes, and the plan's shape — is in [`docs/reference/DRY_RUN_PLAN.md`](docs/reference/DRY_RUN_PLAN.md) and [ADR 0018](docs/adr/0018-dry-run-is-a-pure-plan-builder.md).
+
+### 5. Create a Project
+
+```bash
+forge create python.fastapi.api \
+    --name payments-api \
+    --var project=payments-api \
+    --no-interactive
+```
+
+> 🚧 **The `create` write path is being finalized this iteration.** The pipeline (plan → safety validation → backup → stage → commit) is implemented end-to-end and the plan-side contract is fully tested. The write path's integration tests are the current focus. If you run `create` today, run it against a scratch directory, or use `--dry-run` — which is fully supported and never writes.
+
+When the write path is finalized, `forge create` will:
 
 1. Load the `python.fastapi.api` blueprint (loading pipeline: complete).
 2. Resolve and validate your inputs (resolver: complete).
 3. Plan the file manifest with collision detection (planner: complete).
-4. Render all files into a **staging directory** (renderer: complete; staging: later task).
-5. Validate the staged output (later task).
-6. Commit the project atomically to `./payments-api/` (later task).
+4. Validate the plan against the destination filesystem (safety layer: complete).
+5. Back up existing files if `--overwrite` was passed (safety layer: complete).
+6. Render all files into a **staging directory** and commit atomically (staging: complete).
 7. Write a `.forge/manifest.json` recording the blueprint version and your configuration (later task).
 
-### 5. Verify the Project
+Steps 1–6 are implemented. Step 7 is a later task.
+
+### 6. Verify the Project
 
 ```bash
 cd payments-api
@@ -191,7 +251,7 @@ forge verify
 
 When complete, `forge verify` will run the blueprint's declared verification checks (required files, dependency manifests, lint, type-check, tests, build, Docker) and report a structured result.
 
-### 6. Start Building
+### 7. Start Building
 
 Your project will be a normal software project. Forge will not leave behind any runtime dependency, hidden scripts, or magic. It will generate code that belongs to you.
 
@@ -212,15 +272,15 @@ uv run uvicorn payments_api.main:app --reload
 - ✅ **Reject malformed blueprints** with a warning that names the file, so the rest of the catalogue still loads — complete today.
 - ✅ **Reject schema-invalid blueprints** with a JSON-Pointer error path — complete today.
 - ✅ **Validate blueprints on demand** — `forge validate` runs the full load pipeline (YAML → schema → model → files) and reports every error with a path and hint — complete today.
-- ✅ **Sandbox and render templates** — deterministic output, allowlisted filters, hardened Jinja2 sandbox, structured errors — complete today at the engine level.
-- ✅ **Plan file writes** — pure, total planner with collision detection and path-safety — complete today at the engine level.
-- ✅ **Resolve variables** with a documented precedence and one validation funnel — complete today at the engine level.
-- ⏳ **Generate complete projects** — composing the planner, renderer, and resolver into a staging/commit pipeline. *(Later task.)*
-- ⏳ **Preview before applying** with `--dry-run` and a detailed generation plan. *(Later task.)*
+- ✅ **Sandbox and render templates** — deterministic output, allowlisted filters, hardened Jinja2 sandbox, structured errors — complete today.
+- ✅ **Plan file writes** — pure, total planner with collision detection and path-safety — complete today.
+- ✅ **Resolve variables** with a documented precedence and one validation funnel — complete today.
+- ✅ **Preview a generation** with `--dry-run` — complete plan, human or `--json`, **never writes**, exits `7` on collisions so CI can gate safely — complete today.
+- ⏳ **Generate complete projects** — the pipeline (plan → safety → backup → stage → commit) is implemented; the write path's integration test coverage is being finalized this iteration.
 - ⏳ **Verify the generated project** with explicit, structured checks. *(Verification engine: later task.)*
 - ⏳ **Record project provenance** in `.forge/manifest.json`. *(Manifest generation: later task.)*
 
-The command *surface* — argument shapes, help text, exit-code contracts, JSON envelopes — is complete today and enforced by the test suite. The engine *components* that will power generation are complete and independently tested. The composition of those components into the end-to-end pipeline is the remaining work.
+The command *surface* — argument shapes, help text, exit-code contracts, JSON envelopes — is complete today and enforced by the test suite. The engine *components* that power generation are complete and independently tested. The **dry-run pipeline is fully complete** — it exercises every engine component from start to finish, without writing. The write path composes the same components plus the staging/commit step; its integration test coverage is the current work item.
 
 ### It Does Not
 
@@ -254,7 +314,7 @@ Each blueprint is a **versioned, validated specification** and is designed to pa
 6. Run smoke tests.
 7. Publish the blueprint.
 
-If any step fails, the blueprint is not released. Steps 2, 3, and 4 are already exercised by the blueprint verification contracts in the manifests; steps 1, 5, and 6 will run once the generation and verification engines land.
+If any step fails, the blueprint is not released. Steps 2, 3, and 4 are already exercised by the blueprint verification contracts in the manifests; steps 1, 5, and 6 will run once the write and verification engines are fully integrated.
 
 **Roadmap blueprints** (not shipped today): a full-stack FastAPI blueprint with SQLAlchemy, Alembic, and PostgreSQL; a Playwright-based test-automation blueprint; a React blueprint with Playwright E2E. The three shipped blueprints cover the same categories; the aspirational ones add specific toolchains that will ship as separate blueprints so a user can choose.
 
@@ -295,6 +355,17 @@ Before anything is written, the blueprint is turned into a **manifest of planned
 - Is a pure, total function: no I/O, no rendering of file bodies, deterministic output.
 
 The design is recorded in [ADR 0015](docs/adr/0015-planning-is-pure-and-total.md), and the destination rules are documented in [`docs/reference/PLANNING.md`](docs/reference/PLANNING.md).
+
+### Dry-Run
+
+`--dry-run` is a **full, inspectable preview** of what `create` would do. It:
+
+- Builds the complete plan (files to create, files skipped by conditions, collisions, warnings).
+- Renders it as human text or as a versioned JSON envelope.
+- Exits `7` (not `6`) when the plan contains collisions, so CI can gate on "would this conflict?" without ever risking a write.
+- **Never writes** — the destination is byte-identical before and after, verified by a fingerprint test.
+
+The distinction between exit `6` (write refused) and exit `7` (dry-run found collisions) is deliberate and load-bearing: `6` means "retry with `--overwrite`"; `7` means "inspect the plan, then decide." The design is recorded in [ADR 0018](docs/adr/0018-dry-run-is-a-pure-plan-builder.md), and the JSON contract is in [`docs/reference/DRY_RUN_PLAN.md`](docs/reference/DRY_RUN_PLAN.md).
 
 ### Manifests
 
@@ -351,12 +422,13 @@ Forge CLI takes filesystem safety seriously:
 
 | Guarantee | How it is (or will be) enforced |
 | :--- | :--- |
-| **No silent overwrites** | Generation fails on collision unless `--overwrite` is explicitly passed. Collision detection is complete today at the planning level. |
-| **No partial projects** | Files are rendered into a staging directory, validated, then committed atomically. *(Staging/commit: later task.)* |
+| **No silent overwrites** | Generation fails on collision unless `--overwrite` is explicitly passed. Collision detection is complete today at the planning level; the write path's collision-refusal is complete at the code level and being finalized at the test level. |
+| **No partial projects** | Files are rendered into a staging directory, validated, then committed atomically. Complete at the code level. |
 | **No path traversal** | Destination and source paths are resolved through one safety net; absolute paths, `..`, empty segments, and NUL bytes are rejected before any write. Complete today. |
 | **No arbitrary code execution** | Templates render in a hardened Jinja2 sandbox; filters are allowlisted; escape routes are denied. Complete today. |
 | **Deterministic rendering** | No time, no randomness, sorted context — same inputs produce byte-identical output. Complete today. |
-| **Rollback on failure** | A failed commit triggers automatic rollback to the pre-generation state. *(Transaction engine: later task.)* |
+| **Dry-run never writes** | Two mechanisms: the plan builder never calls a writer (structural), and a fingerprint test verifies the destination tree is byte-identical before and after every dry-run. Complete today. |
+| **Rollback on failure** | A failed commit triggers automatic rollback to the pre-generation state. Backups-before-replace are implemented; full transactional rollback is a later task. |
 
 See [`docs/security/`](docs/security/) for details.
 
@@ -371,6 +443,9 @@ See [`docs/security/`](docs/security/) for details.
 | `forge list --category <c>` | Only list blueprints in the given category. |
 | `forge list --source <s>` | Only list blueprints from `official` or `local`. |
 | `forge create <blueprint> --name <name>` | Create a new project from a blueprint. |
+| `forge create <blueprint> --name <name> --dry-run` | Preview what create would do, without writing. |
+| `forge create <blueprint> --name <name> --dry-run --json` | Preview as a versioned JSON envelope for scripting/CI. |
+| `forge create <blueprint> --name <name> --overwrite` | Replace existing files, taking a timestamped backup of each first. |
 | `forge validate <path>` | Validate a blueprint definition without generating a project. |
 | `forge validate --json <path>` | Emit the validation result as JSON. |
 | `forge verify` | Run the project's verification baseline. |
@@ -389,11 +464,15 @@ Full documentation for each command is available in [`docs/commands/`](docs/comm
 | `0` | Success. |
 | `1` | User input error (e.g., invalid project name, cancelled prompt) **or** an internal tool failure (`forge validate` distinguishes these on stderr). |
 | `2` | Blueprint error (missing, malformed, schema-invalid, or incompatible with the installed Forge). `forge validate` uses this for *invalid* blueprints so CI can tell "the input is broken" from "the tool is broken". |
-| `3` | Filesystem conflict (e.g., target directory exists, path escapes permitted root). |
+| `3` | Filesystem conflict (e.g., path escapes permitted root, unwritable parent). `--overwrite` cannot help here. |
 | `4` | Verification failed (one or more required checks did not pass) **or** a template rendering error. |
 | `5` | Internal error (unexpected failure — a Forge bug, please report). |
+| `6` | **Write**-path collision — the target exists and `--overwrite` was not passed. The write was refused; nothing was modified. |
+| `7` | **Dry-run** collision — the plan was produced and contains collisions. **Nothing was written.** Inspect the plan, then decide. |
 
-Stable exit codes make Forge CLI safe to use in CI pipelines and scripts. The codes are documented in the help text of every command, so `forge <command> --help` is the canonical reference. The full contract, including which exception types map to which codes, is in [`docs/reference/exit-codes.md`](docs/reference/exit-codes.md) and [ADR 0005](docs/adr/0005-stabilize-exit-codes-as-a-public-contract.md) (with the `forge validate` refinement in [ADR 0013](docs/adr/0013-exit-codes-as-public-contract.md)).
+The distinction between `6` and `7` is deliberate: `6` means "retry with `--overwrite` or choose a different destination"; `7` means "inspect the plan on stdout, then decide." A CI script that gates on `7` never risks a write; a script that saw `6` could not.
+
+Stable exit codes make Forge CLI safe to use in CI pipelines and scripts. The codes are documented in the help text of every command, so `forge <command> --help` is the canonical reference. The full contract, including which exception types map to which codes, is in [`docs/reference/exit-codes.md`](docs/reference/exit-codes.md) and [ADR 0005](docs/adr/0005-stabilize-exit-codes-as-a-public-contract.md) (with the `forge validate` refinement in [ADR 0013](docs/adr/0013-exit-codes-as-public-contract.md) and the dry-run distinction in [ADR 0018](docs/adr/0018-dry-run-is-a-pure-plan-builder.md)).
 
 ---
 
@@ -405,19 +484,34 @@ Stable exit codes make Forge CLI safe to use in CI pipelines and scripts. The co
 forge list
 forge list --json | jq '.blueprints[].id'
 
-# The generation pipeline is a later task; today `forge create` echoes
-# the arguments you passed, so this shows the contract, not the output.
-forge create python.fastapi.api --name payments-api
-```
+# Preview the generation without writing anything.
+forge create python.fastapi.api \
+    --name payments-api \
+    --var project=payments-api \
+    --no-interactive \
+    --dry-run
 
-Once generation lands:
-
-```bash
-forge create python.fastapi.api --name payments-api
+# When the write path is finalized, drop --dry-run to apply:
+forge create python.fastapi.api --name payments-api --var project=payments-api --no-interactive
 cd payments-api
 uv sync
 uv run uvicorn payments_api.main:app --reload
 forge verify
+```
+
+### Preview Generation in CI (gating on collisions)
+
+```bash
+forge create python.fastapi.api \
+    --name payments-api \
+    --var project=payments-api \
+    --no-interactive \
+    --dry-run --json > plan.json
+case $? in
+  0) echo "plan is clean" ;;
+  7) echo "collisions detected — inspect plan.json" ; exit 1 ;;
+  *) echo "dry-run failed" ; exit 1 ;;
+esac
 ```
 
 ### Validate a Custom Blueprint
@@ -474,7 +568,7 @@ forge list
 ```bash
 forge list --json > catalogue.json
 forge validate --json .forge/blueprints/acme.internal.api > validation.json
-forge create python.fastapi.api --name payments-api --no-interactive
+forge create python.fastapi.api --name payments-api --var project=payments-api --no-interactive --dry-run --json > plan.json
 cd payments-api
 forge verify --json > verification-report.json
 ```
@@ -524,13 +618,17 @@ Add this line to your `~/.bashrc` or `~/.zshrc` to make it permanent.
 
 The wheel should ship three official blueprints. If `forge list` shows zero, the installation is broken — the bundled resources are missing. Run `pip show -f forge-cli | grep blueprints` to check; if you see nothing, reinstall with `uv tool install --force forge-cli`. This is a packaging bug; please report it with your Python version and how you installed Forge.
 
-### `Target directory already exists` (once generation lands)
+### `Target directory already exists`
 
-Forge CLI refuses to overwrite existing directories by default. Use a different `--name` or `--output`, or pass `--overwrite` if you are certain you want to replace the directory.
+Forge CLI refuses to overwrite existing files by default. Use a different `--name` or `--output`, or pass `--overwrite` if you are certain you want to replace the existing files (a timestamped backup is created for each). To preview what would be overwritten first, run with `--dry-run --json` and inspect the `collisions[]` array.
 
 ### `Blueprint validation failed`
 
 A blueprint definition is malformed. Run `forge validate <path>` for a detailed, path-aware error report. Every error is reported with a JSON-Pointer-style path, a message, and a hint; you can fix every problem in one pass. In CI, use `forge validate --json <path>` and switch on the exit code (`0` valid, `2` invalid, `1` tool error).
+
+### `undefined variable: project` (or similar) during dry-run
+
+The blueprint's file destinations reference a template variable the blueprint does not declare in `variables:[]`. Supply it explicitly with `--var project=<name>` — the flag is merged into the plan's variable mapping even for undeclared keys, so template-only variables work. If you own the blueprint, consider declaring the variable in its `variables:` list so it appears in `forge validate`'s report.
 
 For more troubleshooting, see [`docs/commands/`](docs/commands/) or [open an issue](https://github.com/thapelomagqazana/forge-cli/issues/new?template=bug_report.yml).
 
@@ -540,11 +638,12 @@ For more troubleshooting, see [`docs/commands/`](docs/commands/) or [open an iss
 
 🚧 **Alpha (v0.1.0a0)**
 
-Forge CLI is under active development. The command surface is complete, `forge list` and `forge validate` are functional, and every command is registered by the file-based registry. The engine components that will power generation — discovery, loading, variable resolution, sandboxed rendering, file planning — are complete and independently tested. The remaining work is composing them into the generation pipeline, plus the verification, diagnostics, and configuration engines. The product is **not yet recommended for production use**.
+Forge CLI is under active development. The command surface is complete, `forge list`, `forge validate`, and **`forge create --dry-run`** are fully functional, and every command is registered by the file-based registry. The engine components that power generation — discovery, loading, variable resolution, sandboxed rendering, file planning, safety, dry-run — are complete and independently tested. The write path of `forge create` is implemented end-to-end and being finalized at the test level. The remaining work is the verification, diagnostics, and configuration engines, plus manifest generation and end-to-end integration coverage of the write path. The product is **not yet recommended for production use**.
 
 The roadmap beyond the alpha includes:
 
-- **Generation pipeline** — composing the existing planner, renderer, and resolver into a staging/commit transaction with manifest generation and summary rendering.
+- **Write-path finalization** — completing the integration test coverage of `forge create` (non-dry-run), including `--overwrite` backups and end-to-end staging/commit.
+- **Manifest generation** — writing `.forge/manifest.json` during `create` so future lifecycle features (drift detection, safe updates) can read project provenance.
 - **Verification engine** — manifest loading, blueprint loading, check registry, check handlers, result aggregation, summary rendering.
 - **Diagnostics engine** — environment checks, manifest validation, project structure checks, hint rendering.
 - **Blueprint library** — expand the three launch blueprints and pass each through a clean-environment verification gate.
