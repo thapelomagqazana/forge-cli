@@ -1,0 +1,13 @@
+# The `.gitkeep` keeps this directory in the repository even though it
+# conceptually represents a *destination* tree the tests prepare by
+# writing files into a tmp copy. Tests using it do:
+#
+#     import shutil, tmp_path
+#     shutil.copytree(_FIX / "collision-in-destination", tmp_path / "dest")
+#
+# and then call `DryRunService.plan(..., destination=tmp_path / "dest")`.
+# The `.gitkeep` is the only committed content; the "collisions" the
+# tests detect are seeded by the test itself (e.g. a `pyproject.toml`
+# with content "old") so the fixture remains useful for other scenarios
+# without carrying a file that would need to be committed *and*
+# hash-checked.

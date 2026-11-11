@@ -1,0 +1,31 @@
+schema_version: "1.0.0"
+id: sample.missingvar
+name: Missing Variable Demo
+version: 1.0.0
+description: >
+  A blueprint whose single conditional group references a variable
+  (``include_ci``) that the blueprint itself does not declare.
+
+  Under a correct resolver + evaluator pipeline, planning against an
+  empty variable set produces a ``condition.undefined_variable``
+  finding, and the dry-run service returns a ``DryRunError`` instead
+  of a partial plan. The fixture deliberately has *no* static
+  ``files:`` entries — so if the service ever regressed to "swallow
+  the condition error and return whatever files exist," the test would
+  catch it by observing an empty create list instead of a plan, which
+  the assertion ``isinstance(result, DryRunError)`` would reject.
+category: api
+maintainer: "@forge-team"
+compatibility:
+  min_forge_version: 1.0.0
+variables: []
+files: []
+conditional_files:
+  - condition: include_ci == true
+    files:
+      - source: templates/.github/workflows/ci.yml.j2
+        destination: .github/workflows/ci.yml
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

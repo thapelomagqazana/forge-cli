@@ -1,0 +1,28 @@
+schema_version: "1.0.0"
+id: sample.copies
+name: Copy Kinds Demo
+version: 1.0.0
+description: >
+  A blueprint whose file entries exercise the copy path: one binary
+  image and one plain Python source that is deliberately not a
+  template. Both must be planned as ``copy`` so the renderer never
+  tries to parse them as Jinja.
+
+  Two entries, no conditional groups, no variables — the fixture
+  exists solely to pin the non-template half of the kind-classification
+  rule (``FileMapper._kind_for``) on a blueprint whose *only* job is to
+  contain non-templates.
+category: api
+maintainer: "@forge-team"
+compatibility:
+  min_forge_version: 1.0.0
+variables: []
+files:
+  - source: templates/assets/logo.png
+    destination: assets/logo.png
+  - source: templates/scripts/setup.py
+    destination: scripts/setup.py
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

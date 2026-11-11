@@ -1,0 +1,29 @@
+{
+  "blueprint_id": "sample.dryrun",
+  "blueprint_version": "1.0.0",
+  "collisions": [],
+  "destination": "/fixed/path/used/in/golden/tests",
+  "files_to_create": [
+    {
+      "destination": "pyproject.toml",
+      "kind": "render",
+      "source": "templates/pyproject.toml.j2"
+    },
+    {
+      "destination": "src/main.py",
+      "kind": "render",
+      "source": "templates/main.py.j2"
+    }
+  ],
+  "files_to_skip": [
+    {
+      "condition": "include_docker == true",
+      "destination": "Dockerfile",
+      "reason": "condition evaluated false",
+      "source": "templates/Dockerfile.j2"
+    }
+  ],
+  "overwrite": false,
+  "schema_version": "1.0.0",
+  "warnings": []
+}

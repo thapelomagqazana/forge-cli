@@ -18,28 +18,53 @@ runs ``forge create`` and branches on ``$?`` is depending on the
 *meaning* of each code. Changing any of them is a breaking change and
 requires a major version bump.
 
-+-------+----------------------+-------------------------------------------+
-| Code  | Name                 | When it is returned                       |
-+=======+======================+===========================================+
-| 0     | SUCCESS              | The command completed.                    |
-+-------+----------------------+-------------------------------------------+
-| 1     | USER_ERROR           | Invalid input, missing argument, or       |
-|       |                      | cancellation.                             |
-+-------+----------------------+-------------------------------------------+
-| 2     | BLUEPRINT_ERROR      | A blueprint is missing, malformed, or     |
-|       |                      | incompatible with the installed Forge.    |
-+-------+----------------------+-------------------------------------------+
-| 3     | FILESYSTEM_CONFLICT  | A target would be overwritten, or a path  |
-|       |                      | escapes the permitted root.               |
-+-------+----------------------+-------------------------------------------+
-| 4     | VERIFICATION_FAILED  | One or more required checks did not pass. |
-+-------+----------------------+-------------------------------------------+
-| 5     | INTERNAL_ERROR       | An unexpected exception. This is a bug    |
-|       |                      | in Forge; the user should report it.      |
-+-------+----------------------+-------------------------------------------+
-| 6     | COLLISION            | A planned write would replace an existing |
-|       |                      | file and ``--overwrite`` was not passed.  |
-+-------+----------------------+-------------------------------------------+
++-------+-----------------------+-------------------------------------------+
+| Code  | Name                  | When it is returned                       |
++=======+=======================+===========================================+
+| 0     | SUCCESS               | The command completed.                    |
++-------+-----------------------+-------------------------------------------+
+| 1     | USER_ERROR            | Invalid input, missing argument, or       |
+|       |                       | cancellation.                             |
++-------+-----------------------+-------------------------------------------+
+| 2     | BLUEPRINT_ERROR       | A blueprint is missing, malformed, or     |
+|       |                       | incompatible with the installed Forge.    |
++-------+-----------------------+-------------------------------------------+
+| 3     | FILESYSTEM_CONFLICT   | A target would be overwritten, or a path  |
+|       |                       | escapes the permitted root.               |
++-------+-----------------------+-------------------------------------------+
+| 4     | VERIFICATION_FAILED   | One or more required checks did not pass. |
++-------+-----------------------+-------------------------------------------+
+| 5     | INTERNAL_ERROR        | An unexpected exception. This is a bug    |
+|       |                       | in Forge; the user should report it.      |
++-------+-----------------------+-------------------------------------------+
+| 6     | COLLISION             | A planned **write** would replace an      |
+|       |                       | existing file and ``--overwrite`` was not |
+|       |                       | passed. The write was refused; nothing    |
+|       |                       | was modified.                             |
++-------+-----------------------+-------------------------------------------+
+| 7     | DRY_RUN_COLLISIONS    | A **dry-run** produced a plan that        |
+|       |                       | contains collisions. The plan was         |
+|       |                       | emitted; **nothing was written.**         |
++-------+-----------------------+-------------------------------------------+
+
+Note on 6 vs 7
+--------------
+Both codes signal "the plan and the destination disagree". They are
+deliberately *distinct* because the user's next action is different
+in each case:
+
+* **6 (``COLLISION``)** — a real write was attempted and refused.
+  The write did not happen. The user's next step is to pass
+  ``--overwrite`` or change the destination, then re-run create.
+* **7 (``DRY_RUN_COLLISIONS``)** — a dry-run finished successfully;
+  the plan is on stdout (with the collisions listed inside it).
+  Nothing was written. The user's next step is to *inspect* the
+  plan and then decide.
+
+Collapsing them into one code would force every consumer to inspect
+stdout (or a message) to tell the two apart — exactly the
+string-matching this contract eliminates. See ADR-0013 (exit codes
+as contract) and ADR-0018 (dry-run as pure plan builder).
 
 Note on the safety layer's exit codes
 -------------------------------------
@@ -58,7 +83,7 @@ Why these specific codes?
 The codes are chosen so that the **first digit** encodes the severity:
 
 - ``0`` — success.
-- ``1`` to ``3``, ``6`` — the user can fix this without help.
+- ``1`` to ``3``, ``6``, ``7`` — the user can fix this without help.
 - ``4`` — the project was generated but is not verified.
 - ``5`` — the tool is broken. Report it.
 
@@ -72,6 +97,15 @@ that:
       when it can actually help. Offering it for a traversal attempt
       would teach users to pass the flag reflexively, defeating its
       safety purpose.
+
+``DRY_RUN_COLLISIONS`` (7) is a distinct value rather than folding
+into 6, so that:
+
+    * CI can tell "a real write was refused" (6) from "a dry-run
+      found conflicts" (7) — two different states of the
+      filesystem, two different automation patterns.
+    * A gating script can say ``if exit == 7: parse plan.json and
+      decide`` without mistaking the case for a failed create.
 
 Why the enum lives here, not in ``cli/``
 ----------------------------------------
@@ -100,6 +134,14 @@ Hierarchy at a glance
     │   ├── SchemaValidationError      (1) [slotted dataclass]
     │   └── ModelValidationError       (5) [slotted dataclass]
     └── TemplateRenderError            (5) [slotted dataclass]
+
+Note that ``DRY_RUN_COLLISIONS`` (7) is *not* associated with any
+exception class. It is used exclusively by the ``create`` command's
+``_run_dry_run`` function via a direct ``raise SystemExit(...)`` —
+because the dry-run path does not fail; it *succeeds with a
+notable outcome*. Representing that outcome as an exception would
+be a category error: exceptions are for failures, and the dry-run's
+plan is not a failure.
 
 Two design rules follow from this tree:
 
@@ -203,7 +245,7 @@ Stability
 The following are public API and will not change without a major
 version bump:
 
-- The ``ExitCode`` values (``0`` through ``6``).
+- The ``ExitCode`` values (``0`` through ``7``).
 - The ``ForgeError`` attributes (``exit_code``, ``hint``).
 - The subclass names in ``__all__``.
 - The constructor signature
@@ -225,7 +267,9 @@ version bump:
 
 Adding a new subclass is non-breaking. Removing or renaming one is
 breaking. Adding a new attribute to ``ForgeError`` is non-breaking
-(as long as it has a default). Removing one is breaking.
+(as long as it has a default). Removing one is breaking. Adding a
+new ``ExitCode`` member is non-breaking (existing codes keep their
+meaning); removing or renaming a member is breaking.
 """
 
 from __future__ import annotations
@@ -262,6 +306,12 @@ class ExitCode(IntEnum):
     # remediation, and so the CLI's hint renderer can say "--overwrite"
     # *only* when it can actually help. See ADR-0017.
     COLLISION = 6
+    # A dry-run succeeded but the plan contains collisions. Nothing
+    # was written. Distinguished from COLLISION (6) so CI can tell
+    # "a real write was refused" from "a dry-run found conflicts"
+    # — the two states have different remediations and different
+    # automation patterns. See ADR-0018.
+    DRY_RUN_COLLISIONS = 7
 
 
 # -----------------------------------------------------------------------------
@@ -308,7 +358,7 @@ class ForgeError(Exception):
 
 
 # -----------------------------------------------------------------------------
-# Message-only subclasses (unchanged)
+# Message-only subclasses
 # -----------------------------------------------------------------------------
 class UserInputError(ForgeError):
     """Invalid input from the user. Exit code 1."""
@@ -538,7 +588,7 @@ class CollisionError(SafetyError):
 
 
 # -----------------------------------------------------------------------------
-# Dual-mode input handling subclasses (unchanged)
+# Dual-mode input handling subclasses
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class MissingRequiredFlagsError(UserInputError):
@@ -593,7 +643,7 @@ class PromptCancelledError(UserInputError):
 
 
 # -----------------------------------------------------------------------------
-# Discovery-specific structured subclass (unchanged)
+# Discovery-specific structured subclass
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class MalformedBlueprintError(DiscoveryError):
@@ -612,7 +662,7 @@ class MalformedBlueprintError(DiscoveryError):
 
 
 # -----------------------------------------------------------------------------
-# Structured errors (unchanged)
+# Structured errors
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class StructuredError(ForgeError):
