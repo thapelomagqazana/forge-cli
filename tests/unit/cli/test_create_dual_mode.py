@@ -10,33 +10,24 @@ These tests cover the acceptance criteria of Task 1.1.6 directly:
 5. The wizard allows cancellation (Ctrl+C) and exits cleanly.
 
 The generation pipeline is not stubbed here — the tests for it exercise
-the *real* pipeline (plan → safety → backup → staging → commit). An
-earlier version of the ``TestGeneratePreFlight`` class stubbed the
-writer with ``NotImplementedError`` and asserted the pre-flight
-directory check. Both reflected a pipeline that did its own
-collision detection and then hit a stub. That contract is gone: the
-safety layer owns collision detection (ADR-0017), and the writer is
-the staging-and-commit pipeline. The tests now pin the *new* contract
-— ``CollisionError`` (exit code 6) for collisions, and a timestamped
-backup for every overwritten file.
+the *real* pipeline (plan → safety → backup → staging → commit).
 
-The rest of the file still tests *input handling* in isolation, for
-the reasons below. The two concerns are separated by test class:
+Input handling
+--------------
+``_resolve_inputs`` is the collection boundary. It returns a single
+immutable ``_ResolvedInputs`` bundle. Two concerns are separated by
+test class:
 
 - ``TestDispatch`` and the interactive/non-interactive classes
-  exercise ``_resolve_variables`` and the parser — the input side.
+  exercise ``_resolve_inputs`` and the parser — the input side.
 - ``TestGeneratePreFlight`` exercises the safety layer's contract
   through ``_generate`` — the pipeline side.
-
-The one place input handling fakes a boundary is ``_generate`` in
-``capture_generate``: those tests want to inspect the *inputs* the
-pipeline would receive, not the pipeline itself. That remains the
-correct shape — the test is about what flows *into* the pipeline,
-not what the pipeline does with it.
+- ``TestDryRunPath`` exercises the dry-run *render* contract through
+  ``_run_dry_run`` — a separate function, a separate contract.
 
 Test design
 -----------
-There are two families of tests here, deliberately:
+Two families of tests, deliberately:
 
 - **Dispatch tests** go through ``cli_runner.invoke(forge_app, ...)``.
   Their purpose is to prove that ``forge create <blueprint>`` parses
@@ -45,82 +36,55 @@ There are two families of tests here, deliberately:
   or a mis-placed ``invoke_without_command``), and it can only be
   verified through the parser.
 
-- **Resolution tests** call ``_resolve_variables`` directly. Their
+- **Resolution tests** call ``_resolve_inputs`` directly. Their
   purpose is to prove the collection logic (flags win, missing flags
   aggregate, wizard prompts when interactive, cancellation
   propagates). The parser is not part of what these tests verify,
   so going through it would add indirection without adding coverage.
 
-Both families exercise the *current* shape of the command:
+Both families exercise the current module shape:
 
-    * The project name is a **command argument** resolved outside
-      ``VariableResolver`` (see ``create.py`` for the reasoning).
-    * The *blueprint variables* flow through the resolver.
-    * **Conditional file groups** are evaluated by
-      ``ConditionalEvaluator`` and only the surviving groups reach
-      the planner. That is why ``_resolve_variables`` returns a
-      **three-tuple** — the third element is the surviving groups
-      the planner consumes.
-    * ``_resolve_variables`` returns
-      ``(blueprint, inputs, surviving_groups)`` — the blueprint
-      document is needed by ``_generate`` to feed the planner, and
-      returning it alongside the resolved inputs is the deliberate
-      coupling the command docstring explains.
-    * ``_generate`` takes the blueprint as a **keyword-only**
-      argument, alongside ``inputs``, ``conditional_groups``,
-      ``dry_run``, and ``overwrite``. All five are keyword-only on
-      purpose: a positional call would read as
-      ``_generate(blueprint, inputs, ...)`` and make the order easy
-      to get wrong.
-    * ``conditional_groups`` is a **required** argument because the
-      safe-by-default rule (ADR-0015) says the planner never
-      includes conditional files unless the caller opts in. Passing
-      ``[]`` explicitly is the caller saying "I evaluated conditions
-      and none survived" — which is different from "I forgot to
-      evaluate conditions", and the type system makes the difference
-      visible at every call site.
+- **Project name** is a *command argument*, resolved inside
+  ``_resolve_inputs`` (see ``create.py`` for the reasoning) and
+  validated by ``resolution.names.project_name``.
 
-Tests written before this shape change called ``_resolve_variables``
-and expected a two-tuple, and passed ``_generate`` a signature that
-had not yet grown ``conditional_groups``. Both broke the moment the
-shape changed — which is exactly what the tests are for. The
-corrections (unpack three values, pass the conditional groups) are
-mechanical; the *failure* was the diagnostic that told us the shape
-had changed, and keeping that failure legible in the test suite
-(rather than papering over it with a duck-typed shim) is what makes
-the next shape change equally visible.
+- **Blueprint variables** flow through ``VariableResolver``.
+
+- **Conditional file groups** are evaluated by
+  ``ConditionalEvaluator`` and only surviving groups reach the
+  planner. That is why ``_ResolvedInputs`` carries
+  ``surviving_conditions``.
+
+- **``_generate``** takes exactly **two keyword-only arguments**:
+
+      _generate(*, inputs: _ResolvedInputs, overwrite: bool) -> None
+
+  and is the create path only.
+
+- **``_run_dry_run``** is a *separate* function dispatched to by the
+  command when ``--dry-run`` is passed:
+
+      _run_dry_run(*, inputs: _ResolvedInputs, overwrite: bool,
+                   json_output: bool) -> None
+
+  Splitting the two paths means each is exercised by the test that
+  owns its contract:
+
+  - ``_generate`` → safety layer, backups, staging, commit.
+  - ``_run_dry_run`` → ``DryRunService.plan()`` + render + exit code.
 
 The right seam: ``create.get_blueprint_document``
 -------------------------------------------------
 Earlier versions of these fixtures patched
-``forge.cli.registry._load_blueprint_index`` — a static index that
-the registry used to expose. The registry has since been refactored
-to delegate to ``BlueprintDiscoveryService`` (ADR-0009), and that
+``forge.cli.registry._load_blueprint_index`` — a static index the
+registry used to expose. The registry has since been refactored to
+delegate to ``BlueprintDiscoveryService`` (ADR-0009), and that
 private name no longer exists.
-
-A later revision patched ``create_module.get_blueprint``, which was
-the *catalogue entry* accessor on the registry. That accessor
-returned a ``BlueprintEntry``, and the command tried to reach through
-``entry.path`` to the loader — a bug, because ``BlueprintEntry`` is
-deliberately *not* a filesystem handle. The command has since moved
-to ``get_blueprint_document`` (which returns the loaded ``Blueprint``,
-not the entry).
 
 The fixtures below patch ``create_module.get_blueprint_document``
 — the *exact* name the command module imported at load time
 (``from forge.cli.registry import get_blueprint_document``), which is
-the direct dependency ``_resolve_variables`` calls. Patching at that
-boundary means:
-
-- The fixture cannot silently become a no-op: if ``create.py`` stops
-  importing ``get_blueprint_document``, the ``AttributeError``
-  surfaces immediately at fixture setup, in the test that owns the
-  fixture. This is the same failure mode the previous
-  ``get_blueprint`` patch caught when it was renamed — the fixture
-  breaking is *diagnostic*, not silent.
-- The fixture's correctness does not depend on the registry's
-  internal plumbing. A future registry refactor that keeps the
-  public ``get_blueprint_document`` name does not touch these tests.
+the direct dependency ``_resolve_inputs`` calls.
 
 The fixture's *return shape* is the loaded ``Blueprint``, not a
 ``BlueprintEntry``. That is the shape ``get_blueprint_document``
@@ -140,20 +104,11 @@ install ``handle_exception`` — that wrapper lives in ``main()``,
 which the CLI entry point runs *after* Typer's dispatch. So when a
 command raises a ``ForgeError``, the exception propagates out of
 ``.invoke()`` as ``result.exception``, and ``result.output`` is
-empty: Typer sets the exit code from the exception's ``exit_code``
-attribute, but the domain error is never rendered.
-
-The tests that assert on the *rendered* message (the missing-flags
-message and the cancellation message) therefore invoke
+empty. Tests that assert on the *rendered* message invoke
 ``handle_exception`` on ``result.exception`` directly and assert on
 ``capsys.readouterr().err``. That is the same code path the shell
-exercises (``main()`` → ``handle_exception`` → stderr), just called
-from the test instead of from the entry point.
-
-Each layer is tested at the layer it actually lives in: the parser
-in the dispatch tests, the collection logic in ``_resolve_variables``
-tests, the exception type via ``pytest.raises``, and the rendered
-message via ``handle_exception`` + ``capsys``.
+exercises, just called from the test instead of from the entry
+point.
 
 ``_generate`` inputs must satisfy ``_generate``'s contract
 ----------------------------------------------------------
@@ -161,58 +116,21 @@ message via ``handle_exception`` + ``capsys``.
 exists on ``ResolvedValues`` (the resolver's immutable output type)
 but *not* on a plain ``dict``. That is deliberate: the type
 distinction is what prevents an unvalidated ``dict`` from reaching
-the planner, and removing it would silently undo the KPI the whole
-resolver exists to deliver.
+the planner.
 
-An earlier version of these ``TestGeneratePreFlight`` tests
-constructed ``SimpleNamespace(variables={})`` — a fake that happened
-to be dict-shaped but failed ``_generate``'s actual contract. The
-``AttributeError: 'dict' object has no attribute 'as_dict'`` was the
-*directed* symptom, and the correct fix was to make the fixture
-construct the type ``_generate`` requires, not to teach ``_generate``
-to accept a shape it was designed to reject. The helper
-``_resolved_inputs(...)`` below is that fix, and its existence is
-the constant reminder: fake the *boundary*, not the *type*.
+The helper ``_resolved_inputs(...)`` below constructs the correct
+shape. Note the shape carefully:
 
-The pipeline boundary: two ``blueprint_root`` fixtures
-------------------------------------------------------
-``_generate`` re-resolves the blueprint's manifest directory via
-``create_module._blueprint_root``, which calls
-``BlueprintDiscoveryService.load_with_path``. Discovery is not what
-the ``TestGeneratePreFlight`` tests are about — they are about the
-safety layer's collision and backup contract. Patching
-``_blueprint_root`` at its definition site is the honest boundary:
-the test says "assume the blueprint root is here" and exercises
-everything downstream of that assumption (the planner, the safety
-layer, the staging pipeline, the overwrite backups).
+- ``_ResolvedInputs`` carries the *document* (``blueprint``), not a
+  derived ``blueprint_id`` field. The identifier lives on
+  ``inputs.blueprint.id`` — the model-as-document principle
+  (ADR-0007/0008) says the id belongs to the document, not to a
+  wrapper that would duplicate it and drift.
 
-There are two fixtures, not one, because the tests need two
-different things from the stub:
-
-    * ``_stub_blueprint_root`` — returns ``None``, sets up the
-      monkeypatch. For tests that only need the stub to *exist*
-      (the collision and backup tests do not write into the
-      blueprint root; the destination directory is what they
-      collide against). Applied via
-      ``@pytest.mark.usefixtures("_stub_blueprint_root")``
-      (``PT004``/``PT019``).
-
-    * ``blueprint_root`` — returns the ``Path`` to the stub
-      directory. For tests that need to write a template *into*
-      the root (the dry-run test, which resolves the plan's source
-      reference). Named without an underscore because it returns a
-      value (``PT005``); injected as a parameter because the test
-      body uses it.
-
-The two fixtures delegate to the same ``monkeypatch.setattr`` call
-via a private helper, so there is exactly one place that describes
-*how* the stub is installed. The split is about *what the fixture
-returns*, which is what ``PT004`` and ``PT005`` are actually about.
-
-The alternative — mocking ``BlueprintDiscoveryService`` — would drag
-the discovery module's internal layout into the test, coupling the
-test to the loader's package structure. The current shape couples to
-one function's return type (a ``Path``) and nothing else.
+- ``surviving_conditions`` is a real field, not optional. Passing
+  ``[]`` explicitly is the caller saying "I evaluated conditions and
+  none survived" — different from "I forgot to evaluate conditions",
+  and the type system makes the difference visible.
 
 Lint conventions
 ----------------
@@ -223,21 +141,12 @@ That has three consequences a reader will notice:
 - **Side-effect-only fixtures are prefixed with ``_`` and applied
   via ``@pytest.mark.usefixtures(...)``.** ``PT004`` requires the
   underscore for fixtures that return ``None``; ``PT019`` requires
-  that such fixtures not be injected as test parameters. The two
-  rules are complementary — satisfying one without the other
-  produces a lint error for the other.
+  that such fixtures not be injected as test parameters.
 - **Fixtures that *do* return a value have no leading underscore**
-  (``PT005``). If a test needs a value-only fixture, it must be
-  named as a value and injected as a parameter, not applied via
-  ``usefixtures``.
+  (``PT005``).
 - **Temp directories come from ``tmp_path``, not ``/tmp``.**
-  ``S108`` flags hardcoded ``/tmp`` because it is world-writable and
-  shared across users; ``tmp_path`` is per-test and uniquely owned.
-- **Class attributes are immutable or ``ClassVar``.** ``RUF012``
-  flags mutable class attributes; fixtures that construct fake
-  blueprints build real ``Blueprint`` model instances instead of
-  duck-typed fakes, which sidesteps the rule and gives the tests
-  the resolver's actual contract.
+  ``S108`` flags hardcoded ``/tmp`` because it is world-writable
+  and shared across users.
 """
 
 from __future__ import annotations
@@ -281,29 +190,21 @@ def _make_blueprint(
     """Build a minimal valid ``Blueprint`` for testing.
 
     Centralised so the two fixtures (``_fake_blueprint`` and
-    ``_fake_blueprint_with_vars``) stay in lockstep on all fields they
-    are *not* testing. A future field addition to ``Blueprint`` needs
-    one edit here, not two.
+    ``_fake_blueprint_with_vars``) stay in lockstep on all fields
+    they are *not* testing. A future field addition to ``Blueprint``
+    needs one edit here, not two.
 
     ``files`` is optional because most tests (input collection,
     cancellation, blueprint variables) do not touch the planner —
-    only the ``TestGeneratePreFlight`` tests need a plan with a
-    destination to conflict against. Passing ``None`` keeps the
-    existing behaviour (empty ``files[]``, zero planned files) for
-    every test that does not care.
+    only the ``TestGeneratePreFlight`` and ``TestDryRunPath`` tests
+    need a plan with a destination to conflict against. Passing
+    ``None`` keeps the existing behaviour (empty ``files[]``, zero
+    planned files) for every test that does not care.
 
     The blueprint is deliberately a *real model instance*, not a
     duck-typed fake. The resolver, the loader, the planner, and every
-    other consumer validate against this type, so the test should too
-    — a fake that happens to satisfy the attributes the command reads
-    today would silently break the moment the command gains a new
-    dependency on the model.
-
-    ``conditional_files`` is intentionally empty: these tests exercise
-    input collection (and the safety layer's collision/backup
-    contract), not conditional evaluation. ``_generate``'s
-    ``conditional_groups`` argument is therefore supplied as ``[]``
-    by every test that calls it.
+    other consumer validate against this type, so the test should
+    too.
     """
     return Blueprint(
         schema_version="1.0.0",
@@ -321,35 +222,39 @@ def _make_blueprint(
 
 def _resolved_inputs(
     *,
+    blueprint: Blueprint | None = None,
     destination: Path,
     project_name: str = "my-api",
-    blueprint_id: str = "python.fastapi.api",
     variables: dict[str, Any] | None = None,
+    surviving_conditions: list[Any] | None = None,
 ) -> SimpleNamespace:
     """Build a ``_ResolvedInputs``-shaped object with a real ``ResolvedValues``.
 
-    ``_generate`` calls ``inputs.variables.as_dict()`` — a method
-    that exists on ``ResolvedValues`` but not on a plain ``dict``.
-    That method is the type boundary the resolver exists to enforce
-    (see ``forge.resolution.resolver.ResolvedValues``), and the
-    ``TestGeneratePreFlight`` tests must construct inputs that satisfy
-    it, or they are not exercising ``_generate`` — they are
-    exercising a fake that happens to share some attributes.
+    ``_generate`` calls ``inputs.variables.as_dict()`` — a method that
+    exists on ``ResolvedValues`` but not on a plain ``dict``. That
+    method is the type boundary the resolver exists to enforce (see
+    ``forge.resolution.resolver.ResolvedValues``), and the tests must
+    construct inputs that satisfy it.
 
     ``SimpleNamespace`` is used (rather than ``_ResolvedInputs``
-    directly) because ``_ResolvedInputs`` is a *private* type in
-    ``create.py``, and reaching into a private type from a test
-    couples the test to an implementation detail. The namespace
-    satisfies the duck-typed contract ``_generate`` actually consumes
-    (``.blueprint_id``, ``.project_name``, ``.destination``,
-    ``.variables``), which is the honest level of coupling for a test
-    of a private helper.
+    directly) because ``_ResolvedInputs`` is a private type in
+    ``create.py``. The namespace satisfies the duck-typed contract
+    ``_generate`` / ``_run_dry_run`` actually consume
+    (``.blueprint``, ``.project_name``, ``.destination``,
+    ``.variables``, ``.surviving_conditions``), which is the honest
+    level of coupling for a test of a private helper.
+
+    ``project_name`` is a *bundled field*, not derived from
+    ``blueprint.id`` — the two are different concepts (id is the
+    blueprint, project_name is the user's chosen name), and tests
+    that need to distinguish them can pass different values.
     """
     return SimpleNamespace(
-        blueprint_id=blueprint_id,
+        blueprint=blueprint or _make_blueprint(variables=[]),
         project_name=project_name,
         destination=destination,
         variables=ResolvedValues(MappingProxyType(variables or {})),
+        surviving_conditions=surviving_conditions or [],
     )
 
 
@@ -363,12 +268,6 @@ def _fake_blueprint(monkeypatch: pytest.MonkeyPatch) -> None:
     blueprint that declared a ``project_name`` variable would mask
     the bug the ``KeyError('project_name')`` test run originally
     surfaced.
-
-    Tests that need blueprint variables use
-    ``_fake_blueprint_with_vars`` instead. The two fixtures are
-    distinct on purpose: a test that uses this one cannot
-    accidentally pass by exercising the resolver's
-    blueprint-variable path.
     """
     fake = _make_blueprint(variables=[])
     monkeypatch.setattr(create_module, "get_blueprint_document", lambda _id: fake)
@@ -382,13 +281,7 @@ def _fake_blueprint_with_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     path (missing required variable, real-time prompt for a blueprint
     variable). The variable is a genuine ``VariableDefinition`` from
     ``forge.models`` — the resolver validates against the real type,
-    not a duck-typed fake, so the test proves the actual integration.
-
-    ``author`` is a string with no default and ``required=True``, so
-    the resolver's ``required.missing`` path is reachable simply by
-    omitting it from ``cli_vars``. That is the minimal blueprint that
-    exercises the error aggregation the command wraps into a
-    ``UserInputError``.
+    not a duck-typed fake.
     """
     fake = _make_blueprint(
         variables=[
@@ -410,46 +303,56 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     ``_generate`` is the boundary between *input handling* and the
     *pipeline*. The tests in this class exercise input handling, so
     they stub the pipeline and assert on what it *would* receive.
-    Faking the boundary is honest because the test is about input
-    collection, not generation — the pipeline's own tests
-    (``TestGeneratePreFlight``) exercise the real ``_generate``.
 
     The stub signature mirrors the *current* signature of
-    ``create_module._generate``: keyword-only ``blueprint``,
-    ``inputs``, ``conditional_groups``, ``dry_run``, ``overwrite``.
-    The ``conditional_groups`` parameter is recorded alongside the
-    others so future tests can assert that the *surviving* groups
-    from the evaluator (not the raw ``conditional_files`` list) were
-    what reached the planner — a property the command's docstring
-    promises and the tests should pin.
+    ``create_module._generate``:
+
+        _generate(*, inputs: _ResolvedInputs, overwrite: bool) -> None
+
+    The ``inputs`` object carries everything the pipeline needs:
+    the blueprint document, the resolved variables (with the project
+    name folded in), the destination, and the surviving conditional
+    groups. The stub records the whole ``inputs`` object plus
+    ``overwrite``, so tests can reach into ``inputs`` for whatever
+    specific field they are asserting.
 
     If ``create_module._generate`` gains a parameter (or renames
     one), this fixture will raise ``TypeError`` at the next
     ``cli_runner.invoke`` — the fixture is the trip wire for the
     signature, not just a recording device.
-
-    This fixture *does* return a value (the ``captured`` dict), so
-    it does not need a leading underscore and stays a parameter
-    (``PT004`` and ``PT019`` only apply to fixtures returning
-    ``None``).
     """
     captured: dict[str, Any] = {}
 
-    def _fake(
-        *,
-        blueprint: Any,
-        inputs: Any,
-        conditional_groups: Any,
-        dry_run: bool,
-        overwrite: bool,
-    ) -> None:
-        captured["blueprint"] = blueprint
+    def _fake(*, inputs: Any, overwrite: bool) -> None:
         captured["inputs"] = inputs
-        captured["conditional_groups"] = conditional_groups
-        captured["dry_run"] = dry_run
         captured["overwrite"] = overwrite
 
     monkeypatch.setattr(create_module, "_generate", _fake)
+    return captured
+
+
+@pytest.fixture()
+def capture_dry_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Stub ``_run_dry_run`` so the test can inspect the dry-run inputs.
+
+    Symmetric with ``capture_generate``: the dry-run path is a
+    separate function (``_run_dry_run``) with its own signature
+
+        _run_dry_run(*, inputs: _ResolvedInputs, overwrite: bool,
+                     json_output: bool) -> None
+
+    which the command dispatches to when ``--dry-run`` is passed.
+    Stubbing it lets the dispatch tests prove *which* path was taken
+    without exercising the plan builder.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake(*, inputs: Any, overwrite: bool, json_output: bool) -> None:
+        captured["inputs"] = inputs
+        captured["overwrite"] = overwrite
+        captured["json_output"] = json_output
+
+    monkeypatch.setattr(create_module, "_run_dry_run", _fake)
     return captured
 
 
@@ -459,14 +362,8 @@ def _install_blueprint_root_stub(monkeypatch: pytest.MonkeyPatch, blueprint_root
     Extracted so the two public fixtures (``_stub_blueprint_root`` and
     ``blueprint_root``) describe *the same* monkeypatch. A future change
     to how ``_blueprint_root`` is patched touches this one function.
-
-    The extraction is *not* about avoiding duplication — it is about
-    making the difference between the two fixtures legible: they differ
-    only in *return value*, and both delegate to the same install step.
-    Reading the two fixtures side by side now shows the difference
-    immediately.
     """
-    monkeypatch.setattr(create_module, "_blueprint_root", lambda _bp, _id: blueprint_root)
+    monkeypatch.setattr(create_module, "_blueprint_root", lambda _bp: blueprint_root)
 
 
 @pytest.fixture()
@@ -475,13 +372,6 @@ def _stub_blueprint_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
     For tests that only need the stub to *exist* — they do not write
     into the blueprint root, so they do not need the ``Path``.
-
-    Returns ``None`` (leading underscore, applied via
-    ``@pytest.mark.usefixtures`` per ``PT004`` and ``PT019``).
-
-    The directory is created empty; a test that needs a template file
-    in it should use ``blueprint_root`` (below) instead, which returns
-    the same directory so the test can write into it.
     """
     blueprint_root = tmp_path / "blueprint-root"
     blueprint_root.mkdir()
@@ -492,17 +382,7 @@ def _stub_blueprint_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 def blueprint_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Install the ``_blueprint_root`` stub *and* return its ``Path``.
 
-    For tests that need to write a template file into the root (the
-    dry-run test resolves the plan's source reference against this
-    directory).
-
-    Returns the ``Path`` (no leading underscore per ``PT005``),
-    injected as a parameter because the test body uses it.
-
-    Both fixtures create a directory at ``tmp_path / "blueprint-root"``
-    and install the same monkeypatch. A test that needs both (a stub
-    *and* the path) uses this one; a test that needs only the stub uses
-    the other.
+    For tests that need to write a template file into the root.
     """
     blueprint_root = tmp_path / "blueprint-root"
     blueprint_root.mkdir()
@@ -512,29 +392,13 @@ def blueprint_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture()
 def _force_non_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``prompts.is_interactive()`` return ``False``.
-
-    Simulates a CI environment or ``--no-interactive``. The command
-    checks the flag *and* the TTY, so this fixture only needs to
-    override one of them — the test passes ``--no-interactive`` when
-    it wants the flag path specifically, and this fixture when it
-    wants the TTY path.
-
-    Leading underscore because the fixture returns ``None``
-    (``PT004``); applied via ``@pytest.mark.usefixtures(...)`` rather
-    than as a parameter (``PT019``).
-    """
+    """Make ``prompts.is_interactive()`` return ``False``."""
     monkeypatch.setattr(prompts, "is_interactive", lambda: False)
 
 
 @pytest.fixture()
 def _force_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``prompts.is_interactive()`` return ``True``.
-
-    Leading underscore because the fixture returns ``None``
-    (``PT004``); applied via ``@pytest.mark.usefixtures(...)`` rather
-    than as a parameter (``PT019``).
-    """
+    """Make ``prompts.is_interactive()`` return ``True``."""
     monkeypatch.setattr(prompts, "is_interactive", lambda: True)
 
 
@@ -559,6 +423,14 @@ class TestDispatch:
         if the command were a group, Click would reject
         ``python.fastapi.api`` as a missing subcommand before any
         code ran, and ``_generate`` would never be called.
+
+        The blueprint *id* is reached via ``inputs.blueprint.id``,
+        not via a convenience accessor. The ``_ResolvedInputs``
+        bundle carries the document itself (``blueprint``), and
+        adding a duplicated ``blueprint_id`` field would invite the
+        two to drift — the model-as-document principle (ADR-0007/
+        0008) says the identifier belongs to the document, not to a
+        wrapper.
         """
         result = cli_runner.invoke(
             forge_app,
@@ -572,17 +444,18 @@ class TestDispatch:
         )
 
         assert result.exit_code == 0, result.output
-        assert capture_generate["inputs"].blueprint_id == "python.fastapi.api"
-        assert capture_generate["inputs"].project_name == "my-api"
-        # The blueprint document is passed through *with* the inputs —
-        # the planner needs it, and passing it once (from the resolve
-        # step) rather than re-fetching in `_generate` guarantees the
-        # document the user's answers were validated against is the
-        # document that will be planned.
-        assert capture_generate["blueprint"].id == "python.fastapi.api"
+        inputs = capture_generate["inputs"]
+        # The blueprint document travels inside ``inputs`` — the
+        # planner needs it, and passing it once (from the resolve
+        # step) rather than re-fetching in `_generate` guarantees
+        # the document the user's answers were validated against is
+        # the document that will be planned.
+        assert inputs.blueprint.id == "python.fastapi.api"
+        assert inputs.project_name == "my-api"
         # No conditional files on the fake blueprint → the evaluator
         # returns an empty list, which is what reaches `_generate`.
-        assert capture_generate["conditional_groups"] == []
+        assert inputs.surviving_conditions == []
+        assert capture_generate["overwrite"] is False
 
     @pytest.mark.unit()
     def test_create_help_shows_leaf_signature(self, cli_runner: CliRunner, forge_app: Any) -> None:
@@ -659,25 +532,39 @@ class TestNonInteractiveSuccess:
 
         assert result.exit_code == 0, result.output
         assert capture_generate["inputs"].project_name == "my-api"
-        assert capture_generate["dry_run"] is False
         assert capture_generate["overwrite"] is False
 
     @pytest.mark.unit()
     @pytest.mark.usefixtures("_fake_blueprint", "_force_non_interactive")
-    def test_flags_reach_generate_unchanged(
+    def test_dry_run_flag_routes_to_dry_run_path(
         self,
         cli_runner: CliRunner,
         forge_app: Any,
-        capture_generate: dict[str, Any],
+        capture_dry_run: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """``--output`` and ``--dry-run`` are forwarded to ``_generate``.
+        """``--dry-run`` dispatches to ``_run_dry_run``, not ``_generate``.
 
-        ``tmp_path`` is used for ``--output`` because it is the
-        per-test temp directory pytest provides — uniquely owned by
-        the test, cleaned up automatically, and immune to the
-        hardcoded-``/tmp`` concern that ``S108`` flags.
+        ``--dry-run`` is a *separate code path* at the command level —
+        it builds a ``GenerationPlan`` DTO and renders it, without
+        invoking the pipeline at all (ADR-0018). This test proves the
+        dispatch: when ``--dry-run`` is passed, ``_run_dry_run`` fires
+        with the correct inputs, and ``_generate`` does *not* fire.
+
+        ``_generate`` is stubbed to raise if called — a stronger
+        assertion than "the dry-run stub was called", because it also
+        proves the pipeline was not entered.
         """
+
+        def _fail_generate(*_a: Any, **_k: Any) -> None:
+            raise AssertionError(
+                "_generate fired despite --dry-run — the pipeline "
+                "must not be entered in dry-run mode."
+            )
+
+        monkeypatch.setattr(create_module, "_generate", _fail_generate)
+
         result = cli_runner.invoke(
             forge_app,
             [
@@ -693,7 +580,48 @@ class TestNonInteractiveSuccess:
         )
 
         assert result.exit_code == 0, result.output
-        assert capture_generate["dry_run"] is True
+        assert capture_dry_run["inputs"].project_name == "my-api"
+        assert capture_dry_run["inputs"].destination == tmp_path / "my-api"
+        assert capture_dry_run["overwrite"] is False
+        assert capture_dry_run["json_output"] is False
+
+    @pytest.mark.unit()
+    @pytest.mark.usefixtures("_fake_blueprint", "_force_non_interactive")
+    def test_output_flag_reaches_inputs(
+        self,
+        cli_runner: CliRunner,
+        forge_app: Any,
+        capture_generate: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        """``--output`` is folded into ``inputs.destination``.
+
+        ``--output`` used to be a ``_generate`` parameter. The current
+        shape folds it into ``inputs.destination`` (the pipeline
+        receives the full destination, not a root and a name) because
+        that is what the dry-run path also needs, and duplicating the
+        ``output / name`` computation between the two paths would
+        invite drift.
+
+        ``tmp_path`` is used because it is the per-test temp
+        directory pytest provides — uniquely owned by the test,
+        cleaned up automatically, and immune to the hardcoded-``/tmp``
+        concern that ``S108`` flags.
+        """
+        result = cli_runner.invoke(
+            forge_app,
+            [
+                "create",
+                "python.fastapi.api",
+                "--name",
+                "my-api",
+                "--output",
+                str(tmp_path),
+                "--no-interactive",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
         assert capture_generate["inputs"].destination == tmp_path / "my-api"
 
 
@@ -762,12 +690,12 @@ class TestNonInteractiveMissingFlags:
         precise contract.
 
         This test bypasses the CLI entirely — it calls
-        ``_resolve_variables`` directly. That is the correct layer
-        for "does the command raise the right exception," separate
-        from "does the shell render it" (the previous test).
+        ``_resolve_inputs`` directly. That is the correct layer for
+        "does the command raise the right exception," separate from
+        "does the shell render it" (the previous test).
         """
         with pytest.raises(MissingRequiredFlagsError) as info:
-            create_module._resolve_variables(
+            create_module._resolve_inputs(
                 blueprint_id="python.fastapi.api",
                 cli_name=None,
                 cli_vars={},
@@ -791,7 +719,7 @@ class TestNonInteractiveMissingFlags:
         dead end the class docstring warns against.
         """
         with pytest.raises(MissingRequiredFlagsError) as info:
-            create_module._resolve_variables(
+            create_module._resolve_inputs(
                 blueprint_id="python.fastapi.api",
                 cli_name=None,
                 cli_vars={},
@@ -823,27 +751,12 @@ class TestInteractiveWizard:
         correct side of the boundary: fake what the user types; let
         the code prove it processes what the user typed.
 
-        The ``_fake_blueprint`` fixture declares no blueprint
-        variables, so the wizard asks exactly one question — the
-        project name — which is what ``ask_text`` is patched to
-        answer. If the fixture ever grew variables, this test would
-        fail at ``ask_select`` (which is deliberately not patched),
-        making the coupling visible instead of silent.
-
-        ``_resolve_variables`` returns a three-tuple
-        ``(blueprint, inputs, surviving_groups)``. We unpack the
-        tuple and ignore the blueprint and surviving groups here —
-        the assertions are on the *inputs*. The blueprint is
-        available and asserted on in
-        ``TestDispatch::test_create_accepts_positional_blueprint_directly``,
-        where its presence in ``capture_generate`` proves the
-        command passes it through to ``_generate``. The surviving
-        groups are empty (the fake blueprint declares no conditional
-        files) and are asserted on in the same dispatch test.
+        ``_resolve_inputs`` returns a single ``_ResolvedInputs``
+        object. The project name lives inside it.
         """
         monkeypatch.setattr(prompts, "ask_text", lambda *a, **k: "wizard-api")
 
-        _blueprint, inputs, _groups = create_module._resolve_variables(
+        inputs = create_module._resolve_inputs(
             blueprint_id="python.fastapi.api",
             cli_name=None,
             cli_vars={},
@@ -875,7 +788,7 @@ class TestInteractiveWizard:
         monkeypatch.setattr(prompts, "ask_select", _raise_if_called)
         monkeypatch.setattr(prompts, "ask_confirm", _raise_if_called)
 
-        _blueprint, inputs, _groups = create_module._resolve_variables(
+        inputs = create_module._resolve_inputs(
             blueprint_id="python.fastapi.api",
             cli_name="flag-api",
             cli_vars={},
@@ -959,9 +872,8 @@ class TestInteractiveWizard:
 # The inline validator used to live in the command module
 # (``_project_name_validator``). It has moved to
 # ``resolution.names.project_name``, which is the *same* function the
-# resolver applies. There is no longer a "duplicate" to test for
-# subset consistency — there is exactly one validator, used by both
-# the prompt (for real-time UX) and the resolver (for authoritative
+# resolver applies. There is exactly one validator, used by both the
+# prompt (for real-time UX) and the resolver (for authoritative
 # validation). These tests exercise that validator directly at the
 # layer where it lives.
 # -----------------------------------------------------------------------------
@@ -1000,25 +912,16 @@ class TestNamedValidatorIntegration:
     def test_prompt_wiring_uses_the_same_validator(self, tmp_path: Path) -> None:
         """The wizard's inline validator and the resolver agree on names.
 
-        The invariant this test enforces is stronger than the old
-        "subset" test: it is the *same* function on both sides, so
-        there is no possible drift. We assert the wiring by running
-        a name through the non-interactive path and confirming the
-        resolver accepts it unchanged (which requires the same
-        validator the prompt uses to have already accepted it).
-
-        If the wizard ever grows a *separate* validator (the
-        duplicate the old test was designed to police), that test
-        would fail here — the inline validator would accept a name
-        the resolver rejects, or vice versa.
-
-        The three-tuple return of ``_resolve_variables`` is unpacked
-        (blueprint and surviving groups ignored) because the
-        assertion is on the *inputs*.
+        The invariant this test enforces is stronger than a "subset"
+        test: it is the *same* function on both sides, so there is no
+        possible drift. We assert the wiring by running a name
+        through the non-interactive path and confirming the resolver
+        accepts it unchanged (which requires the same validator the
+        prompt uses to have already accepted it).
         """
         # A name the resolver accepts, threaded through the wizard.
         for candidate in ("myapi", "my-api", "a1-b2"):
-            _blueprint, inputs, _groups = create_module._resolve_variables(
+            inputs = create_module._resolve_inputs(
                 blueprint_id="python.fastapi.api",
                 cli_name=candidate,
                 cli_vars={},
@@ -1056,7 +959,7 @@ class TestCancellation:
         monkeypatch.setattr(prompts, "ask_text", _cancel)
 
         with pytest.raises(PromptCancelledError):
-            create_module._resolve_variables(
+            create_module._resolve_inputs(
                 blueprint_id="python.fastapi.api",
                 cli_name=None,
                 cli_vars={},
@@ -1083,9 +986,7 @@ class TestCancellation:
         This test asserts on the exception type (the contract that
         ``main()`` will see) and on the exit code Typer derives from
         it. The *rendering* of that exception ("Cancelled." on
-        stderr) is tested separately in ``test_errors.py``, where
-        ``handle_exception`` is called directly — the correct layer
-        for that assertion.
+        stderr) is tested separately in ``test_errors.py``.
         """
 
         def _cancel(*_a: Any, **_k: Any) -> str:
@@ -1132,7 +1033,7 @@ class TestBlueprintErrors:
         monkeypatch.setattr(create_module, "get_blueprint_document", _raise)
 
         with pytest.raises(BlueprintError):
-            create_module._resolve_variables(
+            create_module._resolve_inputs(
                 blueprint_id="does.not.exist",
                 cli_name="x",
                 cli_vars={},
@@ -1167,7 +1068,7 @@ class TestBlueprintErrors:
         )
 
         with pytest.raises(BlueprintError):
-            create_module._resolve_variables(
+            create_module._resolve_inputs(
                 blueprint_id="does.not.exist",
                 cli_name=None,
                 cli_vars={},
@@ -1178,13 +1079,6 @@ class TestBlueprintErrors:
 
 # -----------------------------------------------------------------------------
 # Blueprint variables flow through the resolver
-#
-# These tests exercise the resolver's *blueprint variable* path with a
-# fake blueprint that declares a required string variable. They exist
-# to prove the resolution refactor did not accidentally route the
-# project name through the resolver (which would have masked the
-# `project_name` KeyError the test suite originally caught), and that
-# blueprint variables still behave as they did before.
 # -----------------------------------------------------------------------------
 class TestBlueprintVariablesThroughResolver:
     """Blueprint variables flow through ``VariableResolver``."""
@@ -1200,7 +1094,7 @@ class TestBlueprintVariablesThroughResolver:
         the command wraps in a ``UserInputError`` with a hint.
         """
         with pytest.raises(UserInputError) as info:
-            create_module._resolve_variables(
+            create_module._resolve_inputs(
                 blueprint_id="python.fastapi.api",
                 cli_name="my-api",
                 cli_vars={},  # author not supplied
@@ -1218,7 +1112,7 @@ class TestBlueprintVariablesThroughResolver:
     @pytest.mark.usefixtures("_fake_blueprint_with_vars", "_force_non_interactive")
     def test_supplied_blueprint_variable_passes_through(self, tmp_path: Path) -> None:
         """A supplied blueprint variable lands in ``_ResolvedInputs.variables``."""
-        _blueprint, inputs, _groups = create_module._resolve_variables(
+        inputs = create_module._resolve_inputs(
             blueprint_id="python.fastapi.api",
             cli_name="my-api",
             cli_vars={"author": "alice"},
@@ -1235,37 +1129,26 @@ class TestBlueprintVariablesThroughResolver:
 # -----------------------------------------------------------------------------
 # Generation pipeline (safety layer contract)
 # -----------------------------------------------------------------------------
-# These tests do not go through ``_resolve_variables`` — the resolver
-# is deliberately pure and does not check the filesystem. The
-# collision and overwrite contract is enforced by ``forge.safety``
-# inside ``_generate``, and that is the layer these tests exercise.
+# These tests do not go through ``_resolve_inputs`` — the resolver is
+# deliberately pure and does not check the filesystem. The collision
+# and overwrite contract is enforced by ``forge.safety`` inside
+# ``_generate``, and that is the layer these tests exercise.
 #
-# ``_generate`` takes the blueprint document as a keyword-only
-# argument alongside the inputs, because the *planner* needs the
-# document to read ``files[]`` and ``conditional_files[]``. The
-# blueprint used here is a real ``Blueprint`` instance (from
-# ``_make_blueprint``) with at least one ``files[]`` entry, so the
-# pipeline has a destination to collide against.
+# ``_generate`` takes exactly **two keyword-only arguments**:
 #
-# ``conditional_groups`` is passed as ``[]``: the fake blueprint has
-# no conditional files, so the evaluator would return an empty list
-# in the real pipeline. Passing ``[]`` explicitly is the caller saying
-# "I evaluated conditions and none survived" — the correct shape,
-# per ADR-0015's safe-by-default rule (a missing argument is not the
-# same as an empty result).
+#     _generate(*, inputs: _ResolvedInputs, overwrite: bool) -> None
 #
-# ``inputs.variables`` must be a real ``ResolvedValues``, not a plain
-# ``dict``: ``_generate`` calls ``.as_dict()`` on it, and that method
-# is the type boundary the resolver exists to enforce. The
-# ``_resolved_inputs`` helper constructs the correct shape.
+# ``inputs`` is a real ``_ResolvedInputs`` shape (constructed by the
+# ``_resolved_inputs`` helper above) with a real ``Blueprint``
+# instance — because the planner needs to read ``files[]`` and
+# ``conditional_files[]`` from it. ``overwrite`` decides whether the
+# safety layer permits replacing existing destinations.
 #
-# ``_stub_blueprint_root`` (for tests that only need the stub) or
-# ``blueprint_root`` (for tests that need to write into it) is the
-# one fake: ``_blueprint_root`` resolves the manifest directory via
-# discovery, which is not what these tests are about. Everything
-# downstream of that function — the planner, the safety layer, the
-# staging pipeline, the overwrite backups — runs for real. That is
-# what makes these tests the KPI-guard for the pipeline contract.
+# ``_generate`` never handles ``--dry-run`` — that is a separate code
+# path (``_run_dry_run``) invoked by the command based on the flag.
+# The dry-run tests below exercise ``_run_dry_run`` for the render
+# contract and ``_generate`` for the safety contract, so each test
+# targets the function that actually owns the property it pins.
 # -----------------------------------------------------------------------------
 class TestGeneratePreFlight:
     """``_generate`` enforces the safety layer's collision contract.
@@ -1314,16 +1197,10 @@ class TestGeneratePreFlight:
             variables=[],
             files=[{"source": "src.txt", "destination": "out.txt"}],
         )
-        inputs = _resolved_inputs(destination=target)
+        inputs = _resolved_inputs(blueprint=blueprint, destination=target)
 
         with pytest.raises(CollisionError) as info:
-            create_module._generate(
-                blueprint=blueprint,
-                inputs=inputs,
-                conditional_groups=[],
-                dry_run=False,
-                overwrite=False,
-            )
+            create_module._generate(inputs=inputs, overwrite=False)
 
         # Exit code 6 is the contract — a script that retries with
         # ``--overwrite`` branches on this code specifically.
@@ -1355,11 +1232,6 @@ class TestGeneratePreFlight:
         ``_stage_one`` would raise ``FilesystemConflictError`` — the
         test would then fail on the *pipeline setup*, not on the
         overwrite/backup contract it exists to pin.
-
-        The content written to ``src.txt`` is ``"new body"`` so the
-        assertion ``(target / "out.txt").read_text() == "new body"``
-        names the property being tested (the destination has the
-        *source's* content), not merely "some content".
         """
         # Source template the pipeline will copy into the destination.
         (blueprint_root / "src.txt").write_text("new body")
@@ -1374,15 +1246,9 @@ class TestGeneratePreFlight:
             variables=[],
             files=[{"source": "src.txt", "destination": "out.txt"}],
         )
-        inputs = _resolved_inputs(destination=target)
+        inputs = _resolved_inputs(blueprint=blueprint, destination=target)
 
-        create_module._generate(
-            blueprint=blueprint,
-            inputs=inputs,
-            conditional_groups=[],
-            dry_run=False,
-            overwrite=True,
-        )
+        create_module._generate(inputs=inputs, overwrite=True)
 
         # The destination now has the *source's* content.
         assert (target / "out.txt").read_text() == "new body"
@@ -1391,6 +1257,13 @@ class TestGeneratePreFlight:
         backups = list(target.glob("out.txt.bak.*"))
         assert len(backups) == 1
         assert backups[0].read_text() == "pre-existing body"
+
+
+# -----------------------------------------------------------------------------
+# Dry-run path — render contract, no writes
+# -----------------------------------------------------------------------------
+class TestDryRunPath:
+    """``_run_dry_run`` renders a plan and never writes."""
 
     @pytest.mark.unit()
     def test_dry_run_renders_plan_even_for_conflicted_destination(
@@ -1407,12 +1280,48 @@ class TestGeneratePreFlight:
         return. The assertion is on the *rendered plan* (its presence
         in stdout), not on the absence of an exception.
 
-        The ``blueprint_root`` fixture is required because the
-        pipeline resolves the plan's source reference even in dry-run
-        mode — the plan's rendering includes the source path, and
-        the source is resolved against the blueprint root. Without
-        the fixture, ``_blueprint_root`` would call discovery and
-        fail (there is no discovery layout in a unit test).
+        The plan header carries the *blueprint* id and the
+        *destination*, not the project name. The project name is
+        implicit in every destination path the plan lists — see
+        ``GenerationPlan`` in ``forge/dryrun/plan.py``: it has no
+        project-name field because the plan is about *what will be
+        written where*, and every destination already encodes the
+        project name via the path. Asserting on ``"my-api"`` would
+        couple the test to a rendering detail the DTO does not carry
+        and should not carry.
+
+        What the renderer *does* promise — and what this test pins —
+        are the four properties a user actually reads to decide
+        whether to proceed:
+
+        1. The blueprint id.
+        2. The destination root.
+        3. The planned file the user would gain.
+        4. The collision remediation hint (the whole point of a
+           dry-run over a conflicted destination).
+
+        **The exit code contract.** ``_run_dry_run`` raises
+        ``SystemExit(ExitCode.DRY_RUN_COLLISIONS)`` (exit **7**) when
+        the plan contains collisions — *not*
+        ``ExitCode.COLLISION`` (exit **6**). The two codes are
+        distinct by design (ADR-0018):
+
+        * ``6`` — the *create* path's code, meaning "a real write
+          was refused because the destination exists." The write did
+          not happen; the user's next step is to re-run create with
+          ``--overwrite``.
+        * ``7`` — the *dry-run* code, meaning "the plan was
+          produced successfully and is on stdout; it contains
+          collisions." Nothing was written; the user's next step is
+          to *inspect* the plan and then decide.
+
+        This test asserts on 7 because the code path it exercises is
+        the dry-run's. The create path's exit-6 behaviour is tested
+        separately in ``TestGeneratePreFlight``.
+
+        The ``blueprint_root`` fixture is required because the plan
+        builder resolves each source reference against the blueprint
+        root when it constructs the plan's DTO.
         """
         (blueprint_root / "src.txt").write_text("body")
         target = tmp_path / "occupied"
@@ -1423,17 +1332,29 @@ class TestGeneratePreFlight:
             variables=[],
             files=[{"source": "src.txt", "destination": "out.txt"}],
         )
-        inputs = _resolved_inputs(destination=target)
+        inputs = _resolved_inputs(blueprint=blueprint, destination=target)
 
-        create_module._generate(
-            blueprint=blueprint,
-            inputs=inputs,
-            conditional_groups=[],
-            dry_run=True,
-            overwrite=False,
-        )
+        # ``_run_dry_run`` exits with code 7 on collisions (DryRunService
+        # reports collisions as data; the CLI maps that to
+        # ``ExitCode.DRY_RUN_COLLISIONS``, not ``ExitCode.COLLISION``).
+        # We expect that exit, but assert on the rendered output
+        # regardless — the plan must be *rendered* before the exit.
+        with pytest.raises(SystemExit) as info:
+            create_module._run_dry_run(
+                inputs=inputs,
+                overwrite=False,
+                json_output=False,
+            )
+        assert info.value.code == ExitCode.DRY_RUN_COLLISIONS
 
         captured = capsys.readouterr()
+        # (1) Blueprint id in the header.
         assert "python.fastapi.api" in captured.out
-        assert "my-api" in captured.out
+        # (2) Destination root in the header.
         assert str(target) in captured.out
+        # (3) The planned file the user would gain.
+        assert "out.txt" in captured.out
+        # (4) The collision remediation hint is surfaced in the
+        # rendered plan — the whole point of a dry-run over a
+        # conflicted destination.
+        assert "--overwrite" in captured.out

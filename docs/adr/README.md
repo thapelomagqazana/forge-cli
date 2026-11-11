@@ -27,6 +27,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0015](0015-planning-is-a-pure-total-function-destination-paths-have-one.md) | Planning Is a Pure, Total Function; Destination Paths Have One Resolver and One Safety Net | Accepted | 2026-11-10 |
 | [0016](0016-conditional-file-inclusion-uses-a-restricted-dsl-with-a-hand.md) | Conditional File Inclusion Uses a Restricted DSL with a Hand-Written Parser, Not Python Evaluation | Accepted | 2026-11-10 |
 | [0017](0017-one-filesystem-safety-layer-one-policy-one-staging-disciplin.md) | One Filesystem Safety Layer, One Policy, One Staging Discipline | Proposed | 2026-11-10 |
+| [0018](0018-dry-run-is-a-pure-plan-builder-writes-are-structurally-impos.md) | Dry-Run Is a Pure Plan Builder; Writes Are Structurally Impossible, Not Just Tested-Away | Accepted | 2026-11-10 |
 
 ## Creating a new ADR
 

@@ -16,18 +16,18 @@ The categories are:
    are neither failures nor errors. Rendered as a single dimmed
    "Cancelled." line on stderr, exiting with ``ExitCode.USER_ERROR``.
 
-2. **``ForgeError`` and its subclasses** that carry a simple
-   message. The user's fault (bad input, missing blueprint). Rendered
-   as a single red line with an optional hint, exiting with the
-   subclass's declared ``exit_code``.
-
-3. **Safety errors** (``SafetyError`` and its ``CollisionError``
-   subclass, both subclasses of ``ForgeError``). These carry a
+2. **Safety errors** (``SafetyError`` and its ``CollisionError``
+   subclass, both from ``forge.core.exceptions``). These carry a
    *list of findings*, not a single message. Rendered as a header
    line plus one indented line per finding, exiting with the
    subclass's declared code (3 for structural, 6 for collisions).
    ``--overwrite`` is offered *only* for ``CollisionError``, because
    structural safety failures cannot be fixed by the flag.
+
+3. **``ForgeError`` and its subclasses** that carry a simple
+   message. The user's fault (bad input, missing blueprint). Rendered
+   as a single red line with an optional hint, exiting with the
+   subclass's declared ``exit_code``.
 
 4. **``click.ClickException``** (``UsageError``, ``BadParameter``,
    ``Abort``, etc.). Also the user's fault: Click raises them when
@@ -42,6 +42,29 @@ The categories are:
    message never includes the exception's class, message, or
    traceback — those could leak internal details or hints about
    vulnerabilities.
+
+The exit code that does **not** pass through this handler
+---------------------------------------------------------
+``ExitCode.DRY_RUN_COLLISIONS`` (7) is produced by the ``create``
+command's ``_run_dry_run`` function via a direct
+``raise SystemExit(ExitCode.DRY_RUN_COLLISIONS)``, *after* the plan
+has been rendered to stdout. The dry-run path does not raise an
+exception in the ordinary sense — it produces a valid plan that
+happens to contain collisions, and exits with a code that tells CI
+"the plan is on stdout; parse it and decide."
+
+By the time ``_run_dry_run`` raises, there is no *exception* to
+classify: the dry-run **succeeded**. It would be a category error to
+route this through ``handle_exception``, whose entire job is to
+convert *failures* into messages. The handler correctly lets any
+``SystemExit`` propagate (via ``main()``, which catches ``SystemExit``
+and lets it pass through rather than sending it to this handler).
+
+This is why the exit-code table in ``forge/core/exceptions.py`` has
+no ``ForgeError`` subclass that resolves to 7: no exception *means*
+"the dry-run found conflicts." The dry-run path knows that fact
+directly and exits accordingly. See ``docs/reference/DRY_RUN_PLAN.md``
+for the user-facing contract that documents exit 7.
 
 See ``forge/core/exceptions.py`` for the domain error hierarchy, the
 exit-code table, and the rationale for each subclass's exit code.
@@ -184,6 +207,11 @@ Design principles
    it carries findings that need their own rendering. The classifier
    checks the more specific category first, so the presentation
    matches the data shape.
+9. **Not everything with an exit code is an exception.** A dry-run
+   that finds collisions *succeeds* — the plan is produced, the user
+   has information — and exits with a code that says so. That code
+   (7) never reaches this handler, and that is by design: the handler
+   classifies *failures*, and a dry-run's collision report is not one.
 """
 
 from __future__ import annotations
@@ -203,15 +231,12 @@ from forge.core.exceptions import (
     CollisionError,
     ExitCode,
     ForgeError,
-    MissingRequiredFlagsError,
     PromptCancelledError,
     SafetyError,
 )
 
 __all__ = [
     "ExitCode",
-    "MissingRequiredFlagsError",
-    "PromptCancelledError",
     "handle_exception",
 ]
 
@@ -224,7 +249,6 @@ __all__ = [
 # (``echo "" | forge create``) hits EOF at the first read — that is a
 # cancellation, not a bug.
 _CANCELLATIONS: tuple[type[BaseException], ...] = (
-    PromptCancelledError,
     KeyboardInterrupt,
     click.Abort,
     typer.Abort,
@@ -265,6 +289,15 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     cancellations, because they are not bugs and there is nothing to
     debug.
 
+    Not a category handled here: ``ExitCode.DRY_RUN_COLLISIONS`` (7).
+    The dry-run path raises ``SystemExit(7)`` directly from
+    ``create._run_dry_run`` *after* rendering the plan — there is no
+    exception to classify. ``SystemExit`` from that path flows
+    through ``main()``, which lets it pass through unmodified. This
+    handler is for failures; the dry-run's collision report is not
+    one. See the module docstring's "The exit code that does **not**
+    pass through this handler" section.
+
     Raises:
         NoReturn: always exits, either by re-raising (under
             ``--debug``, unexpected only) or by raising ``SystemExit``.
@@ -272,7 +305,17 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     # -------------------------------------------------------------------------
     # 1. Cancellations — checked FIRST (see module docstring).
     # -------------------------------------------------------------------------
-    if isinstance(exc, _CANCELLATIONS):
+    # ``PromptCancelledError`` is a ``UserInputError`` (and therefore a
+    # ``ForgeError``), so it must be tested here — before the generic
+    # ``ForgeError`` branch. Otherwise the user sees a red error line
+    # for what is actually a clean cancellation. See module docstring,
+    # "Why cancellations are checked before ``ForgeError``."
+    #
+    # ``PromptCancelledError`` is imported at module level (not inside
+    # this function) because it is a *first-class* member of the
+    # cancellation set — not an afterthought — and the import belongs
+    # where a reviewer scanning the module's top will see it.
+    if isinstance(exc, (PromptCancelledError, *_CANCELLATIONS)):
         print_cancelled()
         raise SystemExit(ExitCode.USER_ERROR) from None
 
@@ -305,14 +348,16 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     # -------------------------------------------------------------------------
     # 3. ForgeError and subclasses — the user's fault, with an exit code.
     # -------------------------------------------------------------------------
-    # ``MissingRequiredFlagsError`` and ``PromptCancelledError`` are
-    # ``ForgeError`` subclasses too, but the former is handled here
-    # via its overridden ``hint`` (which carries the remediation text)
-    # and the latter was caught by the cancellation branch above.
+    # ``MissingRequiredFlagsError`` is handled here directly: its
+    # ``__post_init__`` composes an actionable message, and its
+    # class-level ``hint`` provides the remediation. No special-case
+    # needed — the generic branch renders both fields, which is exactly
+    # what the subclass provides.
     if isinstance(exc, ForgeError):
         print_error(str(exc))
-        if exc.hint:
-            print_hint(exc.hint)
+        hint = getattr(exc, "hint", None)
+        if hint:
+            print_hint(hint)
         raise SystemExit(exc.exit_code) from None
 
     # -------------------------------------------------------------------------
@@ -353,51 +398,61 @@ def _render_safety_error(
     callers differ only in the header text and whether they name
     ``--overwrite``.
 
-    Why a helper, not duplicated code:
-        The finding shape is ``(code, path, message, hint)`` for both
-        types, and both render the header in the same style. A future
-        field (a ``severity``, a ``suggestion``) would need to appear
-        in two places if this were duplicated; a single function is
-        the seam for that change.
+    Why a helper, not duplicated code
+    ---------------------------------
+    The finding shape is a 4-tuple ``(code, path, message, hint)`` for
+    both types, and both render the header in the same style. A future
+    field (a ``severity``, a ``suggestion``) would need to appear in
+    two places if this were duplicated; a single function is the seam
+    for that change.
 
-    Why ``print_error_indented``, not ``print_error``:
-        The CLI's error vocabulary distinguishes top-level failures
-        (``print_error``) from detail lines under a header
-        (``print_error_indented``). Finding lines are detail lines;
-        rendering them at top level would make a five-finding error
-        look like five separate failures. The indentation is the
-        visual cue that they share a cause.
+    Why ``print_error_indented``, not ``print_error``
+    -------------------------------------------------
+    The CLI's error vocabulary distinguishes top-level failures
+    (``print_error``) from detail lines under a header
+    (``print_error_indented``). Finding lines are detail lines;
+    rendering them at top level would make a five-finding error look
+    like five separate failures. The indentation is the visual cue
+    that they share a cause.
+
+    Why the hint order is findings-then-hint
+    ----------------------------------------
+    The user should read *what went wrong* (each finding) before
+    *what to do about it* (the top-level hint). This matches the
+    loading and planning renderers, which also put the diagnosis
+    before the remediation.
+
+    Why the ``hint`` check is ``if hint := ...`` rather than
+    ``getattr(exc, "hint", None)`` followed by a truthiness check
+    -----------------------------------------------------------------
+    ``SafetyError.hint`` is annotated ``str | None`` on
+    ``forge.core.exceptions.SafetyError`` — a hint is optional,
+    because not every safety failure has a remediation the class
+    itself can name. (For ``CollisionError`` the branch below is
+    never reached: ``offer_overwrite=True`` skips it. For plain
+    ``SafetyError``, ``hint`` may be ``None`` when the caller
+    constructed the error without one — the safety-layer callers in
+    ``cli.commands.create`` always supply a hint, but the class
+    does not require it.)
+
+    ``if hint := getattr(exc, "hint", None)`` both reads the
+    attribute and narrows its type to ``str`` inside the body —
+    the walrus operator's value is the assignment result, and the
+    truthiness check rules out ``None`` and ``""``. A bare
+    ``getattr(exc, "hint", None)`` returns ``str | None`` (because
+    the default is ``None``), which ``print_hint``'s ``str``
+    parameter rejects under mypy strict.
     """
     print_error(header)
-    if exc.findings:
-        for code, path, message, _finding_hint in exc.findings:
-            rendered_path = path or "<root>"
-            print_error_indented(f"  [{code}] {rendered_path}: {message}")
-    # Hint after findings so the user reads the *what* before the
-    # *what to do* — the same order as the loading and planning
-    # renderers.
+    for code, path, message, _finding_hint in exc.findings:
+        rendered_path = path or "<root>"
+        print_error_indented(f"  [{code}] {rendered_path}: {message}")
+
     if offer_overwrite:
         print_hint(
             "Re-run with --overwrite to replace the existing files "
             "(a timestamped backup will be created), or edit the plan "
             "so it does not target those paths."
         )
-    elif exc.hint:
-        print_hint(exc.hint)
-
-
-# -----------------------------------------------------------------------------
-# Public re-exports
-# -----------------------------------------------------------------------------
-# The two dual-mode subclasses are re-exported for convenience, so a
-# caller using ``from forge.cli.errors import (handle_exception,
-# MissingRequiredFlagsError, PromptCancelledError)`` gets everything
-# in one import. The *definitions* live in ``forge.core.exceptions``
-# (see the module docstring, "Why this module imports its error types
-# from core").
-__all__ = [
-    "ExitCode",
-    "MissingRequiredFlagsError",
-    "PromptCancelledError",
-    "handle_exception",
-]
+    elif hint := getattr(exc, "hint", None):
+        print_hint(hint)

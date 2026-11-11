@@ -24,6 +24,33 @@ directly: the only way to produce a file is `stage.write_*()`, and the
 only way to reveal it is `stage.commit()`. Bypassing staging is a type
 error, not a code-review note.
 
+Read-only mode
+--------------
+`StagingArea.for_root(root, read_only=True)` produces a staging area
+that **cannot write**:
+
+    * entering the context manager does *not* create a directory
+      (a read-only staging area is a zero-side-effect object),
+    * `write_bytes`, `write_text`, and `commit` all raise
+      `RuntimeError` before touching the filesystem.
+
+This is the structural half of the "no filesystem mutations during
+dry-run" guarantee (ADR-0018). The dry-run service does not construct
+a staging area today — but the guarantee is only meaningful if a
+future contributor *cannot* accidentally introduce a write inside the
+plan code path without tripping a loud, deterministic error at the
+call site. A fingerprint-based test (compare the destination tree
+before and after) is necessary but not sufficient: a temporary file
+that is created and removed within the same dry-run would slip past a
+fingerprint taken after the run. The read-only staging area catches
+that class, because the write is refused *when it is attempted* —
+before it can be created and hidden.
+
+Read-only mode does not weaken the type contract. Callers that take a
+`StagingArea` still receive one; they still call the same methods; they
+just get a `RuntimeError` from the write methods instead of a file on
+disk. That is the correct failure mode: a bug, surfaced loudly.
+
 Why same-filesystem
 -------------------
 `os.replace` is atomic only within a single filesystem. Staging on the
@@ -43,6 +70,13 @@ manager makes cleanup automatic on *all* exit paths, including
 exceptions the caller did not anticipate. The `finally` block runs
 even if the caller's own `except` clause raises. That is the only way
 to guarantee "no debris" as a property, not a promise.
+
+Read-only mode is a special case of the same cleanup discipline:
+because it never creates a directory, there is nothing to clean up. The
+context manager still yields and returns normally, so a caller does not
+need two code paths — `with StagingArea.for_root(root, read_only=True)`
+and `with StagingArea.for_root(root)` differ only in what they permit,
+not in how they are used.
 
 Why not `TemporaryDirectory`
 ----------------------------
@@ -99,20 +133,31 @@ from pathlib import Path
 # and easy for users to identify if they ever need to clean up manually.
 _STAGING_PREFIX = ".forge-stage-"
 
+# Sentinel used as the "path" of a read-only staging area. It is
+# deliberately not a real filesystem path: no operation should ever
+# reach the filesystem through this value, and any attempt to open it
+# fails with an obvious error that names the sentinel.
+_READ_ONLY_SENTINEL = Path("<read-only-staging>")
+
 
 @dataclass
 class StagingArea:
     """A staging directory that lives next to the destination root.
 
-    Construct via `StagingArea.for_root(root)`; do not instantiate
-    directly. The dataclass is *stateful* — `_created` tracks every
-    file placed under `path` so `commit()` knows exactly what to move.
+    Construct via ``StagingArea.for_root(root)`` (or with
+    ``read_only=True`` for a no-write instance); do not instantiate
+    directly. The dataclass is *stateful* — ``_created`` tracks every
+    file placed under ``path`` so ``commit()`` knows exactly what to
+    move.
 
     Attributes
     ----------
     path : Path
         The staging directory itself. Files are created inside it
-        (never outside — `_prepare` enforces this).
+        (never outside — ``_prepare`` enforces this). For read-only
+        areas, this is the sentinel ``_READ_ONLY_SENTINEL``; it exists
+        so ``StagingArea`` remains a valid object, but no path
+        operation on it will ever produce a real file.
     root : Path
         The destination root that staged files will be committed into.
         Must be an ancestor of every final destination path.
@@ -125,11 +170,18 @@ class StagingArea:
         duplicate move. See the module docstring's "Duplicate
         writes" section for why deduplication-by-path is the
         correct semantics.
+    read_only : bool
+        When ``True``, the staging area refuses every write and commit
+        (raising ``RuntimeError``) and its construction does not create
+        a directory. Used by dry-run code paths that must not mutate
+        the filesystem under any circumstance. Defaults to ``False``,
+        which is the write path.
     """
 
     path: Path
     root: Path
     _created: list[Path] = field(default_factory=list)
+    read_only: bool = False
 
     # ------------------------------------------------------------------
     # Construction
@@ -137,10 +189,11 @@ class StagingArea:
 
     @classmethod
     @contextmanager
-    def for_root(cls, root: Path) -> Iterator[StagingArea]:
+    def for_root(cls, root: Path, *, read_only: bool = False) -> Iterator[StagingArea]:
         """Create a staging area anchored to `root`; clean up on exit.
 
-        The `finally` clause runs on *every* exit path:
+        With ``read_only=False`` (the default), the `finally` clause
+        runs on *every* exit path:
 
             * normal return (after `commit`),
             * any exception the caller raised,
@@ -151,10 +204,45 @@ class StagingArea:
         `root` with a private name. A failure to remove it cannot leak
         user data outside the staging tree, and any file we might miss
         belongs to us, not to the destination.
+
+        With ``read_only=True``, no directory is created and the
+        `finally` clause is a no-op (there is nothing to remove). The
+        yielded area's ``path`` is the sentinel ``_READ_ONLY_SENTINEL``;
+        callers that log ``stage.path`` will see ``<read-only-staging>``
+        rather than a real path — which is the correct signal that no
+        staging occurred.
+
+        See the module docstring's "Read-only mode" section for why the
+        guarantee is enforced structurally rather than only tested
+        behaviourally.
         """
+        # Read-only mode: no directory is created. Building the object
+        # without touching the filesystem is the *whole point* — a
+        # read-only staging area that still called `mkdtemp` would
+        # violate its own contract at the first call.
+        if read_only:
+            area = cls(
+                path=_READ_ONLY_SENTINEL,
+                root=root,
+                _created=[],
+                read_only=True,
+            )
+            try:
+                yield area
+            finally:
+                # Nothing to clean up. The `try/finally` still surrounds
+                # the yield so callers can rely on cleanup-shaped
+                # context management (any `__exit__` bookkeeping they
+                # perform in *their* own finally runs identically in
+                # both modes).
+                pass
+            return
+
+        # Write mode: create the staging directory under `root`. Same
+        # behaviour as before — mkdtemp, yield, best-effort rmtree.
         root.mkdir(parents=True, exist_ok=True)
         stage_dir = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=str(root)))
-        area = cls(path=stage_dir, root=root, _created=[])
+        area = cls(path=stage_dir, root=root, _created=[], read_only=False)
         try:
             yield area
         finally:
@@ -183,11 +271,18 @@ class StagingArea:
         the file once, with the last write's content. See the module
         docstring's "Duplicate writes" section.
 
+        On a read-only staging area, this method raises ``RuntimeError``
+        before touching the filesystem. That is the intended failure
+        mode — a caller that reaches a write call in a read-only
+        context has a bug, and the error names the staging area, not
+        the (nonexistent) file.
+
         Returns the absolute path of the staged file. Callers do not
         need this for `commit()` (which tracks staged files itself),
         but tests and dry-run renderers benefit from being able to read
         back exactly what they wrote.
         """
+        self._refuse_if_read_only("write_bytes")
         target = self._prepare(relpath)
         with open(target, "wb") as fh:
             fh.write(data)
@@ -207,7 +302,14 @@ class StagingArea:
         return target
 
     def write_text(self, relpath: str, text: str) -> Path:
-        """UTF-8 convenience wrapper around `write_bytes`."""
+        """UTF-8 convenience wrapper around `write_bytes`.
+
+        Guarded by the same read-only refusal as `write_bytes` —
+        calling this on a read-only area raises ``RuntimeError``
+        *before* delegating, so a future refactor of the delegation
+        cannot accidentally bypass the guard.
+        """
+        self._refuse_if_read_only("write_text")
         return self.write_bytes(relpath, text.encode("utf-8"))
 
     # ------------------------------------------------------------------
@@ -231,6 +333,13 @@ class StagingArea:
         order matches the *first-write* order, which is what a caller
         that logs "wrote a, wrote b, wrote c" expects.
 
+        On a read-only staging area, this method raises
+        ``RuntimeError`` — even though there is nothing to commit,
+        a caller invoking ``commit()`` on a read-only area is
+        expressing an intent that contradicts the area's contract.
+        Silently returning ``[]`` would hide the bug; raising makes
+        it visible.
+
         Why not roll back on partial commit failure?
             Rolling back means undoing successful atomic renames,
             which means copying the *original* destination files back
@@ -252,8 +361,9 @@ class StagingArea:
         -------
         list[Path]
             The final destination paths, in commit order. Empty when
-            nothing was staged (harmless no-op).
+            nothing was staged (harmless no-op in write mode).
         """
+        self._refuse_if_read_only("commit")
         committed: list[Path] = []
         try:
             for staged in self._created:
@@ -277,6 +387,29 @@ class StagingArea:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _refuse_if_read_only(self, method: str) -> None:
+        """Raise a clear RuntimeError if this staging area is read-only.
+
+        Centralised so every write path has identical refusal semantics
+        and message shape. Adding a new write method in the future means
+        calling this guard at the top of the method — one line, one
+        place to review, one failure mode to test.
+
+        The error message names the method (so a stack trace's *first*
+        line says which entry point was reached) and the mode (so the
+        reader does not have to look up which staging area this is).
+        That combination is what makes a regression to the dry-run path
+        obvious at the point of failure, rather than appearing as
+        mysterious missing files later.
+        """
+        if self.read_only:
+            raise RuntimeError(
+                f"StagingArea.{method}() refused: this staging area is "
+                "read-only. The dry-run path must not modify the "
+                "filesystem; use StagingArea.for_root(root) "
+                "(read_only=False) to obtain a writable staging area."
+            )
 
     def _prepare(self, relpath: str) -> Path:
         """Resolve `relpath` inside staging; reject anything that escapes.

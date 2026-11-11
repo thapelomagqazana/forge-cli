@@ -27,45 +27,6 @@ in ``cli.commands.create``) is what lets a future ``forge generate``
 (or an HTTP endpoint, or a batch runner) reuse the exact same
 pipeline without re-implementing the ordering.
 
-Why this module currently delegates
------------------------------------
-The full ``scaffold_from_plan`` implementation — including rendering,
-backup scheduling, and commit — is presently in
-``cli.commands.create._generate``. It was placed there so the CLI
-could ship end-to-end before the generation module existed. Now that
-the module exists, the *contract* lives here; the *implementation*
-migrates next.
-
-The delegation below is deliberate and temporary:
-
-    * Callers already import ``scaffold_from_plan`` from
-      ``forge.generation`` (``create`` is the first; a future
-      ``forge generate`` will be the second). That import path is
-      **stable from this commit forward** — the migration of the body
-      from ``create._generate`` to this module does not touch any
-      call site.
-
-    * The signature is the one the pipeline needs, not the one
-      ``create`` happens to have. In particular:
-
-        - ``destination`` is explicit, so the caller controls it
-          (create builds it as ``output / project_name``).
-        - ``overwrite`` is required, so the *caller* decides the
-          overwrite policy (create reads it from ``--overwrite``).
-        - ``renderer`` is injectable, so a future caller that wants
-          a different renderer (say, one that emits a manifest) can
-          supply it. The default is the sandboxed renderer
-          (ADR-0014), which is the right choice for every current
-          caller.
-
-    * The delegation itself is one function call. There is no
-      branching, no policy, no state — a reader who follows the call
-      sees the current implementation in one place. When the
-      implementation moves here, that call is replaced by the body
-      it *currently* points to; the diff is mechanical, and the
-      tests that already exercise ``create._generate`` will continue
-      to pass unchanged.
-
 Why ``scaffold_from_plan`` and not, say, ``write_plan``
 -------------------------------------------------------
 "Scaffold" is the domain verb: the CLI, the docs, and every user-
@@ -121,17 +82,60 @@ mypy's ``unused-ignore`` check — on under strict mode — will force
 its removal in the same PR that lands the stubs. That is the desired
 signal: the ignore is a *placeholder for an external dependency's
 gap*, not a permanent part of this module's contract.
+
+Why the commit phase is inlined rather than delegated
+-----------------------------------------------------
+An earlier revision of this module delegated to
+``cli.commands.create._generate`` to avoid duplicating the commit
+loop while the CLI was being built out. That delegation is now gone,
+for two reasons:
+
+    1. **The signatures diverged.** ``_generate`` now takes an
+       opaque ``_ResolvedInputs`` bundle plus ``overwrite`` — it
+       builds the plan *and* commits it. ``scaffold_from_plan`` is
+       handed a finished plan by its caller (that is its whole
+       contract). Calling ``_generate`` would build a second plan
+       from the blueprint and commit *that*, ignoring the caller's
+       plan entirely. A façade that silently ignores its primary
+       argument is not a façade.
+
+    2. **The adapter shims were unsound.** To call ``_generate``,
+       this module had to manufacture a ``_ResolvedInputs``-shaped
+       object (via ``_InputsAdapter``) and a ``Blueprint``-shaped
+       stand-in (via ``_BlueprintShim``). Both were held together
+       by ``# type: ignore[arg-type]`` comments, and neither could
+       ever be *right* — ``_ResolvedInputs`` carries a real
+       ``Blueprint`` document, and a shim cannot provide one
+       because the caller never had one. The façade's job is to
+       *use* the plan, not to fabricate the inputs that would let
+       a different function build one.
+
+The inlined commit loop below is short, uses only the primitives
+the CLI's ``_generate`` uses (``backup_existing`` and
+``StagingArea``), and is the natural home for the ordering invariant
+the module docstring states. It also eliminates the last runtime
+dependency on ``forge.cli`` from this module — ``forge.generation``
+is now importable without pulling in the CLI.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from forge.core.exceptions import (
+    FilesystemConflictError,
+    TemplateRenderError,
+)
 from forge.planning import PlannedFile
 from forge.rendering import TemplateRenderer
+from forge.safety import StagingArea, backup_existing
+
+if TYPE_CHECKING:
+    from forge.rendering.errors import TemplateRenderError as RenderingTemplateError
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,122 +303,180 @@ def scaffold_from_plan(  # type: ignore[no-any-unimported]
         trying to avoid. The purity lives in ``FileMapper`` (plan)
         and ``forge.safety`` (validate); this function is the *only*
         impure step, and it is short enough to read in one sitting.
-
-    Why the function is defined here and not yet implemented here:
-        The current implementation lives in ``create._generate``. It
-        is functionally identical to what this function will contain
-        once the body is migrated — the migration is a copy of the
-        loop from ``_generate`` into this function, plus a small
-        wrapper around the plan iteration. Until then, this function
-        *calls into* ``create._generate``'s building blocks to
-        provide the same behaviour to any caller that prefers the
-        façade. New callers (a future ``forge generate``, an HTTP
-        endpoint) should use this function; existing callers (the
-        CLI's ``create``) are free to keep their inlined pipeline
-        during the transition, because both paths run the same
-        underlying safety and rendering code.
     """
-    # The delegation below is *intentionally* a thin call into the
-    # same primitives that ``create._generate`` uses. It is not a
-    # shortcut — it is the *same behaviour expressed through a
-    # stable façade*. When ``_generate``'s pipeline moves here, the
-    # only diff will be: (a) the source of ``variables`` and
-    # ``blueprint_root`` (already parameters here), and (b) the
-    # ``ui.success`` call at the end (which belongs in the caller,
-    # not the writer — the writer should not print).
+    effective_renderer = renderer if renderer is not None else TemplateRenderer()
+
+    # ------------------------------------------------------------------
+    # Phase A: backups (opt-in via --overwrite, and only for files
+    # that already exist at plan destinations).
     #
-    # That is why this façade exists: to give callers a stable target
-    # *today*, and to give the migration a landing pad *tomorrow*.
-    from forge.cli.commands import create as _create  # local: avoid import cycle
-
-    # Adapter: build the exact same inputs ``_generate`` expects, run
-    # its staging loop, and capture the result. This guarantees the
-    # façade and the inlined pipeline produce identical output for
-    # identical input, which is what a façade is for during a
-    # transition.
-    class _InputsAdapter:
-        """Minimal shape ``_generate`` reads: id, name, destination, variables."""
-
-        __slots__ = ("blueprint_id", "project_name", "destination", "variables")
-
-        def __init__(self, blueprint_id: str, destination: Path, variables: Mapping[str, Any]):
-            self.blueprint_id = blueprint_id
-            self.project_name = destination.name
-            self.destination = destination
-            self.variables = variables
-
-    # ``_generate`` also needs a ``Blueprint`` to render, which the
-    # caller does not pass (the plan already encodes everything
-    # required to render each file). We reconstruct a minimal
-    # blueprint-like shim to satisfy ``_generate``'s signature until
-    # the migration lands. A future ``scaffold_from_plan`` will not
-    # need this — the plan carries all the information it needs.
-    class _BlueprintShim:
-        """Just enough ``Blueprint`` surface for ``_generate``'s internals."""
-
-        __slots__ = ("id",)
-
-        def __init__(self, blueprint_id: str):
-            self.id = blueprint_id
-
-    # ``_generate`` needs the blueprint id for error attribution. We
-    # infer it from ``blueprint_root`` (the directory name is the
-    # blueprint id by the loader's layout). This is temporary — the
-    # migrated implementation will take ``blueprint_id`` as an
-    # explicit parameter, eliminating the inference.
-    blueprint_id = blueprint_root.name
-
-    inputs = _InputsAdapter(blueprint_id=blueprint_id, destination=destination, variables=variables)
-    shim_blueprint = _BlueprintShim(blueprint_id=blueprint_id)
-
-    # Run the pipeline. ``_generate`` mutates the filesystem via the
-    # same primitives this function's docstring describes; the
-    # adapters above are the seam.
-    _create._generate(
-        blueprint=shim_blueprint,  # type: ignore[arg-type]  # see note
-        inputs=inputs,  # type: ignore[arg-type]
-        conditional_groups=[],  # already encoded in ``plan``
-        dry_run=False,
-        overwrite=overwrite,
-    )
-
-    # The writer's job is to produce files, not to report. But
-    # ``_generate`` currently returns ``None`` and does not expose
-    # the written/backup lists. To honour this façade's contract
-    # (return ``ScaffoldResult``), we derive the lists from the
-    # plan and the filesystem. This derivation is *exact* — the
-    # plan is the source of truth for what was written, and the
-    # ``*.bak.*`` glob is the source of truth for what was backed
-    # up. A migrated implementation will return these directly,
-    # without the filesystem walk; that is the only difference.
-
-    # The plan is sorted by destination; the returned written
-    # paths preserve that order.
-    written = tuple(destination / p.destination for p in plan)
+    # Runs *before* any staging write. If this phase fails, the caller
+    # sees a ``FilesystemConflictError`` naming the I/O problem, and
+    # the destination is unchanged — no files have been touched.
+    # ------------------------------------------------------------------
     backups: tuple[Path, ...] = ()
     if overwrite:
-        # Glob for the timestamped backup siblings we just created.
-        # The pattern is ``<name>.bak.<UTC timestamp>``, and the
-        # write happens in ``backup_existing``; a simple glob is
-        # sufficient because the timestamp is fresh.
-        found: list[Path] = []
-        for planned in plan:
-            target = destination / planned.destination
-            found.extend(target.parent.glob(f"{target.name}.bak.*"))
-        # Deduplicate while preserving order. ``dict.fromkeys`` is the
-        # canonical "dedupe a sequence preserving first occurrence"
-        # idiom: a dict preserves insertion order, and its keys are
-        # unique — so ``dict.fromkeys(seq)`` iterates the distinct
-        # elements in the order they first appeared. The previous
-        # implementation used ``seen.add(p)`` inside a generator
-        # expression, which ruff's ``[func-returns-value]`` correctly
-        # flagged: ``set.add`` returns ``None``, so ``not seen.add(p)``
-        # works only because of ``and`` short-circuiting — a fragile
-        # idiom whose correctness is not obvious to a reader. The
-        # ``dict.fromkeys`` form is shorter *and* clearer.
-        backups = tuple(dict.fromkeys(found))
+        existing = _existing_targets(plan, destination)
+        if existing:
+            try:
+                created = backup_existing(existing)
+            except OSError as exc:
+                raise FilesystemConflictError(
+                    f"Could not back up existing files before overwrite: {exc}",
+                    hint=(
+                        "Check permissions and free disk space, then retry. "
+                        "No files have been modified."
+                    ),
+                ) from exc
+            backups = tuple(b.backup for b in created)
 
-    return ScaffoldResult(written=written, backups=backups)
+    # ------------------------------------------------------------------
+    # Phase B: staging and commit.
+    #
+    # ``StagingArea.for_root`` creates a hidden ``.forge-stage-*``
+    # directory *inside* ``destination`` (same filesystem, so
+    # ``os.replace`` is atomic). The context manager removes it on
+    # exit, including on exception. This is the *only* phase that
+    # mutates the destination root; phase A writes only to backup
+    # files, which are new and outside the plan's target set.
+    #
+    # ``mkdtemp`` (used by ``StagingArea.for_root``) requires its
+    # parent to exist. Creating the root is idempotent and
+    # side-effect-free if it already exists.
+    # ------------------------------------------------------------------
+    destination.mkdir(parents=True, exist_ok=True)
+
+    with StagingArea.for_root(destination) as stage:
+        for planned in plan:
+            _stage_one(
+                stage=stage,
+                renderer=effective_renderer,
+                planned=planned,
+                blueprint_root=blueprint_root,
+                variables=variables,
+            )
+        committed = stage.commit()
+
+    # ``committed`` is the authoritative list of written paths — the
+    # staging area returns them in commit order, which is the same
+    # order as ``plan`` (the caller sorted the plan by destination).
+    # Using ``committed`` rather than re-deriving from ``plan`` keeps
+    # the result *honest* if a future staging-area implementation ever
+    # skipped a file (e.g. a no-op for an empty source). The plan is
+    # the *intent*; the commit result is what *happened*.
+    return ScaffoldResult(
+        written=tuple(committed),
+        backups=backups,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+
+def _existing_targets(plan: list[PlannedFile], root: Path) -> list[Path]:
+    """Return absolute paths of plan destinations that exist on disk.
+
+    Uses ``lstat`` — a broken symlink is a name in use and will be
+    replaced by ``--overwrite``, so it must be backed up. Fail closed:
+    an unreadable entry is treated as existing, because a spurious
+    backup is cheap and a missed backup is data loss.
+
+    Kept identical to ``create._generate``'s helper because both call
+    sites perform the same check against the same plan shape. A future
+    consolidation (hoisting this into ``forge.safety``) would let both
+    callers share it; until then, the duplication is small enough
+    (~15 lines) that an extra import edge isn't worth it.
+    """
+    existing: list[Path] = []
+    for planned in plan:
+        target = root / planned.destination
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass  # fail closed: treat as existing
+        existing.append(target)
+    return existing
+
+
+def _stage_one(
+    *,
+    stage: StagingArea,
+    renderer: Any,  # see the docstring for why this is ``Any``
+    planned: PlannedFile,
+    blueprint_root: Path,
+    variables: Mapping[str, Any],
+) -> None:
+    """Render or copy one planned file into the staging area.
+
+    * ``COPY`` — read bytes verbatim and write them to staging.
+    * ``RENDER`` — render through the sandboxed renderer; translate
+      any ``TemplateRenderError`` into the CLI error hierarchy.
+
+    ``renderer`` is typed ``Any`` rather than ``TemplateRenderer``
+    because the latter is unfollowed by mypy (see the module
+    docstring's ``# type: ignore[no-any-unimported]`` section) — a
+    ``TemplateRenderer`` annotation would just re-introduce the same
+    ``[no-any-unimported]`` diagnostic on *this* function's ``def``
+    line. ``Any`` is honest here: the runtime contract is enforced by
+    ``renderer.render(...)`` failing with a clear ``AttributeError``
+    if the caller supplied the wrong object, and the *caller* (which
+    is ``scaffold_from_plan``, whose own parameter carries the real
+    ``TemplateRenderer | None`` annotation) has already type-checked
+    the value before passing it down. The parameter is *internal* to
+    this module — it is not part of the public surface — so loosening
+    its type costs nothing a caller can observe.
+    """
+    source_path = blueprint_root / planned.source
+
+    if planned.is_render:
+        result = renderer.render(source_path, variables)
+        if not result.is_ok():
+            raise _as_template_error(result.error, source=str(source_path))
+        stage.write_text(planned.destination, result.value)
+        return
+
+    try:
+        data = source_path.read_bytes()
+    except OSError as exc:
+        raise FilesystemConflictError(
+            f"Could not read source file {planned.source!r} for copy: {exc}",
+            hint="Check the blueprint's file entry; the source must be readable.",
+        ) from exc
+    stage.write_bytes(planned.destination, data)
+
+
+def _as_template_error(
+    error: RenderingTemplateError,
+    *,
+    source: str,
+) -> TemplateRenderError:
+    """Translate a rendering-side error into the CLI's error type.
+
+    The rendering-side error carries ``template``, ``line``, ``col``,
+    and ``name`` — richer than the CLI's ``TemplateRenderError``
+    (which is a ``StructuredError`` with ``(pointer, message)``
+    pairs). This function projects them into a single tuple so the
+    handler can render it uniformly.
+
+    Identical to ``create._generate``'s helper of the same name.
+    Kept local rather than imported from the CLI because importing
+    it would re-introduce the module-level dependency on
+    ``forge.cli`` that the inlined implementation was introduced to
+    remove.
+    """
+    pointer = ""
+    if error.line is not None:
+        pointer = f"line {error.line}"
+        if error.col is not None:
+            pointer += f", col {error.col}"
+    return TemplateRenderError(
+        source=source,
+        errors=((pointer, error.message),),
+    )
 
 
 __all__ = ["ScaffoldResult", "scaffold_from_plan"]

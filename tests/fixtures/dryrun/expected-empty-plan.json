@@ -1,0 +1,11 @@
+{
+  "blueprint_id": "sample.empty",
+  "blueprint_version": "1.0.0",
+  "collisions": [],
+  "destination": "/fixed/path/used/in/golden/tests",
+  "files_to_create": [],
+  "files_to_skip": [],
+  "overwrite": false,
+  "schema_version": "1.0.0",
+  "warnings": []
+}

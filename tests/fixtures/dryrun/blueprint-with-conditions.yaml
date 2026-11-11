@@ -1,0 +1,40 @@
+schema_version: "1.0.0"
+id: sample.conditions
+name: Conditions Demo
+version: 1.0.0
+description: >
+  A two-conditional-group blueprint used to prove that the skip list
+  is complete (both groups are listed when neither condition holds)
+  and that evaluating one condition true leaves the other in the
+  skip list.
+category: api
+maintainer: "@forge-team"
+compatibility:
+  min_forge_version: 1.0.0
+variables:
+  - id: include_docker
+    type: boolean
+    description: Include Docker files.
+    required: false
+    default: false
+  - id: include_ci
+    type: boolean
+    description: Include CI configuration.
+    required: false
+    default: false
+files: []
+conditional_files:
+  - condition: include_docker == true
+    files:
+      - source: templates/Dockerfile.j2
+        destination: Dockerfile
+      - source: templates/docker-compose.yml.j2
+        destination: docker-compose.yml
+  - condition: include_ci == true
+    files:
+      - source: templates/.github/workflows/ci.yml.j2
+        destination: .github/workflows/ci.yml
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md

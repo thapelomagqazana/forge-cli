@@ -1,0 +1,18 @@
+schema_version: "1.0.0"
+id: sample.empty
+name: Empty Blueprint
+version: 1.0.0
+description: >
+  A blueprint with no files. Used to prove the dry-run renders an
+  empty plan with the same envelope shape as a non-empty plan — a
+  property automation depends on when enumerating plans across many
+  blueprints.
+category: other
+compatibility:
+  min_forge_version: 1.0.0
+variables: []
+files: []
+verification:
+  - id: has_readme
+    type: required_file
+    path: README.md
