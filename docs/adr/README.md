@@ -28,6 +28,7 @@ If a decision changes, a new ADR supersedes the old one.
 | [0016](0016-conditional-file-inclusion-uses-a-restricted-dsl-with-a-hand.md) | Conditional File Inclusion Uses a Restricted DSL with a Hand-Written Parser, Not Python Evaluation | Accepted | 2026-11-10 |
 | [0017](0017-one-filesystem-safety-layer-one-policy-one-staging-disciplin.md) | One Filesystem Safety Layer, One Policy, One Staging Discipline | Proposed | 2026-11-10 |
 | [0018](0018-dry-run-is-a-pure-plan-builder-writes-are-structurally-impos.md) | Dry-Run Is a Pure Plan Builder; Writes Are Structurally Impossible, Not Just Tested-Away | Accepted | 2026-11-10 |
+| [0019](0019-staging-is-atomic-and-invisible-the-rendering-engine-never-w.md) | Staging Is Atomic and Invisible; the Rendering Engine Never Writes to the Destination | Accepted | 2026-11-14 |
 
 ## Creating a new ADR
 

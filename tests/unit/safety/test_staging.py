@@ -14,8 +14,14 @@ failure mode that plagues scaffolding tools:
 The staging discipline eliminates this class of failure:
 
     * Every file the pipeline produces goes into a hidden
-      ``.forge-stage-*`` directory inside the *destination root*
-      (same filesystem, so ``os.replace`` is atomic at commit time).
+      ``.forge-stage-*`` directory that is a *sibling* of the
+      destination root — both are children of the destination's
+      parent. Staging in the parent (rather than inside the
+      destination) means a failed run does not leave an empty
+      destination behind, while still guaranteeing the same
+      filesystem for atomic ``os.replace`` at commit time. See
+      ``forge.safety.staging``'s "Where the staging directory
+      lives" section for the full reasoning.
     * ``commit()`` moves each staged file to its final destination
       via ``os.replace`` — atomic per file.
     * If anything fails before ``commit()``, the staging directory
@@ -60,7 +66,7 @@ Why the tests do *not* use ``StagingArea()`` directly
 -----------------------------------------------------
 ``for_root`` is the only public constructor. Direct instantiation
 would skip the ``mkdtemp`` call that anchors the staging directory
-inside the destination root (same filesystem, for atomic
+next to the destination root (same filesystem, for atomic
 ``os.replace``), which is the whole point of the design. The tests
 exercise ``for_root`` exclusively — if a future refactor added a
 direct constructor, the tests would need a new class for it, and
@@ -80,8 +86,11 @@ A few tests depend on filesystem behaviour that is not portable:
 * **Cross-filesystem staging** — the design *requires* the staging
   directory to be on the same filesystem as the destination root.
   The tests exercise the same-filesystem case (which is what
-  ``for_root`` guarantees). Testing cross-filesystem would require
-  mounting a separate filesystem, which is not portable in CI.
+  ``for_root`` guarantees) by comparing ``st_dev`` — the property
+  the guarantee depends on — rather than a same-subtree property
+  the current design does not (and must not) provide. Testing
+  cross-filesystem would require mounting a separate filesystem,
+  which is not portable in CI.
 
 Both are documented as non-goals in the module docstring; the tests
 here exercise the behaviour the design *does* guarantee.
@@ -104,6 +113,7 @@ What this file does *not* cover
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -481,12 +491,22 @@ class TestCleanup:
 
     @pytest.mark.unit()
     def test_staging_dir_removed_after_commit(self, tmp_path: Path) -> None:
-        """After ``commit`` and exit, no ``.forge-stage-*`` directories remain."""
+        """After ``commit`` and exit, no ``.forge-stage-*`` directories remain.
+
+        The glob is scoped to ``tmp_path.parent`` because the staging
+        directory is a *sibling* of the destination root, not a child
+        of it. A test that only globbed inside ``tmp_path`` would pass
+        for a bug that failed to clean up the staging tree entirely —
+        the tree would be in ``tmp_path.parent``, invisible to a glob
+        scoped to the destination. That would be exactly the kind of
+        half-checked test the codebase's design principles warn
+        against.
+        """
         with StagingArea.for_root(tmp_path) as stage:
             stage.write_text("file.txt", "x")
             stage.commit()
 
-        staging_dirs = list(tmp_path.glob(".forge-stage-*"))
+        staging_dirs = list(tmp_path.parent.glob(".forge-stage-*"))
         assert staging_dirs == []
 
     @pytest.mark.unit()
@@ -499,6 +519,11 @@ class TestCleanup:
         exited in reverse on the raise: ``pytest.raises`` swallows the
         exception, then ``StagingArea.__exit__`` runs cleanup. The
         final assertion confirms the staging directory is gone.
+
+        As with ``test_staging_dir_removed_after_commit``, the glob
+        is scoped to ``tmp_path.parent`` (the destination root's
+        parent) because the staging directory is a sibling of the
+        destination, not a child of it.
         """
         with (
             StagingArea.for_root(tmp_path) as stage,
@@ -506,7 +531,7 @@ class TestCleanup:
         ):
             _stage_one_and_raise(stage)
 
-        staging_dirs = list(tmp_path.glob(".forge-stage-*"))
+        staging_dirs = list(tmp_path.parent.glob(".forge-stage-*"))
         assert staging_dirs == []
 
     @pytest.mark.unit()
@@ -528,27 +553,37 @@ class TestCleanup:
 
         # No destination files, no staging directory.
         assert list(tmp_path.glob("*.txt")) == []
-        assert list(tmp_path.glob(".forge-stage-*")) == []
+        assert list(tmp_path.parent.glob(".forge-stage-*")) == []
 
     @pytest.mark.unit()
     def test_staging_dir_is_hidden(self, tmp_path: Path) -> None:
         """The staging directory's name starts with ``.`` (hidden in ``ls``).
 
-        A user running ``ls`` in a directory where a ``forge create``
-        is *currently* running (a rare but possible race) should not
-        see a ``forge-stage-`` directory that looks like part of the
-        project. The leading dot keeps it out of plain ``ls`` (and
-        thus out of the user's view during the brief window when it
-        exists).
+        A user running ``ls -a`` in the destination's *parent*
+        directory — the directory that contains both the destination
+        and the staging sibling — would see the staging directory's
+        name. The leading dot keeps it out of plain ``ls`` (and thus
+        out of the user's casual view). In *plain* ``ls`` of the
+        destination itself, the staging directory does not appear at
+        all, because it is not inside the destination.
+
+        The test inspects the *name* of the staging directory, not its
+        visibility relative to any particular directory. That is the
+        property the leading dot exists to provide, and it holds
+        regardless of where the staging directory lives.
 
         The ``stage`` binding from ``StagingArea.for_root(...)`` is
         assigned to a throwaway because the test only inspects the
-        filesystem (via ``glob``) — it does not call any method on
-        the staging area itself. Using ``_stage`` (leading underscore)
-        documents "deliberately unused" and silences ``F841``.
+        filesystem (via ``glob`` on the parent) — it does not call
+        any method on the staging area itself. Using ``_stage``
+        (leading underscore) documents "deliberately unused" and
+        silences ``F841``.
         """
         with StagingArea.for_root(tmp_path) as _stage:
-            staging_dirs = list(tmp_path.glob(".forge-stage-*"))
+            # Staging is a sibling of the destination root, so it
+            # appears in the destination's *parent* directory, not
+            # in the destination itself.
+            staging_dirs = list(tmp_path.parent.glob(".forge-stage-*"))
             assert len(staging_dirs) == 1
             # And it is hidden (leading dot).
             assert staging_dirs[0].name.startswith(".")
@@ -643,29 +678,56 @@ class TestMultipleWrites:
 
 
 # =============================================================================
-# Group 6: staging root placement — same filesystem, hidden
+# Group 6: staging root placement — same filesystem, hidden sibling
 # =============================================================================
 class TestStagingRootPlacement:
-    """The staging directory is anchored inside the destination root.
+    """The staging directory is anchored next to the destination root.
 
     Two properties matter:
 
         * **Same filesystem** — ``os.replace`` is atomic only within
-          a filesystem. Staging inside the destination root guarantees
-          the atomicity (both are on the same device).
-        * **Hidden** — the leading dot keeps the staging directory out
-          of the user's view during the brief window it exists.
+          a filesystem. Staging in the destination's *parent* is
+          guaranteed to be on the same filesystem as the destination
+          (creating a directory in a parent does not cross a
+          filesystem boundary), so commit is still atomic. The test
+          for this asserts the *property the guarantee depends on*
+          (``st_dev`` equality), not the placement strategy (which
+          could change in a future refactor without breaking the
+          guarantee).
+        * **Sibling, not child** — the staging directory is a
+          sibling of the destination root, not inside it. This
+          matters for two reasons: (1) a failed run does not leave
+          an empty destination behind, because the destination is
+          never created just to hold the staging tree; (2) a user
+          browsing the destination during a run sees no staging
+          artifacts, because the staging tree is outside their view.
 
-    The tests here pin the *observable* property — the staging
-    directory's parent is the destination root — not the
-    implementation (which uses ``mkdtemp(dir=root)``). A future
-    change to a different placement mechanism would still pass, as
-    long as the placement property held.
+    The tests here pin both properties as *observable* facts.
     """
 
     @pytest.mark.unit()
-    def test_staging_dir_inside_destination_root(self, tmp_path: Path) -> None:
-        """The staging directory's parent is the destination root.
+    def test_staging_dir_is_sibling_of_destination_root(self, tmp_path: Path) -> None:
+        """The staging directory lives in the destination's *parent*.
+
+        This is the load-bearing placement guarantee. The earlier
+        design staged *inside* the destination; that worked for
+        atomicity but forced the destination to be created before
+        staging could begin, which leaked an empty directory on any
+        failed run. The current design stages in the parent, which
+        has two consequences the test pins:
+
+            * The staging directory is a *sibling* of the
+              destination (its parent is ``tmp_path.parent``).
+            * It is *not* inside the destination (a glob on
+              ``tmp_path`` would find nothing staging-related).
+
+        Asserting both — the sibling fact and the not-a-child fact —
+        is what distinguishes "staged in the right place" from
+        "happened to be next to the right place". A child of
+        ``tmp_path`` would satisfy neither, but the two assertions
+        also rule out a deeper placement (a great-grandchild of
+        ``tmp_path.parent``) that neither assertion alone would
+        catch.
 
         The ``stage`` binding is assigned to a throwaway because the
         test only inspects the *placement* of the staging directory
@@ -674,27 +736,105 @@ class TestStagingRootPlacement:
         and silences ``F841``.
         """
         with StagingArea.for_root(tmp_path) as _stage:
-            staging_dirs = list(tmp_path.glob(".forge-stage-*"))
-            assert len(staging_dirs) == 1
-            assert staging_dirs[0].parent == tmp_path
+            staging_dirs = list(tmp_path.parent.glob(".forge-stage-*"))
+            assert len(staging_dirs) == 1, (
+                f"expected one staging directory in {tmp_path.parent}, "
+                f"found {[p.name for p in staging_dirs]!r}"
+            )
+            # Property (1): sibling.
+            assert staging_dirs[0].parent == tmp_path.parent
+            # Property (2): not a child. This catches a regression
+            # that put the staging directory *inside* the destination
+            # — the exact bug the current design exists to prevent.
+            assert not staging_dirs[0].is_relative_to(tmp_path)
 
     @pytest.mark.unit()
     def test_staging_dir_created_if_root_missing(self, tmp_path: Path) -> None:
-        """A destination root that does not exist is created first.
+        """A destination root that does not exist is created on commit.
 
-        ``for_root`` calls ``root.mkdir(parents=True, exist_ok=True)``
-        before creating the staging directory. Without this, a caller
-        whose destination is a not-yet-created directory (a common
-        case for ``forge create --output /path/that/does/not/exist``)
-        would get a ``FileNotFoundException`` from ``mkdtemp``. The test
-        pins that the creation happens.
+        The earlier design called ``root.mkdir(parents=True,
+        exist_ok=True)`` at ``for_root`` time, which is why a
+        "destination root does not exist" test would have asserted
+        the root's existence *while the staging area was open*.
+        The current design defers the destination's creation to
+        commit — the first ``os.replace`` calls ``target.parent.
+        mkdir(parents=True, exist_ok=True)``, which creates the
+        destination as a side effect of the first file landing in
+        it. This test verifies the end-to-end result: a call to
+        ``for_root`` with a not-yet-created destination root, followed
+        by a commit, leaves the destination root created with the
+        committed file in it.
+
+        The intermediate state (root does not exist while staging is
+        open) is what the sibling-placement test's *other* half
+        verifies — that the staging tree does not create the
+        destination root before commit. The two tests together pin
+        the complete "creation is deferred to commit" contract.
         """
         new_root = tmp_path / "new-project-dir"
         assert not new_root.exists()
 
         with StagingArea.for_root(new_root) as stage:
+            # While staging is open, the destination root does not
+            # yet exist — the staging area does not create it, and
+            # the caller has not committed.
+            assert not new_root.exists(), (
+                "the destination root was created by staging; creation "
+                "must be deferred to commit so a failed run does not "
+                "leave an empty directory behind"
+            )
             stage.write_text("file.txt", "x")
             stage.commit()
 
         assert new_root.exists()
         assert (new_root / "file.txt").read_text() == "x"
+
+    @pytest.mark.unit()
+    def test_staging_dir_is_on_same_filesystem_as_destination(self, tmp_path: Path) -> None:
+        """The staging directory and the destination are on the same device.
+
+        This is the *actual* guarantee that makes ``os.replace``
+        atomic at commit time. The earlier test —
+        ``test_staging_dir_inside_destination_root`` — asserted a
+        stronger-looking property (staging is inside the destination)
+        that implied same-filesystem but was not equivalent to it:
+        the stronger property forced an empty directory to be created
+        on failure, which was the bug. The current design gives up the
+        stronger property while preserving the weaker one that matters.
+
+        The test compares ``os.stat().st_dev`` for the two paths.
+        Two paths are on the same filesystem if and only if their
+        ``st_dev`` values are equal — this is exactly the check
+        ``os.replace`` makes internally. Asserting on it here is the
+        direct expression of the atomicity guarantee, and it survives
+        a future placement refactor as long as the guarantee holds.
+
+        The staging directory is captured *while the staging area is
+        open*, because that is the only moment it exists; the test
+        then compares its device to the destination root's device
+        (which is not affected by the staging tree's presence or
+        absence).
+        """
+        with StagingArea.for_root(tmp_path) as _stage:
+            staging_dirs = list(tmp_path.parent.glob(".forge-stage-*"))
+            assert len(staging_dirs) == 1, (
+                f"expected one staging directory in {tmp_path.parent}, "
+                f"found {[p.name for p in staging_dirs]!r}"
+            )
+            staging_dir = staging_dirs[0]
+
+            # ``tmp_path.parent`` is created by pytest and always
+            # exists; the destination root (``tmp_path``) exists
+            # because pytest created it. Comparing ``st_dev`` on
+            # both is the direct expression of "same filesystem".
+            staging_dev = os.stat(staging_dir).st_dev
+            destination_dev = os.stat(tmp_path).st_dev
+
+            assert staging_dev == destination_dev, (
+                f"staging directory {staging_dir} (device {staging_dev}) "
+                f"is on a different filesystem from destination root "
+                f"{tmp_path} (device {destination_dev}) — cross-filesystem "
+                f"staging breaks atomic commit (see "
+                f"forge.safety.staging's 'Where the staging directory "
+                f"lives' section)"
+            )

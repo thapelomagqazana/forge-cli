@@ -41,6 +41,21 @@ compatibility:
 # Variables — presented in this order by the interactive wizard.
 # Ids are lower_snake_case (schema-enforced) because they are used
 # verbatim in templates as `{{variable_id}}`.
+#
+# The variable `project_name` is supplied by the CLI itself (it is the
+# `--name` argument folded into the template context — see
+# cli/commands/create.py's `_resolve_inputs`), so it is *not* declared
+# here. Declaring it would make the resolver try to resolve it against
+# `--var`, which is not how the CLI supplies it, and the result would be
+# a confusing "you must also pass --var project_name=..." prompt. The
+# CLI's contract is that `project_name` is always available.
+#
+# The *derived* value `project_module` — the Python identifier derived
+# from `project_name` — is also not declared. It is computed inline via
+# the `replace('-', '_')` filter wherever a Python module path is needed
+# (destinations, verification `path:`, verification `command:`). The
+# filter is in the renderer's allowlist (docs/reference/TEMPLATE_FILTERS.md)
+# precisely for this case.
 # ---------------------------------------------------------------------------
 variables:
   - id: author
@@ -71,8 +86,26 @@ variables:
     default: true
 
 # ---------------------------------------------------------------------------
-# Files — always applied. Destinations may interpolate `{{project}}` and
-# any variable id. Templates live next to this manifest under templates/.
+# Files — always applied.
+#
+# Contract (see docs/reference/PLANNING.md):
+#   * `source:` is a *literal* path resolved against the blueprint
+#     directory. It is not templated; the loader verifies its existence
+#     before planning succeeds (loading/fs_checks.py). A template that
+#     will be rendered must end in `.j2` (or `.jinja`/`.jinja2`) and live
+#     at a static path; a template that is copied verbatim must have no
+#     suffix and must not contain `{{…}}`.
+#   * `destination:` *is* templated. Every segment that ends up as a
+#     Python package name must be a valid Python identifier, so
+#     `project_name` is transformed with `replace('-', '_')` wherever
+#     the destination is a module path.
+#
+# The template's `source:` directory is `templates/src/project/` — a
+# static `project` segment, not `{{project_name}}/` — because `source:`
+# is not templated. The `.j2` suffix on each file marks it as render-kind
+# (its body contains `{{…}}` and must be rendered); the absence of the
+# suffix on `.gitignore` marks it as copy-kind (its body must not contain
+# `{{…}}` and must be preserved byte-for-byte).
 # ---------------------------------------------------------------------------
 files:
   - source: templates/pyproject.toml.j2
@@ -81,15 +114,15 @@ files:
     destination: README.md
   - source: templates/.gitignore
     destination: .gitignore
-  - source: templates/src/{{project}}/__init__.py
-    destination: src/{{project}}/__init__.py
-  - source: templates/src/{{project}}/main.py.j2
-    destination: src/{{project}}/main.py
-  - source: templates/src/{{project}}/settings.py.j2
-    destination: src/{{project}}/settings.py
+  - source: templates/src/project/__init__.py
+    destination: src/{{project_name | replace('-', '_')}}/__init__.py
+  - source: templates/src/project/main.py.j2
+    destination: src/{{project_name | replace('-', '_')}}/main.py
+  - source: templates/src/project/settings.py.j2
+    destination: src/{{project_name | replace('-', '_')}}/settings.py
   - source: templates/tests/test_health.py.j2
     destination: tests/test_health.py
-  - source: templates/tests/conftest.py
+  - source: templates/tests/conftest.py.j2
     destination: tests/conftest.py
 
 # ---------------------------------------------------------------------------
@@ -111,6 +144,21 @@ conditional_files:
 # Verification contract — every generated project must satisfy these
 # before `forge create` reports success. Checks run in order; the first
 # failure short-circuits and surfaces the offending id.
+#
+# Unlike ``files[].source``, verification ``path`` and ``command`` *are*
+# templated (they run in the generated project's context, not against the
+# blueprint directory), so ``{{project_name | replace('-', '_')}}`` is
+# used here for the Python-module contexts.
+#
+# Why `replace('-', '_')` and not bare `{{project_name}}`:
+#   `forge create python.fastapi.api --name payments-api` produces a
+#   package at `src/payments_api/`. A verification check that said
+#   `python -c "import payments-api"` would fail on a *correctly generated*
+#   project — because Python cannot import a module whose name contains a
+#   hyphen. That failure mode would be attributed to the generated project
+#   rather than the check, which is the opposite of the verification
+#   phase's purpose. The filter makes the check describe what the project
+#   actually is: a package at `payments_api`.
 # ---------------------------------------------------------------------------
 verification:
   # Cheap structural check first: fail fast if scaffolding dropped a file.
@@ -120,14 +168,14 @@ verification:
 
   - id: has_package
     type: required_file
-    path: src/{{project}}/main.py
+    path: src/{{project_name | replace('-', '_')}}/main.py
 
   # Behavioural check: the generated service must actually import and its
   # test suite must pass. Timeout is generous because cold caches on CI
   # can be slow the first time.
   - id: imports_cleanly
     type: command
-    command: python -c "import {{project}}"
+    command: python -c "import {{project_name | replace('-', '_')}}"
     timeout: 120
 
   - id: tests_pass

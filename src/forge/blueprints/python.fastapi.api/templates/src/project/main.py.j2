@@ -1,0 +1,35 @@
+"""HTTP entry point for {{ project_name }}."""
+
+from __future__ import annotations
+
+from fastapi import FastAPI
+
+from .settings import get_settings
+
+app = FastAPI(
+    title="{{ project_name }}",
+    version="0.1.0",
+)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Liveness probe.
+
+    Kept dependency-free (no database, no cache) so the endpoint stays
+    cheap for orchestrators to call at high frequency.
+    """
+    return {"status": "ok", "version": app.version}
+
+
+@app.get("/config")
+def config() -> dict[str, str]:
+    """Non-sensitive configuration, for debugging.
+
+    Exposes only fields that are safe to reveal. If a settings field is
+    added that should *not* be world-readable, do not add it to the
+    payload — this endpoint is a debugging aid, not a general settings
+    dump.
+    """
+    settings = get_settings()
+    return {"environment": settings.environment}

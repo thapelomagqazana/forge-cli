@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------------------
+# Fixture templates and binaries are byte-content, not source.
+#
+# Git's text normalisation (core.autocrlf, text=auto, eol=) can silently
+# convert CRLF↔LF or strip a final newline on checkout. The staging tests
+# assert byte-identity against the fixture, so *any* normalisation breaks
+# them in a way that depends on the developer's git configuration — the
+# worst kind of failure: it works on your machine and fails in CI.
+#
+# -text disables all text normalisation for these paths.
+# -diff disables line-oriented diff (a binary diff is correct for a
+# template whose bytes are the contract; a line diff is misleading).
+# ---------------------------------------------------------------------------
+tests/fixtures/**/*.j2  -text -diff
+tests/fixtures/**/*.png -text -diff

@@ -1,0 +1,23 @@
+schema_version: "1.0.0"
+id: sample.staging.missingvar
+name: Staging Failure Demo
+version: 1.0.0
+description: References a variable the blueprint does not declare — render must fail.
+category: api
+variables:
+  - id: project_name
+    type: string
+    description: Project name used in templates.
+    required: true
+    default: demo
+files:
+  - source: templates/main.py.j2
+    destination: "src/{{ project_name }}/main.py"
+  - source: templates/undefined-ref.j2
+    destination: broken.py
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+compatibility:
+  min_forge_version: 1.0.0

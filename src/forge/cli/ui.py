@@ -8,13 +8,15 @@ helpers are deliberately few and simple:
 - ``print_error`` — red, error prefix, stderr.
 - ``print_error_indented`` — detail line under an error header,
   bullet prefix, stderr. Used by the exception handler to render
-  structured findings (safety, planning, conditions) beneath the
-  single-line header that names their cause.
+  structured findings (safety, planning, conditions, rendering)
+  beneath the single-line header that names their cause.
 - ``print_info`` — plain text, stdout.
 - ``print_section`` — bold header, stdout. Used by interactive
   wizards to delimit steps, and by any command that groups output.
 - ``print_hint`` — dim remediation line, stderr.
 - ``print_cancelled`` — dim acknowledgement line, stderr.
+- ``print_progress`` — in-place progress line, stderr. Used by the
+  staging engine's progress sink; renders ``[N/M] render path``.
 - ``emit`` — raw passthrough for pre-rendered payloads (JSON, tables).
 
 The distinction between stdout and stderr is not cosmetic. It is the
@@ -42,6 +44,20 @@ different prefixes (``⚠`` vs. ``✗``) so a user scanning output — or a
 script that greps for ``✗`` — can distinguish "the command told me
 something" from "the command failed."
 
+Progress vs. info vs. section
+-----------------------------
+Progress is *commentary*, not product. It goes to stderr with the same
+reasoning as warnings: a script that pipes ``forge create --json`` to
+``jq`` must not receive "rendering 5/20…" lines mixed into its JSON.
+Info is product (a value the user asked for) and goes to stdout. A
+section header is structural product (a step title in a wizard) and
+also goes to stdout.
+
+The staging engine produces typed ``ProgressEvent`` values; this
+module renders them. The engine never prints, so the engine is
+testable without capturing streams, and the CLI is the *only* place
+where progress presentation is decided. See ADR-0019.
+
 Why a single module?
 --------------------
 If every command calls ``typer.echo`` or ``print`` directly, the CLI's
@@ -53,8 +69,9 @@ voice.
 
 Design principles
 -----------------
-1. **Two streams, one rule.** Success and info go to stdout; warnings
-   and errors go to stderr. This is the Unix contract. Do not break it.
+1. **Two streams, one rule.** Success and info go to stdout; warnings,
+   errors, and progress go to stderr. This is the Unix contract. Do
+   not break it.
 2. **Colour is a courtesy, not a requirement.** Every message must be
    readable in plain text (with the prefixes as the signal). Colour is
    additive. ``NO_COLOR`` and ``FORCE_COLOR`` are honoured.
@@ -87,15 +104,22 @@ Design principles
    (prefix/suffix), not by injecting escape codes into the payload
    itself — otherwise the renderer's contract is broken by the
    caller, which is exactly the drift principle 5 exists to prevent.
+8. **Progress is a sink, not a print.** The staging engine emits
+   typed ``ProgressEvent`` values through a ``ProgressSink`` protocol
+   (see ``forge.staging.progress``). ``print_progress`` is a
+   ``ProgressSink`` implementation; the CLI passes it to the engine,
+   and the engine emits. This makes the engine's behaviour identical
+   in tests (list sink), in CI (no-op sink), and in interactive use
+   (this sink) — the only difference is which sink is passed.
 
 Why ``print_error_indented`` is a first-class helper
 ----------------------------------------------------
 Errors with structured findings (safety refusals, collisions, planning
-errors, condition errors) render as a *header* plus zero or more
-*detail lines*. The header names the cause; each detail names one
-concrete violation. Rendering both with ``print_error`` would give
-every detail its own ``✗`` prefix, and the report would read as six
-independent failures rather than one failure with six symptoms.
+errors, condition errors, rendering errors) render as a *header* plus
+zero or more *detail lines*. The header names the cause; each detail
+names one concrete violation. Rendering both with ``print_error`` would
+give every detail its own ``✗`` prefix, and the report would read as
+six independent failures rather than one failure with six symptoms.
 
 The helper's job is to make that distinction visible:
 
@@ -124,13 +148,13 @@ Three things are load-bearing about the indented form:
 Why the caller's message is *not* prefixed by the helper:
 
     Different callers use different detail prefixes. The exception
-    handler uses ``  • [code] path: message``; a future dry-run
-    renderer might use ``    [render] dest ← src`` for its detail
-    lines. If the helper prepended its own ``•``, the dry-run
-    renderer would need a special "don't prefix" variant — exactly
+    handler uses ``  • [code] path: message``; the staging progress
+    sink uses ``  [render] path``; a future dry-run renderer might
+    use ``    [render] dest ← src``. If the helper prepended its own
+    ``•``, every caller would need a "don't prefix" variant — exactly
     the drift principle 5 prohibits. Keeping the helper a pure
-    stream-selector-plus-nothing lets every caller produce the
-    detail format it needs.
+    stream-selector-plus-nothing lets every caller produce the detail
+    format it needs.
 
 Why ``print_section`` is a first-class helper
 ----------------------------------------------
@@ -148,6 +172,33 @@ The alternative — having the wizard call ``print_info`` with a
 caller, which is how drift starts: two wizards render headers two
 ways, and the third wizard copies the wrong one. The helper exists so
 the *look* of a section is decided once, here.
+
+Why ``print_progress`` is a first-class helper
+----------------------------------------------
+Staging can take noticeable time (rendering dozens of templates,
+copying assets). Silence for ten seconds reads as a hang. Progress
+lines acknowledge the work and, on failure, give the user the last
+file the engine touched — the first hint about *which* template broke.
+
+But progress must not pollute stdout: it is commentary, not product.
+Putting it on stdout would corrupt JSON output and break pipelines.
+The helper therefore:
+
+* writes to stderr (matching the warning/error convention),
+* is dim and prefixed with ``  [stage]`` so it reads as subordinate
+  to whatever product is being built,
+* never emits a trailing newline for in-place file events (so a
+  terminal sees one line that updates), and always emits a trailing
+  newline for lifecycle events (``start``, ``finish``) so log files
+  see discrete lines. The distinction between "the terminal wants
+  overwrite" and "the log wants lines" is the kind of thing that a
+  raw ``print`` inside the engine cannot express; a helper can.
+
+The helper is a ``ProgressSink`` — it implements the same protocol
+that the engine consumes. That means the CLI passes it directly to
+``StagingEngine.stage(progress=...)``, tests pass a ``ListSink``,
+and CI can pass ``null_sink``. The engine's code is identical; only
+the sink differs. See ADR-0019.
 
 Why ``emit`` is separate from ``print_info``
 --------------------------------------------
@@ -175,6 +226,8 @@ import os
 import sys
 
 from rich.console import Console
+
+from forge.staging.progress import ProgressEvent
 
 # -----------------------------------------------------------------------------
 # The consoles
@@ -281,9 +334,9 @@ def print_error_indented(message: str) -> None:
     """Print a detail line under an error header, on stderr.
 
     Structured error reports — safety refusals, collisions, planning
-    errors, condition errors — have a header (rendered by
-    ``print_error``) plus zero or more detail lines, one per finding.
-    This helper renders those details.
+    errors, condition errors, rendering errors — have a header
+    (rendered by ``print_error``) plus zero or more detail lines, one
+    per finding. This helper renders those details.
 
     The message is emitted **verbatim** (aside from a small dim
     colour), so the caller owns the full detail format — including
@@ -304,7 +357,8 @@ def print_error_indented(message: str) -> None:
 
     Why no bullet prefix from the helper itself:
         Different callers use different detail formats. The exception
-        handler uses ``  • [code] path: message``; a future dry-run
+        handler uses ``  • [code] path: message``; the staging
+        progress sink uses ``  [render] path``; a future dry-run
         renderer might use ``    [render] dest ← src``. If the helper
         prepended its own ``•``, callers who want a bullet would get
         ``• •`` and callers who want a different prefix would need a
@@ -412,6 +466,101 @@ def print_hint(message: str) -> None:
         typer_echo_safe(f"Hint: {message}", err=True)
 
 
+def print_progress(event: ProgressEvent) -> None:
+    """Render a staging progress event on stderr.
+
+    This function is a ``ProgressSink`` — the staging engine calls it
+    once per file (plus once at start and once at finish), and the
+    presentation lives entirely here. The engine never prints. See
+    ADR-0019.
+
+    Rendering rules
+    ---------------
+    Per-file events (``stage`` of ``"render"`` or ``"copy"``):
+        Rendered as ``  [N/M] <stage> <path>``, dim, on stderr, with a
+        carriage return (``\\r``) prefix *when stderr is a TTY*, so a
+        terminal updates one line in place rather than scrolling. When
+        stderr is not a TTY (a log file, a CI capture), the line ends
+        with a newline so log readers see discrete events. The
+        TTY-vs-log distinction is the one thing a raw ``print`` inside
+        the engine cannot make; the sink can, because it is the piece
+        that knows about the destination.
+
+    Lifecycle events (``stage`` of ``"start"`` or ``"finish"``):
+        Rendered as a single line on stderr with a trailing newline,
+        always. Start is silent in the common case (a user who invoked
+        create already knows what they invoked); finish prints a
+        summary (``staged N file(s) in T ms``) so a successful
+        completion is visible without the caller having to look at a
+        subsequent success line. An empty plan (``total == 0``) still
+        prints the finish line, so "nothing to do" is not silent.
+
+    Why dim, not coloured:
+        Progress is subordinate to product. Dim text establishes the
+        hierarchy on any terminal, and it remains readable in monochrome
+        logs where colour is stripped. The two obvious alternatives are
+        worse: colour (stripped in logs, becomes invisibly noisy on
+        terminals that do not support it) and bold (competes with the
+        success line that is the actual product).
+
+    Why this is a module-level function, not a class:
+        The ``ProgressSink`` protocol accepts any callable. A
+        module-level function is the simplest thing that satisfies it,
+        is trivially passed as ``progress=print_progress``, and cannot
+        hold state that would make it behave differently on the second
+        call. The engine owns per-call state; the sink owns nothing.
+
+    Why the leading two spaces:
+        The indented form matches ``print_error_indented``'s framing,
+        so a report that mixes progress lines with error findings reads
+        as one coherent output. Consistency across sinks is what makes
+        the CLI's voice predictable — the module's whole reason for
+        existing.
+
+    Args:
+        event: The progress event from the engine. Fields used:
+            ``stage``, ``index``, ``total``, ``path``, ``elapsed_ms``.
+            Other fields are ignored so a future engine that adds
+            fields does not require a matching change here.
+    """
+    if event.stage in {"render", "copy"}:
+        line = f"  [{event.index}/{event.total}] {event.stage} {event.path}"
+        # A TTY gets in-place updates; a pipe/log gets discrete lines.
+        # The check is on stderr because that is where the sink writes.
+        if sys.stderr.isatty():
+            try:
+                _stderr_console.print(f"\r[dim]{line}[/dim]", end="")
+            except (BrokenPipeError, OSError):
+                typer_echo_safe(line, err=True)
+        else:
+            try:
+                _stderr_console.print(f"[dim]{line}[/dim]")
+            except (BrokenPipeError, OSError):
+                typer_echo_safe(line, err=True)
+        return
+
+    if event.stage == "finish":
+        # A newline before the summary so a terminal that was showing
+        # an in-place file line does not have its last line overwritten
+        # by the summary.
+        summary = (
+            f"staged {event.total} file(s) in " f"{event.elapsed_ms:.0f} ms"
+            if event.total > 0
+            else "nothing to stage"
+        )
+        try:
+            _stderr_console.print(f"\n[dim]{summary}[/dim]")
+        except (BrokenPipeError, OSError):
+            typer_echo_safe(summary, err=True)
+        return
+
+    # ``start`` is deliberately silent: the user invoked a command; the
+    # command starting is not information they do not already have.
+    # A future ``--verbose`` mode can print it; the sink does not
+    # presume.
+    return
+
+
 # -----------------------------------------------------------------------------
 # Raw passthrough (machine payloads)
 # -----------------------------------------------------------------------------
@@ -487,6 +636,7 @@ error = print_error
 error_indented = print_error_indented
 hint = print_hint
 cancelled = print_cancelled
+progress = print_progress
 
 
 # -----------------------------------------------------------------------------
@@ -529,9 +679,11 @@ __all__ = [
     "print_error_indented",
     "print_hint",
     "print_info",
+    "print_progress",
     "print_section",
     "print_success",
     "print_warning",
+    "progress",
     "section",
     "success",
     "typer_echo_safe",

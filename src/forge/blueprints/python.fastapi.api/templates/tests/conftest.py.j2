@@ -1,0 +1,20 @@
+"""Shared pytest fixtures for {{ project_name }}."""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture()
+def client():
+    """Return a ``TestClient`` bound to a fresh app instance.
+
+    Import is inside the fixture so an import error in the service's
+    module surfaces as a test failure on the *first* test that uses the
+    client, not at collection time. Collection-time errors are harder
+    to attribute when several test modules exist.
+    """
+    from {{ project_name | replace('-', '_') }}.main import app
+
+    return TestClient(app)

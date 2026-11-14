@@ -13,3 +13,27 @@ indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
+
+# ---------------------------------------------------------------------------
+# Fixture templates and binaries are *content*, not source.
+#
+# The staging tests assert on the exact bytes the renderer produces, and
+# the renderer preserves trailing newlines (keep_trailing_newline=True).
+# An editor applying the global trim_trailing_whitespace rule to a .j2
+# file would strip the final newline on save and silently change every
+# rendered output — a failure that surfaces several layers downstream as
+# a confusing string diff.
+#
+# trim_trailing_whitespace is set to false because a template may
+# intentionally render trailing whitespace (Markdown hard breaks, YAML
+# block scalars), and fixtures must be byte-preserved, not reformatted.
+# ---------------------------------------------------------------------------
+[tests/fixtures/**/*.j2]
+insert_final_newline = true
+end_of_line = lf
+trim_trailing_whitespace = false
+
+[tests/fixtures/**/*.png]
+insert_final_newline = false
+trim_trailing_whitespace = false
+end_of_line = unset

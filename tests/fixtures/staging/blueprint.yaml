@@ -1,0 +1,25 @@
+schema_version: "1.0.0"
+id: sample.staging
+name: Staging Demo
+version: 1.0.0
+description: Exercises render-kind and copy-kind files with a nested directory structure.
+category: api
+variables:
+  - id: project_name
+    type: string
+    description: Project name used in templates.
+    required: true
+    default: demo
+files:
+  - source: templates/main.py.j2
+    destination: "src/{{ project_name }}/main.py"
+  - source: templates/pyproject.toml.j2
+    destination: pyproject.toml
+  - source: templates/assets/logo.png
+    destination: "src/{{ project_name }}/assets/logo.png"
+verification:
+  - id: has_pyproject
+    type: required_file
+    path: pyproject.toml
+compatibility:
+  min_forge_version: 1.0.0

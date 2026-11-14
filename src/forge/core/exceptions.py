@@ -46,6 +46,16 @@ requires a major version bump.
 |       |                       | contains collisions. The plan was         |
 |       |                       | emitted; **nothing was written.**         |
 +-------+-----------------------+-------------------------------------------+
+| 8     | RENDERING_ERROR       | A template failed to render **and the     |
+|       |                       | engine had already aborted staging**.     |
+|       |                       | Distinct from 5 because the failure is    |
+|       |                       | attributable to a specific template, not  |
+|       |                       | to the tool; distinct from 2 because the  |
+|       |                       | blueprint itself validated — only a       |
+|       |                       | template body failed. The staging tree    |
+|       |                       | was destroyed; the destination is         |
+|       |                       | untouched. See ADR-0019.                  |
++-------+-----------------------+-------------------------------------------+
 
 Note on 6 vs 7
 --------------
@@ -83,7 +93,7 @@ Why these specific codes?
 The codes are chosen so that the **first digit** encodes the severity:
 
 - ``0`` — success.
-- ``1`` to ``3``, ``6``, ``7`` — the user can fix this without help.
+- ``1`` to ``3``, ``6``, ``7``, ``8`` — the user can fix this without help.
 - ``4`` — the project was generated but is not verified.
 - ``5`` — the tool is broken. Report it.
 
@@ -106,6 +116,24 @@ into 6, so that:
       filesystem, two different automation patterns.
     * A gating script can say ``if exit == 7: parse plan.json and
       decide`` without mistaking the case for a failed create.
+
+``RENDERING_ERROR`` (8) is a distinct value rather than folding into
+5 (internal) or 2 (blueprint) because:
+
+    * The blueprint itself passed validation (schema + model +
+      path planning). Only a *template body* failed to render —
+      typically because a variable the template references was not
+      provided, or because the template has a syntax error that
+      only manifests on this input. That is a template or a
+      template-inputs problem, not a bug in the tool and not a
+      malformed blueprint.
+    * The staging engine guarantees no partial output (staging
+      tree destroyed, destination untouched). The user's
+      remediation is to fix the template (or re-run with the
+      missing variable) — the same remediation as a compile
+      error, not the same as "report a bug."
+    * Giving it its own code lets CI gate "retry after fixing the
+      template" separately from "this is a tool bug."
 
 Why the enum lives here, not in ``cli/``
 ----------------------------------------
@@ -133,7 +161,8 @@ Hierarchy at a glance
     ├── StructuredError                (5) [slotted dataclass; not exported]
     │   ├── SchemaValidationError      (1) [slotted dataclass]
     │   └── ModelValidationError       (5) [slotted dataclass]
-    └── TemplateRenderError            (5) [slotted dataclass]
+    ├── TemplateRenderError            (8) [slotted dataclass]
+    └── RenderingError                 (8) [slotted dataclass]
 
 Note that ``DRY_RUN_COLLISIONS`` (7) is *not* associated with any
 exception class. It is used exclusively by the ``create`` command's
@@ -157,13 +186,22 @@ Two design rules follow from this tree:
   load-bearing: it is what lets CI script "retry with --overwrite" as
   a distinct behaviour rather than a generic "fix the plan" branch.
 
+* **``RenderingError`` breaks ``StructuredError``'s exit code on
+  purpose.** A structural error in the *staging engine* (missing root,
+  unexpected file in the tree, symlink where a file was expected) is a
+  bug (5); a *rendering* failure is a template-side problem (8). The
+  two share a base class for the findings shape, but diverge on exit
+  code because the remediations are different. See the ``(8)``
+  rationale above.
+
 Mutable structured errors, not frozen dataclasses
 -------------------------------------------------
 ``MissingRequiredFlagsError``, ``PromptCancelledError``,
 ``MalformedBlueprintError``, ``StructuredError``,
 ``SchemaValidationError``, ``ModelValidationError``, ``SafetyError``,
-and ``CollisionError`` are **plain dataclasses** (``slots=True``
-only — no ``frozen=True``). This is deliberate.
+``CollisionError``, ``TemplateRenderError``, and ``RenderingError``
+are **plain dataclasses** (``slots=True`` only — no ``frozen=True``).
+This is deliberate.
 
 Python's exception machinery requires ``__traceback__`` to be a
 settable attribute: ``contextlib``, ``unittest``, and every
@@ -219,10 +257,10 @@ documents as public API.
 
 For subclasses that do not need per-instance hint overrides
 (``MalformedBlueprintError``, ``StructuredError`` and its concrete
-subclasses), ``hint`` stays a class attribute. That is correct: a
-caller who wants to override those hints is outside the current
-contract, and adding a field would widen the surface without a use
-case.
+subclasses, ``RenderingError``), ``hint`` stays a class attribute.
+That is correct: a caller who wants to override those hints is
+outside the current contract, and adding a field would widen the
+surface without a use case.
 
 Dataclass inheritance and ``__post_init__``
 -------------------------------------------
@@ -245,7 +283,7 @@ Stability
 The following are public API and will not change without a major
 version bump:
 
-- The ``ExitCode`` values (``0`` through ``7``).
+- The ``ExitCode`` values (``0`` through ``8``).
 - The ``ForgeError`` attributes (``exit_code``, ``hint``).
 - The subclass names in ``__all__``.
 - The constructor signature
@@ -264,6 +302,11 @@ version bump:
   is a tuple of ``(code, path, message, hint)`` tuples — the same
   shape that ``forge.safety.errors.Finding`` produces, so the bridge
   is a straight construction.
+- The rendering-error constructor signature
+  (``findings: tuple[tuple[str, str, str, str], ...]``). This mirrors
+  the safety-error shape, so callers that already know how to build a
+  safety error can build a rendering error the same way. The
+  ``path``-and-``hint``-carrying findings are the same four-tuple.
 
 Adding a new subclass is non-breaking. Removing or renaming one is
 breaking. Adding a new attribute to ``ForgeError`` is non-breaking
@@ -312,6 +355,13 @@ class ExitCode(IntEnum):
     # — the two states have different remediations and different
     # automation patterns. See ADR-0018.
     DRY_RUN_COLLISIONS = 7
+    # A template failed to render and the staging engine aborted
+    # cleanly. Distinguished from INTERNAL_ERROR (5) because the
+    # failure is attributable to a template body (fixable by the
+    # user) rather than the tool, and from BLUEPRINT_ERROR (2)
+    # because the blueprint itself validated — only a template body
+    # failed. See ADR-0019.
+    RENDERING_ERROR = 8
 
 
 # -----------------------------------------------------------------------------
@@ -745,29 +795,113 @@ class ModelValidationError(StructuredError):
 
 @dataclass(slots=True)
 class TemplateRenderError(StructuredError):
-    """A template failed during rendering. Exit code 5.
+    """A template failed during rendering. Exit code 8.
 
     The public rendering-side type is
     ``forge.rendering.errors.TemplateRenderError``; this subclass
     exists so the CLI handler can dispatch on ``isinstance(exc,
     ForgeError)`` without string matching.
+
+    Why 8, not 5
+    ------------
+    A template body failing to render is a *template*-side problem
+    (missing variable, syntax error that manifests only on this
+    input), not a bug in the tool. The user fixes the template (or
+    supplies the missing variable); they do not report a bug. Giving
+    this its own exit code lets CI gate "retry after fixing the
+    template" separately from "this is a tool bug." See ADR-0019.
     """
 
-    exit_code = ExitCode.INTERNAL_ERROR
+    exit_code = ExitCode.RENDERING_ERROR
     hint = (
-        "This is a Forge bug, not an input error. Report it with the "
-        "template path and the offending line; include the "
-        "`forge --version` output."
+        "Fix the template or supply the missing variable, then re-run. "
+        "The staging tree was destroyed; the destination is untouched."
     )
 
     def __str__(self) -> str:
         if not self.errors:
-            return f"Template '{self.source}' failed to render — this is a Forge bug."
-        lines = [f"Template '{self.source}' failed to render — this is a Forge bug:"]
+            return f"Template '{self.source}' failed to render."
+        lines = [f"Template '{self.source}' failed to render:"]
         for pointer, message in self.errors:
             rendered_pointer = pointer if pointer else "/"
             lines.append(f"  • {rendered_pointer}: {message}")
         return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# Rendering-phase safety bridge
+# -----------------------------------------------------------------------------
+# Mirrors the ``SafetyError`` bridge above: ``forge.staging`` produces
+# its own ``RenderingError`` (with a ``findings`` tuple of
+# ``(code, path, message, hint)`` tuples), and the CLI translates it
+# into this class so the handler can dispatch on
+# ``isinstance(exc, ForgeError)``.
+#
+# Why a distinct class from ``TemplateRenderError``
+# -------------------------------------------------
+# ``TemplateRenderError`` is a ``StructuredError`` used by the
+# *renderer* for a single-template failure. ``RenderingError`` is the
+# *staging engine's* aggregated report — one or more templates failed
+# during a stage() call, the tree was destroyed, and the user needs
+# to see every finding at once. Same finding shape as ``SafetyError``;
+# same exit code as ``TemplateRenderError`` (8). Different failure
+# source, different renderer, different remediation hint.
+@dataclass(slots=True)
+class RenderingError(ForgeError):
+    """One or more templates failed during the staging phase.
+
+    **Exit code:** ``RENDERING_ERROR`` (8).
+
+    **When raised:** ``StagingEngine.stage()`` collected at least one
+    ``Finding`` from a template render or a copy operation and aborted
+    staging. The staging tree was destroyed; the destination was not
+    touched.
+
+    **What the user should do:** Fix the failing template(s), or
+    supply the missing variable(s), then re-run. The hint names the
+    common causes.
+
+    Attributes:
+        findings: One ``(code, path, message, hint)`` tuple per
+            failure. ``path`` is the *destination-relative* path of
+            the file that could not be produced (the user reads
+            "which file was I trying to make?" first); the source
+            path appears in ``message`` (which is where the user goes
+            to fix it). Both pieces of information, one finding.
+        operation: The phase label (e.g. ``"staging"``). Same
+            convention as ``SafetyError.operation``.
+        hint: A generic remediation ("fix the template") that names
+            the common causes. Per-finding hints are still rendered
+            (see ``forge.cli.errors.print_rendering_findings``); this
+            field covers the "what do I do overall" case.
+    """
+
+    findings: tuple[tuple[str, str, str, str], ...] = ()
+    operation: str = "staging"
+    hint: str | None = field(
+        default=(
+            "One or more templates failed to render. Fix the failing "
+            "template or supply the missing variable, then re-run. "
+            "The destination was not modified."
+        )
+    )
+
+    exit_code = ExitCode.RENDERING_ERROR
+
+    def __post_init__(self) -> None:
+        """Compose the message from findings. See ``SafetyError``."""
+        if not self.findings:
+            message = f"Rendering failed during {self.operation}."
+        else:
+            header = (
+                f"Rendering failed during {self.operation} " f"({len(self.findings)} error(s)):"
+            )
+            lines = [header]
+            for code, path, message, _hint in self.findings:
+                rendered_path = path or "<staging>"
+                lines.append(f"  • [{code}] {rendered_path}: {message}")
+            message = "\n".join(lines)
+        Exception.__init__(self, message)
 
 
 # -----------------------------------------------------------------------------
@@ -778,7 +912,10 @@ class TemplateRenderError(StructuredError):
 # should catch the actionable subtype. The safety bridge exports both
 # concrete types because callers legitimately branch on
 # ``isinstance(exc, CollisionError)`` to decide whether to offer
-# ``--overwrite``.
+# ``--overwrite``. The rendering bridge exports ``RenderingError``
+# (aggregated, staging-phase) and ``TemplateRenderError``
+# (single-template, rendering-phase) because callers legitimately
+# branch on which phase produced the failure.
 __all__ = [
     "BlueprintError",
     "CollisionError",
@@ -790,6 +927,7 @@ __all__ = [
     "MissingRequiredFlagsError",
     "ModelValidationError",
     "PromptCancelledError",
+    "RenderingError",
     "SafetyError",
     "SchemaValidationError",
     "TemplateRenderError",

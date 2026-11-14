@@ -30,9 +30,10 @@ handler classifies.
        (``forge.safety.backup_existing``). Fails with exit code 3 on
        any I/O error, and rolls back partial backups so the
        filesystem is left exactly as it was at phase entry.
-    7. **Stage and commit** (``StagingArea``). Renders each planned
+    7. **Stage and commit** (``StagingEngine``). Renders each planned
        file into a staging directory, then atomically renames them
-       into place. Fails with exit code 4 on template errors.
+       into place. Fails with exit code 8 on template errors (see
+       ADR-0019).
 
 The ordering is not incidental. Phase 5 is a *pre-flight* — it
 validates the plan before any file is touched, so a plan with a
@@ -40,8 +41,33 @@ traversal attempt fails without ever opening a write handle. Phase 6
 is a *data-preservation* gate — it copies every file about to be
 replaced before any write occurs, so an interrupted phase 7 leaves
 the originals intact. Phase 7 is the *only* phase that mutates the
-destination, and it does so through ``StagingArea`` — the same
-guarantee ADR-0017 makes: *no write escapes staging*.
+destination, and it does so through ``StagingEngine`` — which itself
+writes into a hidden staging directory and only surfaces files at
+commit time. The combined guarantee (ADR-0017 + ADR-0019): *no write
+escapes staging; no partial project is ever visible in the
+destination*.
+
+Phase 7 and the destination's existence
+---------------------------------------
+A subtlety worth documenting explicitly because it is easy to
+regress: **the destination directory may not exist until the first
+file is committed into it.** The staging engine stages in
+``destination.parent`` (see ``safety/staging.py`` for why), so it does
+not need ``destination`` to exist. And it does *not* create
+``destination`` — the engine has no code path that could. That is by
+design (see the property test
+``test_destination_not_created_when_absent``): creating an empty
+destination before any file is written would leave a directory behind
+on any failed run, which is the class of mutation staging exists to
+prevent.
+
+The destination comes into existence exactly when
+``_commit_staged`` begins its first ``os.replace`` — that call does
+``mkdir -p`` on ``destination / relpath.parent``, which creates the
+destination and any intermediate directories as needed. If staging
+failed, commit never runs, and the destination was never created. If
+commit is running, the destination is *being* created as its files
+land in it, each atomically.
 
 Dry-run
 -------
@@ -146,6 +172,31 @@ code is raised via ``SystemExit`` directly, bypassing
 exception here). See ``docs/reference/DRY_RUN_PLAN.md``'s exit-code
 table for the user-facing contract.
 
+Why template errors exit 8, not 4 or 5
+--------------------------------------
+An earlier draft of this command used exit code 4 (``VERIFICATION_
+FAILED``) for template errors, on the theory that "the render failed
+before commit, so nothing was generated." That was wrong on two
+counts:
+
+1. **4 means the project was generated but did not verify.** A
+   rendering error means the project was *not* generated — nothing
+   was written. Those are opposite states.
+2. **5 means the tool is broken.** A rendering error is not the
+   tool's fault; it is a template-side problem (a missing variable,
+   a syntax error that only manifests on this input). The user fixes
+   it by editing the template or supplying the missing variable —
+   no bug report needed.
+
+``ExitCode.RENDERING_ERROR`` (8) was introduced (see ADR-0019) to
+carry exactly this distinction. The staging engine's aggregated
+``RenderingError`` maps to 8; the renderer's single-template
+``TemplateRenderError`` also maps to 8 (via the bridge in
+``forge.core.exceptions``). Both categories render identically in
+the CLI handler (findings-shaped, no ``--overwrite`` hint), so the
+user sees consistent presentation regardless of which phase failed
+first.
+
 Why no ``try`` / ``except`` around the command body
 ---------------------------------------------------
 Every exception this command raises is a ``ForgeError`` subclass
@@ -156,26 +207,6 @@ catching here would hide the exception from tests that assert on it
 directly. The command has no side effects before phase 5, so there is
 nothing to clean up on failure. The absence of a ``try`` block is
 intentional and is the correct contract.
-
-Why ``_stage_one`` has a ``# type: ignore[no-any-unimported]``
---------------------------------------------------------------
-``TemplateRenderer`` is imported from ``forge.rendering``, whose
-façade lazy-loads the concrete class from ``forge.rendering.renderer``,
-which in turn imports ``jinja2`` — a package gated behind
-``ignore_missing_imports`` in ``pyproject.toml``. Mypy can therefore
-see the *name* ``TemplateRenderer`` but cannot resolve its shape, and
-treats a parameter annotated with it as ``Any``. Strict mode's
-``[no-any-unimported]`` check flags that.
-
-The suppression is narrowly scoped to the ``def`` line and only
-covers ``[no-any-unimported]``. It does not weaken the parameter's
-*runtime* contract (``renderer`` must be a ``TemplateRenderer``;
-passing anything else fails at ``.render(...)`` with a clear
-``AttributeError``), the return type, or any other argument or
-function. If ``jinja2`` ever gains type stubs (or the project drops
-``ignore_missing_imports`` for it), the suppression becomes unused
-and mypy's ``unused-ignore`` check — on under strict mode — will
-force its removal in the same PR that lands the stubs.
 """
 
 from __future__ import annotations
@@ -196,6 +227,7 @@ from forge.core.exceptions import (
     CollisionError,
     FilesystemConflictError,
     MissingRequiredFlagsError,
+    RenderingError,
     SafetyError,
     TemplateRenderError,
     UserInputError,
@@ -204,16 +236,16 @@ from forge.dryrun import DryRunError, DryRunService, render_human, render_json
 from forge.loading.result import Err
 from forge.models import Blueprint, VariableDefinition
 from forge.planning import FileMapper, PlannedFile
-from forge.rendering import TemplateRenderer
 from forge.resolution import ResolvedValues, VariableResolver
 from forge.resolution.names import NAMED_VALIDATORS
 from forge.safety import (
-    StagingArea,
     backup_existing,
     detect_collisions,
     safe_resolve,
     validate_destination,
 )
+from forge.staging import RenderingError as StagingRenderingError
+from forge.staging import StagingEngine, StagingResult
 
 if TYPE_CHECKING:
     from forge.loading.errors import ValidationError
@@ -323,13 +355,18 @@ def create(
     - 2 — Blueprint error (not found, invalid, incompatible).
     - 3 — Filesystem safety refusal (traversal, absolute path, symlink
       escape, unwritable parent). ``--overwrite`` cannot help.
-    - 4 — Template error (a template failed to render).
+    - 4 — Verification failure (reserved; not produced by this
+      command). A project that verifies cleanly is exit 0; a project
+      that fails verification is a distinct future command's concern.
     - 5 — Internal error (unexpected exception).
     - 6 — Collision (a destination already exists and ``--overwrite``
       was not passed). Retry with ``--overwrite``, or edit the plan.
     - 7 — Dry-run found collisions. Nothing was written. Inspect the
       plan; then re-run with ``--overwrite`` if appropriate, or
       choose a different destination, or edit the blueprint.
+    - 8 — Rendering error. A template failed to render during
+      staging; nothing was written. Fix the template or supply the
+      missing variable, then re-run.
     """
     inputs = _resolve_inputs(
         blueprint_id=blueprint,
@@ -615,7 +652,9 @@ def _generate(
 
     See the module docstring for ordering rationale. Phase 5 is the
     safety gate; phase 6 is the backup gate; phase 7 is the only phase
-    that writes to the destination.
+    that writes to the destination — and it writes via
+    ``StagingEngine``, which itself never writes to the destination
+    until commit.
     """
     # Phase 4: plan (pure).
     plan_result = FileMapper().map(
@@ -652,29 +691,141 @@ def _generate(
                     ),
                 ) from exc
 
-    # Phase 7: staging and commit.
+    # Phase 7: stage via StagingEngine, then commit the staged tree
+    # into the destination.
+    #
+    # ``StagingEngine.stage()`` owns the entire render-into-staging
+    # phase: it writes every planned file into a hidden staging
+    # directory that is a *sibling* of ``inputs.destination`` (in
+    # ``inputs.destination.parent``), emits progress via
+    # ``ui.progress``, and returns either a ``StagingResult`` (a
+    # populated, renamed tree) or a ``RenderingError`` (aggregated
+    # findings; tree destroyed).
+    #
+    # The command's remaining responsibility is to *commit* the
+    # staged tree — a per-file atomic ``os.replace`` into the
+    # destination — and to destroy the ``StagingResult`` if commit
+    # fails. Splitting stage and commit into two modules (``staging``
+    # and this one) mirrors the ADR-0019 boundary: the engine produces
+    # a tree, downstream code decides what to do with it.
+    #
+    # Note that we do *not* `mkdir` the destination here. The staging
+    # engine stages in the destination's parent (see
+    # ``safety/staging.py``'s "Where the staging directory lives"
+    # section), so the destination does not need to exist for staging
+    # to run. That is deliberate: creating an empty destination before
+    # any file is written would leave a directory behind on any failed
+    # run, violating the "no filesystem mutations during staging"
+    # guarantee (ADR-0019) — see
+    # ``test_destination_not_created_when_absent``. The destination
+    # comes into existence exactly when the first file is committed
+    # into it (``_commit_staged``'s ``mkdir -p`` on the target's
+    # parent).
     blueprint_root = _blueprint_root(inputs.blueprint)
-    renderer = TemplateRenderer()
 
-    # ``mkdtemp`` (used by ``StagingArea.for_root``) requires its parent
-    # to exist. Creating the root is idempotent and side-effect-free if
-    # it already exists.
-    inputs.destination.mkdir(parents=True, exist_ok=True)
+    staged = StagingEngine().stage(
+        plan,
+        variables=inputs.variables.as_dict(),
+        blueprint_root=blueprint_root,
+        destination_root=inputs.destination,
+        progress=ui.progress,
+    )
+    if isinstance(staged, Err):
+        # ``StagingEngine`` returns the *staging* error type
+        # (``forge.staging.RenderingError``). Translate to the CLI's
+        # ``forge.core.exceptions.RenderingError`` so the handler can
+        # render it uniformly (findings-shaped, exit 8).
+        #
+        # The translation is a one-line projection:
+        # ``forge.staging.Finding`` → ``(code, path, message, hint)``
+        # tuple, and the phase label carries through so the header
+        # says "during staging".
+        raise _as_rendering_error(staged.error)
 
-    with StagingArea.for_root(inputs.destination) as stage:
-        for planned in plan:
-            _stage_one(
-                stage=stage,
-                renderer=renderer,
-                planned=planned,
-                blueprint_root=blueprint_root,
-                variables=inputs.variables.as_dict(),
-            )
-        committed = stage.commit()
+    _commit_staged(staged.value)
+
+
+def _commit_staged(staged: StagingResult) -> None:
+    """Move every staged file into the destination, atomically per file.
+
+    Three responsibilities, kept explicit so the ownership semantics
+    are obvious at the call site:
+
+    1. **Create the destination as needed.** For each ``(relpath,
+       _kind)`` in ``staged.manifest``, ensure
+       ``destination_root / relpath.parent`` exists (via ``mkdir -p``).
+       This is the *only* place in the generation pipeline that
+       creates anything under ``destination_root``, and it does so
+       only for a target whose file is about to be committed into it.
+       If a run fails before reaching this loop, ``destination_root``
+       was never created (see the module docstring's "Phase 7 and the
+       destination's existence" section).
+
+    2. **Commit.** ``os.replace`` each staged file into its final
+       location. ``os.replace`` is atomic within a filesystem (which
+       is guaranteed by ``StagingEngine`` staging in
+       ``destination_root.parent``), so each file's appearance in the
+       destination is atomic. A failure mid-commit leaves the files
+       already moved in place (they are complete) and raises before
+       the next move — the destination is never partial *within* a
+       file.
+
+    3. **Destroy.** Regardless of success or failure, the staging tree
+       must be destroyed. It is not the caller's job to remember that
+       cleanup; a leaked staging directory is debris that users will
+       (rightly) complain about. The ``try/finally`` is not paranoia —
+       it is the only place the ``StagingResult``'s lifetime ends.
+
+    Why not call ``stage.commit()`` on the ``StagingArea`` directly?
+        ``StagingEngine`` already handed ownership to the caller by
+        detaching the staging directory into a stable ``*-ready``
+        sibling. The ``StagingArea`` context manager has exited; its
+        ``commit()`` is unreachable. Committing through the
+        ``StagingResult``'s manifest is the *only* sanctioned path —
+        it also means the commit iterates the *plan's* manifest, not
+        the filesystem, so an unexpected extra file in the staging
+        tree cannot leak to the destination (see ``_validate.py`` for
+        the structural check that runs before this point).
+
+    Why ``os.replace`` and not ``shutil.move``?
+        ``os.replace`` is atomic on the same filesystem, which is
+        guaranteed by ``StagingEngine`` (it stages in
+        ``destination_root.parent``). ``shutil.move`` falls back to a
+        copy + delete if the rename fails, which breaks the atomicity
+        guarantee without telling anyone. The atomic primitive is the
+        right one.
+    """
+    committed: list[Path] = []
+    try:
+        for relpath, _kind in staged.manifest:
+            source = staged.root / relpath
+            target = staged.destination_root / relpath
+            # Ensure the target's parent exists. The very first
+            # iteration creates ``destination_root`` itself if it did
+            # not already exist — that is the moment the destination
+            # comes into being, and it happens only because a file is
+            # about to be committed into it.
+            #
+            # ``exist_ok=True`` makes this idempotent for the common
+            # case where the destination pre-exists (an existing
+            # project being extended), and ``parents=True`` creates
+            # any intermediate directories a nested destination needs
+            # (e.g. ``src/demo/main.py`` creates ``src/`` and
+            # ``src/demo/``).
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, target)
+            committed.append(target)
+    finally:
+        # The staged tree is always destroyed — success or failure.
+        # A successful commit leaves it empty (every file was moved
+        # out); a failed commit leaves the unmoved files, which the
+        # user must not have to clean up manually. ``destroy`` is
+        # idempotent so a caller in a ``finally`` block cannot
+        # accidentally double-destroy.
+        staged.destroy()
 
     ui.success(
-        f"Created {inputs.project_name!r} from {inputs.blueprint.id} "
-        f"({len(committed)} file(s))."
+        f"Created {staged.destination_root.name!r} from a blueprint " f"({len(committed)} file(s))."
     )
 
 
@@ -738,48 +889,6 @@ def _raise_safety(findings: list[SafetyFinding], *, operation: str) -> None:
     raise SafetyError(findings=projected, operation=operation)
 
 
-# ``[no-any-unimported]`` is suppressed on the ``def`` line only. See
-# the module docstring's "Why ``_stage_one`` has a
-# ``# type: ignore[no-any-unimported]``" section for the reasoning.
-# The suppression is load-bearing for the *type checker* (which cannot
-# follow ``TemplateRenderer`` through the ``forge.rendering`` façade
-# into the ``jinja2``-gated module) but does not affect runtime
-# behaviour: the parameter is a ``TemplateRenderer`` at call time, and
-# passing anything else fails at ``.render(...)`` with a clear
-# ``AttributeError``.
-def _stage_one(  # type: ignore[no-any-unimported]
-    *,
-    stage: StagingArea,
-    renderer: TemplateRenderer,
-    planned: PlannedFile,
-    blueprint_root: Path,
-    variables: dict[str, Any],
-) -> None:
-    """Render or copy one planned file into the staging area.
-
-    * ``COPY`` — read bytes verbatim and write them to staging.
-    * ``RENDER`` — render through the sandboxed renderer; translate
-      any ``TemplateRenderError`` into the CLI error hierarchy.
-    """
-    source_path = blueprint_root / planned.source
-
-    if planned.is_render:
-        result = renderer.render(source_path, variables)
-        if not result.is_ok():
-            raise _as_template_error(result.error, source=str(source_path))
-        stage.write_text(planned.destination, result.value)
-        return
-
-    try:
-        data = source_path.read_bytes()
-    except OSError as exc:
-        raise FilesystemConflictError(
-            f"Could not read source file {planned.source!r} for copy: {exc}",
-            hint="Check the blueprint's file entry; the source must be readable.",
-        ) from exc
-    stage.write_bytes(planned.destination, data)
-
-
 def _existing_targets(plan: list[PlannedFile], root: Path) -> list[Path]:
     """Return absolute paths of plan destinations that exist on disk.
 
@@ -834,9 +943,9 @@ def _blueprint_root(blueprint: Blueprint) -> Path:
 # -----------------------------------------------------------------------------
 #
 # These translate the *data*-shaped errors produced by the loading,
-# resolution, conditions, planning, dry-run, and rendering modules into
-# the *type*-shaped errors the CLI handler classifies. Keeping them
-# here (not in the handler) means:
+# resolution, conditions, planning, dry-run, rendering, and staging
+# modules into the *type*-shaped errors the CLI handler classifies.
+# Keeping them here (not in the handler) means:
 #
 #   * the CLI handler has one job (render), and
 #   * each error adapter is next to the code that raised it, so a
@@ -911,7 +1020,7 @@ def _as_template_error(
     *,
     source: str,
 ) -> TemplateRenderError:
-    """Translate a rendering-side error into the CLI's error type.
+    """Translate a *rendering-side* error into the CLI's error type.
 
     The rendering-side error carries ``template``, ``line``, ``col``,
     and ``name`` — richer than the CLI's ``TemplateRenderError``
@@ -927,6 +1036,30 @@ def _as_template_error(
     return TemplateRenderError(
         source=source,
         errors=((pointer, error.message),),
+    )
+
+
+def _as_rendering_error(error: StagingRenderingError) -> RenderingError:
+    """Translate a *staging-side* aggregated error into the CLI's type.
+
+    ``forge.staging.RenderingError`` carries ``findings: tuple[Finding,
+    ...]`` where each ``Finding`` has ``code``, ``path``, ``message``,
+    ``hint`` (four fields). The CLI's ``forge.core.exceptions.
+    RenderingError`` expects the same four-tuple shape, so the
+    projection is direct.
+
+    Distinct from ``_as_template_error`` (which handles the
+    *rendering*-phase error from a single template). This function
+    handles the *staging*-phase aggregate — the engine has already
+    collected every finding and destroyed the tree, so the caller
+    only needs to name the outcome. Both end up at the same CLI
+    exception type (exit 8), which is correct: both are "a template
+    failed to render," and the user's remediation is identical.
+    """
+    projected = tuple((f.code, f.path, f.message, f.hint) for f in error.findings)
+    return RenderingError(
+        findings=projected,
+        operation=error.operation,
     )
 
 

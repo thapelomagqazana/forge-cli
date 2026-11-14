@@ -1,0 +1,42 @@
+"""Typed settings for {{ project_name }}.
+
+Environment variables are prefixed with
+``{{ project_name | replace('-', '_') | upper }}_``. For example,
+``{{ project_name | replace('-', '_') | upper }}_ENVIRONMENT=production``.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Runtime configuration.
+
+    Values are read from environment variables in precedence order
+    (highest first): process environment, then ``.env`` if present.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="{{ project_name | replace('-', '_') | upper }}_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    environment: str = "development"
+    debug: bool = False
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the process-wide settings singleton.
+
+    ``lru_cache`` ensures the ``.env`` file is read once per process.
+    Tests that need different settings should override the
+    ``get_settings`` dependency (FastAPI) or clear the cache
+    (``get_settings.cache_clear()``), not re-instantiate.
+    """
+    return Settings()

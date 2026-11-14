@@ -24,19 +24,28 @@ The categories are:
    ``--overwrite`` is offered *only* for ``CollisionError``, because
    structural safety failures cannot be fixed by the flag.
 
-3. **``ForgeError`` and its subclasses** that carry a simple
+3. **Rendering errors** (``RenderingError``, from
+   ``forge.core.exceptions``). The staging engine's aggregated
+   report of templates that failed to render. Same finding shape as
+   safety errors (``(code, path, message, hint)``), same rendering
+   treatment (header + indented findings + hint), but a distinct
+   category and exit code (8) because the remediation is different:
+   fix the template, not the plan. ``--overwrite`` is *never*
+   offered for rendering errors.
+
+4. **``ForgeError`` and its subclasses** that carry a simple
    message. The user's fault (bad input, missing blueprint). Rendered
    as a single red line with an optional hint, exiting with the
    subclass's declared ``exit_code``.
 
-4. **``click.ClickException``** (``UsageError``, ``BadParameter``,
+5. **``click.ClickException``** (``UsageError``, ``BadParameter``,
    ``Abort``, etc.). Also the user's fault: Click raises them when
    the user's input does not match the command's contract. Rendered
    as a friendly message with Click's own exit code (2 for usage
    errors). The full Click traceback is *not* shown, because the
    message already says what is wrong.
 
-5. **Unexpected exceptions.** Bugs. Rendered as a generic "an
+6. **Unexpected exceptions.** Bugs. Rendered as a generic "an
    unexpected internal error occurred" message with a link to the
    issue tracker, exiting with ``ExitCode.INTERNAL_ERROR``. The
    message never includes the exception's class, message, or
@@ -121,6 +130,31 @@ findings, ``print_hint`` for hints), matching the visual language of
 the loading and planning output. A user who has seen one Forge
 error recognises every Forge error.
 
+Why rendering errors get their own branch
+-----------------------------------------
+``RenderingError`` is a ``ForgeError`` subclass, but like
+``SafetyError`` it carries a findings list. Reusing the safety
+renderer would produce a *correct* rendering (same shape) but the
+wrong remediation hint (a safety hint, not a template-fix hint).
+Worse, some safety renderings conditionally offer ``--overwrite`` —
+never appropriate for a rendering error.
+
+A dedicated branch gives rendering errors:
+    * their own header ("Rendering failed during staging:"),
+    * the same findings formatting,
+    * a rendering-specific hint (fix the template, destination is
+      untouched),
+    * a distinct exit code (8) so CI can gate "retry after fixing
+      the template" separately from "this is a tool bug" (5) or a
+      plan-safety issue (3).
+
+The branch is placed *after* the safety branches and *before* the
+generic ``ForgeError`` branch. It could be before safety (they are
+independent), but keeping safety first mirrors the domain order:
+plan-safety decisions happen before rendering even begins, so a
+``SafetyError`` is always the more "upstream" failure. The ordering
+makes log analysis easier.
+
 Why ``--overwrite`` is offered only for ``CollisionError``
 ----------------------------------------------------------
 The flag consents to replacing existing files. That consent is
@@ -146,9 +180,10 @@ exception is a bug in Forge — something the developer did not
 anticipate.
 
 A ``UsageError`` is *not* a bug. A ``SafetyError`` is *not* a bug.
-The user typed a command that does not exist, or a blueprint that
-points outside the root. There is nothing to debug. Showing the
-full internals is noise, not signal.
+A ``RenderingError`` is *not* a bug (in the tool). The user typed a
+command that does not exist, or a blueprint that points outside the
+root, or a template that references a missing variable. There is
+nothing to debug. Showing the full internals is noise, not signal.
 
 The correct behaviour is: even under ``--debug``, a *user* error
 (``ForgeError``, ``ClickException``) is rendered as a friendly
@@ -207,11 +242,14 @@ Design principles
    it carries findings that need their own rendering. The classifier
    checks the more specific category first, so the presentation
    matches the data shape.
-9. **Not everything with an exit code is an exception.** A dry-run
-   that finds collisions *succeeds* — the plan is produced, the user
-   has information — and exits with a code that says so. That code
-   (7) never reaches this handler, and that is by design: the handler
-   classifies *failures*, and a dry-run's collision report is not one.
+9. **Rendering is checked before generic ForgeError.** Same reasoning
+   as safety: ``RenderingError`` carries findings, needs its own
+   header and hint. The generic branch would flatten them.
+10. **Not everything with an exit code is an exception.** A dry-run
+    that finds collisions *succeeds* — the plan is produced, the user
+    has information — and exits with a code that says so. That code
+    (7) never reaches this handler, and that is by design: the handler
+    classifies *failures*, and a dry-run's collision report is not one.
 """
 
 from __future__ import annotations
@@ -232,6 +270,7 @@ from forge.core.exceptions import (
     ExitCode,
     ForgeError,
     PromptCancelledError,
+    RenderingError,
     SafetyError,
 )
 
@@ -267,7 +306,7 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     called from tests directly, to assert on the rendering without
     going through the CLI.
 
-    The handler classifies the exception into one of five categories
+    The handler classifies the exception into one of six categories
     and dispatches to the matching renderer. The categories and their
     ``--debug`` behaviour:
 
@@ -277,6 +316,8 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
     - **Safety** — ``SafetyError`` or ``CollisionError``. Rendered
       with findings, one per line. ``--overwrite`` offered only for
       ``CollisionError``. Exit code from the subclass (3 or 6).
+    - **Rendering** — ``RenderingError``. Rendered with findings,
+      one per line. No ``--overwrite`` hint. Exit code 8.
     - **``ForgeError``** — user error, rendered friendly, exit code
       from the subclass.
     - **``click.ClickException``** — user error, rendered friendly,
@@ -346,7 +387,26 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
         raise SystemExit(exc.exit_code) from None
 
     # -------------------------------------------------------------------------
-    # 3. ForgeError and subclasses — the user's fault, with an exit code.
+    # 3. Rendering errors — findings-shaped, but a different remediation.
+    # -------------------------------------------------------------------------
+    # Checked before the generic ``ForgeError`` branch for the same
+    # reason as safety: ``RenderingError`` carries findings that need
+    # their own rendering. Checked *after* safety so a plan-safety
+    # failure (upstream of rendering) is reported first when both are
+    # present (they cannot both be present in a single exception, but
+    # the ordering documents the domain precedence: a plan that is
+    # unsafe never reaches rendering).
+    #
+    # ``--overwrite`` is deliberately not offered. The flag has no
+    # effect on a template that failed to render; the user needs to
+    # fix the template or supply the missing variable. See module
+    # docstring, "Why rendering errors get their own branch."
+    if isinstance(exc, RenderingError):
+        _render_rendering_error(exc)
+        raise SystemExit(exc.exit_code) from None
+
+    # -------------------------------------------------------------------------
+    # 4. ForgeError and subclasses — the user's fault, with an exit code.
     # -------------------------------------------------------------------------
     # ``MissingRequiredFlagsError`` is handled here directly: its
     # ``__post_init__`` composes an actionable message, and its
@@ -361,14 +421,14 @@ def handle_exception(exc: BaseException, *, debug: bool) -> NoReturn:
         raise SystemExit(exc.exit_code) from None
 
     # -------------------------------------------------------------------------
-    # 4. Click exceptions — the user's fault, but from Click's parser.
+    # 5. Click exceptions — the user's fault, but from Click's parser.
     # -------------------------------------------------------------------------
     if isinstance(exc, click.ClickException):
         print_error(exc.format_message())
         raise SystemExit(exc.exit_code) from None
 
     # -------------------------------------------------------------------------
-    # 5. Unexpected exceptions — bugs, with no internal details leaked.
+    # 6. Unexpected exceptions — bugs, with no internal details leaked.
     # -------------------------------------------------------------------------
     if debug:
         raise exc
@@ -455,4 +515,57 @@ def _render_safety_error(
             "so it does not target those paths."
         )
     elif hint := getattr(exc, "hint", None):
+        print_hint(hint)
+
+
+def _render_rendering_error(exc: RenderingError) -> None:
+    """Render an aggregated rendering error: header, findings, hint.
+
+    Structurally identical to ``_render_safety_error`` — same finding
+    shape, same presentation conventions — but with a
+    rendering-specific header and no possibility of an
+    ``--overwrite`` hint. A separate function rather than a
+    parameterisation of the safety renderer because:
+
+    * the two error types are *conceptually* distinct (template bug
+      vs. plan bug), and a shared renderer with a "kind" parameter
+      would invite the two paths to drift;
+    * future rendering-specific presentation (e.g. showing the
+      template source line alongside the finding) has a natural home
+      here and no obvious home in a shared function;
+    * the codebase's pattern is one small renderer per error
+      category (see ``_render_safety_error`` above); following it
+      keeps the handler readable.
+
+    The finding tuple's shape is ``(code, path, message, hint)``,
+    same as safety errors. ``path`` is the *destination-relative*
+    path (what the user was trying to produce); the template source
+    path is embedded in ``message`` (which is where the user fixes
+    the problem). Both pieces of information, one finding — same UX
+    contract as the safety findings.
+
+    The header deliberately avoids the word "safety" (this is not a
+    safety failure) and names the phase (``"staging"``) so a log
+    reader knows *when* in the pipeline the failure occurred. The
+    hint after the findings names the common remediations
+    (fix the template, supply the missing variable) and states the
+    invariant the user cares about ("the destination was not
+    modified") — the last point is the reassuring one after a
+    failure, and it is always true for a rendering error.
+
+    Why the ``hint`` check uses the walrus operator here too
+    --------------------------------------------------------
+    Same reasoning as in ``_render_safety_error``: ``RenderingError``
+    declares ``hint`` with a class-level default (so ``exc.hint`` is
+    ``str`` in practice), but the field is typed ``str | None``
+    because callers can override it. ``if hint := exc.hint`` narrows
+    the type for ``print_hint`` and silently handles the ``None``
+    case without a branching ``if exc.hint is not None``.
+    """
+    print_error(f"Rendering failed during {exc.operation}:")
+    for code, path, message, _finding_hint in exc.findings:
+        rendered_path = path or "<staging>"
+        print_error_indented(f"  [{code}] {rendered_path}: {message}")
+
+    if hint := getattr(exc, "hint", None):
         print_hint(hint)

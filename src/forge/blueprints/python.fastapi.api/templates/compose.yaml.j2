@@ -1,0 +1,14 @@
+# Rendered file — see the blueprint's conditional_files entry for its destination.
+# Interpolates: project_name.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      {{ project_name | replace('-', '_') | upper }}_ENVIRONMENT: "production"
+      {{ project_name | replace('-', '_') | upper }}_DEBUG: "false"
+    restart: unless-stopped
