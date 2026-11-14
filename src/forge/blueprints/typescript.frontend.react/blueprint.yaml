@@ -21,7 +21,8 @@ description: >-
   A Vite + React + TypeScript starter with strict compiler settings,
   React Router, and a vitest harness wired to Testing Library. Ships
   opinionated defaults that pass `tsc --noEmit` and `vitest run` on a
-  clean checkout, so the generated project is CI-ready from minute one.
+  clean checkout once dependencies are installed, so the generated
+  project is CI-ready from minute one.
 
 category: frontend
 maintainer: "@platform-team"
@@ -33,6 +34,13 @@ compatibility:
 # Variables — ordered; the wizard presents them top to bottom. All ids
 # are lower_snake_case (schema-enforced) because templates reference them
 # as `{{variable_id}}`.
+#
+# The variable `project_name` is supplied by the CLI itself (`--name`),
+# so it is *not* declared here. Unlike the Python blueprints, the project
+# name is used **verbatim** in this blueprint: npm package names
+# legitimately contain hyphens, and `src/` is a bundler-resolved
+# filesystem path rather than an import-resolved module name. Neither
+# context requires (or should apply) a `replace('-', '_')` transform.
 # ---------------------------------------------------------------------------
 variables:
   - id: package_scope
@@ -87,8 +95,25 @@ variables:
     default: true
 
 # ---------------------------------------------------------------------------
-# Files — always applied. Destinations may interpolate `{{project}}` and
-# any variable id; templates live next to this manifest under templates/.
+# Files — always applied.
+#
+# Contract (see docs/reference/PLANNING.md):
+#   * `source:` is a *literal* filesystem path, resolved against the
+#     blueprint directory. It is not templated; the loader verifies its
+#     existence before planning succeeds. A template that will be
+#     rendered must end in `.j2` (or `.jinja`/`.jinja2`) and live at a
+#     static path; a template that is copied verbatim must have no
+#     suffix and must not contain `{{…}}`.
+#   * `destination:` *is* templated, and may interpolate `{{project_name}}`
+#     (supplied by the CLI) and any variable id declared above.
+#
+# Note on `{{project_name}}` in destinations: the value is used verbatim.
+# Node package names may legitimately contain hyphens (`payments-app`),
+# and `src/` is resolved by the bundler by file, not by import name, so
+# neither context requires a Python-style `replace('-', '_')` transform.
+# Applying one would produce a package name that does not match the
+# project name the user typed, which would break `npm install` from a
+# registry that publishes the user's project.
 # ---------------------------------------------------------------------------
 files:
   - source: templates/package.json.j2
@@ -119,11 +144,26 @@ files:
 # Branches here are independent; the resolver evaluates each in order and
 # merges the file lists. Overlapping destinations are a bug in the
 # blueprint, not the resolver — keep destinations unique per branch.
+#
+# The `styling` branches are disjoint on destinations:
+#   * `styling == css-modules` contributes `src/styles/App.module.css`
+#     (a CSS module the App component imports).
+#   * `styling == tailwind` contributes `tailwind.config.ts`,
+#     `postcss.config.js`, and `src/styles/tailwind.css` (the Tailwind
+#     entry file that `main.tsx.j2` imports when the branch is active).
+#   * `styling == vanilla-css` contributes nothing — `src/styles/global.css`
+#     in `files:` is the base stylesheet, and no additional config is
+#     required for vanilla CSS.
+#
+# The `main.tsx.j2` template's body differs based on `styling`; that
+# difference is *content*, not structure, and is handled inside the
+# template with an inline `{% if %}` block. The resolver never sees it.
 # ---------------------------------------------------------------------------
 conditional_files:
   # Routing: the app shell imports a router only when requested. The
-  # main.tsx template handles both shapes via an inline conditional, so
-  # no destination collides here.
+  # `main.tsx.j2` template handles both shapes via an inline
+  # `{% if router == 'react-router' %}` block; the router file itself
+  # only exists when the branch is active.
   - condition: router == react-router
     files:
       - source: templates/src/router.tsx.j2
@@ -147,11 +187,23 @@ conditional_files:
 
   # Tests: opt-out because the harness pulls in vitest, jsdom, and
   # Testing Library — meaningful dependency weight for a throwaway shell.
+  #
+  # `vitest.config.ts` and `setupTests.ts` are render-kind (`.j2`) even
+  # though their bodies are mostly static, because:
+  #   * `vitest.config.ts` may reference the package name for coverage
+  #     reporting or path aliasing (`resolve.alias` often points at
+  #     `<project>/src` in a workspace).
+  #   * `setupTests.ts` may import from the package's own test utilities.
+  # A copy-kind file with `{{…}}` in its body would be written verbatim,
+  # producing a config that references a literal `{{project_name}}` — a
+  # guaranteed failure at `npm test`. The `.j2` suffix on both is the
+  # safe default and costs nothing (the renderer handles static bodies
+  # as a no-op interpolation).
   - condition: include_tests == true
     files:
-      - source: templates/vitest.config.ts
+      - source: templates/vitest.config.ts.j2
         destination: vitest.config.ts
-      - source: templates/src/setupTests.ts
+      - source: templates/src/setupTests.ts.j2
         destination: src/setupTests.ts
       - source: templates/src/routes/Health.test.tsx.j2
         destination: src/routes/Health.test.tsx
@@ -168,12 +220,32 @@ conditional_files:
 
 # ---------------------------------------------------------------------------
 # Verification contract — every generated project must satisfy these
-# before `forge create` reports success. Structural checks first (cheap);
-# behavioural checks afterwards (real typecheck and test run).
+# before `forge create` reports success.
 #
-# Note: `npm install` is deliberately *not* run by verification — the
-# contract asserts the generated project is well-formed, not that the
-# user's npm registry is reachable. Install is the user's first step.
+# What verification *can* check without network access or `npm install`:
+#   * File existence.
+#   * JSON well-formedness of `package.json`, `tsconfig.json`,
+#     `tsconfig.node.json`, and (when present) `.prettierrc.json`.
+#
+# What verification *cannot* check on a fresh scaffold:
+#   * `npx tsc --noEmit` — requires `node_modules`, which `create` does
+#     not install (installing dependencies is a documented *user* step,
+#     not a scaffolding step — the README's Quick Start shows
+#     `npm install` before `npm run dev`).
+#   * `npm test` — same reason.
+#
+# A previous version of this blueprint included both commands in the
+# verification contract, with a comment claiming "the wizard runs
+# `npm install` as a post-scaffold step". That step does not exist in
+# `forge create`, so both checks would fail on every fresh scaffold.
+# The correct place for those checks is the *user's* CI pipeline
+# (the generated `package.json` declares `typecheck` and `test`
+# scripts, and the generated `README.md` shows how to run them) or a
+# future `forge verify` command that installs dependencies.
+#
+# What remains here is what a *fresh scaffold* can prove: that the
+# files the blueprint promised exist, and that the ones with a
+# well-defined structure are structurally valid.
 # ---------------------------------------------------------------------------
 verification:
   - id: has_package_json
@@ -184,19 +256,30 @@ verification:
     type: required_file
     path: src/main.tsx
 
-  # `tsc --noEmit` is the canonical proof that a TypeScript project is
-  # internally consistent: types resolve, imports resolve, strict flags
-  # are honoured. It requires node_modules, so the wizard runs
-  # `npm install` as a post-scaffold step and then executes this check.
-  - id: typechecks
+  # JSON well-formedness — cheap, dependency-free, and catches the
+  # single most common scaffolding regression: a template that
+  # produced syntactically invalid JSON (a trailing comma, a missing
+  # quote) that would only surface at `npm install`.
+  - id: package_json_is_valid
     type: command
-    command: npx tsc --noEmit
-    timeout: 300
+    command: >-
+      node -e "JSON.parse(require('fs').readFileSync('package.json', 'utf8'))"
+    timeout: 30
 
-  # Only assert the test harness when the user opted into it. The
-  # blueprint template ensures `test` is defined conditionally, so a
-  # project with include_tests=false has no test script to call.
-  - id: tests_pass
+  - id: tsconfig_is_valid
     type: command
-    command: npm test -- --run
-    timeout: 600
+    command: >-
+      node -e "JSON.parse(require('fs').readFileSync('tsconfig.json', 'utf8'))"
+    timeout: 30
+
+  - id: tsconfig_node_is_valid
+    type: command
+    command: >-
+      node -e "JSON.parse(require('fs').readFileSync('tsconfig.node.json', 'utf8'))"
+    timeout: 30
+
+  # `node -e "JSON.parse(...)"` is available wherever `npm` is, because
+  # `npm` requires `node`. The check does not invoke `npm` itself, does
+  # not touch the network, and does not require `node_modules` — it only
+  # requires a working `node`, which is the same requirement the
+  # `package.json`'s `engines` field documents.
