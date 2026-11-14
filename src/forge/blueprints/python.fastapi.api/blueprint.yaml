@@ -41,6 +41,14 @@ compatibility:
 # Variables — presented in this order by the interactive wizard.
 # Ids are lower_snake_case (schema-enforced) because they are used
 # verbatim in templates as `{{variable_id}}`.
+#
+# The variable `project_name` is supplied by the CLI itself (it is the
+# `--name` argument folded into the template context — see
+# cli/commands/create.py's `_resolve_inputs`), so it is *not* declared
+# here. Declaring it would make the resolver try to resolve it against
+# `--var`, which is not how the CLI supplies it, and the result would be
+# a confusing "you must also pass --var project_name=..." prompt. The
+# CLI's contract is that `project_name` is always available.
 # ---------------------------------------------------------------------------
 variables:
   - id: author
@@ -71,8 +79,20 @@ variables:
     default: true
 
 # ---------------------------------------------------------------------------
-# Files — always applied. Destinations may interpolate `{{project}}` and
-# any variable id. Templates live next to this manifest under templates/.
+# Files — always applied.
+#
+# Contract:
+#   * `source:` is a *literal* path resolved against the blueprint
+#     directory. It is not templated, because the loader verifies its
+#     existence before planning succeeds (see loading/fs_checks.py).
+#   * `destination:` *is* templated, and may interpolate `{{project_name}}`
+#     (supplied by the CLI) and any variable id declared above.
+#
+# A template whose *content* interpolates the project name must be
+# planned as render-kind, which means its source must end in ``.j2``
+# (or ``.jinja``/``.jinja2``). Files whose content must be preserved
+# byte-for-byte (a `.gitignore`, a pre-built asset) are planned as
+# copy-kind and must not contain ``{{…}}``.
 # ---------------------------------------------------------------------------
 files:
   - source: templates/pyproject.toml.j2
@@ -81,15 +101,15 @@ files:
     destination: README.md
   - source: templates/.gitignore
     destination: .gitignore
-  - source: templates/src/{{project}}/__init__.py
-    destination: src/{{project}}/__init__.py
-  - source: templates/src/{{project}}/main.py.j2
-    destination: src/{{project}}/main.py
-  - source: templates/src/{{project}}/settings.py.j2
-    destination: src/{{project}}/settings.py
+  - source: templates/src/project/__init__.py
+    destination: src/{{project_name}}/__init__.py
+  - source: templates/src/project/main.py.j2
+    destination: src/{{project_name}}/main.py
+  - source: templates/src/project/settings.py.j2
+    destination: src/{{project_name}}/settings.py
   - source: templates/tests/test_health.py.j2
     destination: tests/test_health.py
-  - source: templates/tests/conftest.py
+  - source: templates/tests/conftest.py.j2
     destination: tests/conftest.py
 
 # ---------------------------------------------------------------------------
@@ -111,6 +131,10 @@ conditional_files:
 # Verification contract — every generated project must satisfy these
 # before `forge create` reports success. Checks run in order; the first
 # failure short-circuits and surfaces the offending id.
+#
+# Unlike ``files[].source``, verification ``path`` and ``command`` *are*
+# templated (they run in the generated project's context, not against the
+# blueprint directory), so ``{{project_name}}`` is used here.
 # ---------------------------------------------------------------------------
 verification:
   # Cheap structural check first: fail fast if scaffolding dropped a file.
@@ -120,14 +144,14 @@ verification:
 
   - id: has_package
     type: required_file
-    path: src/{{project}}/main.py
+    path: src/{{project_name}}/main.py
 
   # Behavioural check: the generated service must actually import and its
   # test suite must pass. Timeout is generous because cold caches on CI
   # can be slow the first time.
   - id: imports_cleanly
     type: command
-    command: python -c "import {{project}}"
+    command: python -c "import {{project_name | replace('-', '_')}}"
     timeout: 120
 
   - id: tests_pass

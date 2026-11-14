@@ -85,34 +85,79 @@ Bundled-source materialisation
 ------------------------------
 The loader is strictly path-based by design (a file it can read is a
 blueprint it can validate). Bundled blueprints live inside the wheel
-under ``forge/blueprints/<id>/blueprint.yaml`` and are reachable only
-via ``importlib.resources`` — which yields a *resource handle*, not a
-``Path``. To bridge the two, the service stages each bundled manifest
-to a temporary file, runs the loader against it, and (for
-``load_with_path``) returns the staged path's parent as the
-"manifest directory" anchor.
+under ``forge/blueprints/<id>/blueprint.yaml`` and are reached via
+``importlib.resources.files("forge.blueprints")``.
 
-The staging is done inside a ``tempfile.TemporaryDirectory`` context
-manager so the staging directory is removed on exit. Only the
-*returned* path — a plain ``Path`` the caller may read immediately —
-is at risk of going stale, and the caller's use of it is bounded: the
-staged parent contains exactly one file (the manifest), and template
-health was *already* derived from the on-disk package contents before
-returning (see ``_derive_status``). A caller that tries to read a
-template through this path will get a clear "file not found" — which
-is correct, because the template does not live there; it lives in the
-package, and the caller should be using the loader's discovery (or
-the packaged resource) for it. This is a *deliberate* limitation, not
-an oversight: the entire alternative is exposing ``importlib.resources``
-handles through the service, which would leak a low-level API into
-every caller's code.
+**On every supported installation mode** — source checkout,
+``pip install -e .``, ``pip install <wheel>`` — ``importlib.resources``
+yields a traversable that is backed by a **real filesystem path**.
+That path's *parent* is the blueprint directory, which contains both
+``blueprint.yaml`` and the ``templates/`` subdirectory the blueprint
+references. Returning it as the materialised path makes every
+``files[].source`` resolvable against it — the same way it already
+works for local blueprints.
+
+An earlier design staged the manifest into a ``tempfile.mkdtemp``
+directory and returned the staged path's parent. That was correct for
+callers that only wanted to **read the manifest** (a one-shot read is
+fine from a temp copy) but wrong for callers that want to **resolve
+template paths against the manifest's directory** — the temp directory
+contains no ``templates/`` and every source lookup fails. The
+``create`` command's ``_blueprint_root`` is exactly such a caller: it
+passes the returned path's parent to the staging engine as
+``blueprint_root``, and every ``files[].source`` is resolved against
+it. Staging the manifest reproduced the "template file not found"
+failure for every bundled blueprint, even though the templates were
+present in the package the whole time.
+
+The current design fixes that by returning the real package path.
+Zip-import installation (a ``.zip`` on ``sys.path``) is the one mode
+where the packaged files are *not* on a real filesystem; the engine
+already does not support it (templates are read from disk by the
+loader, the renderer, and the safety layer), so this module fails
+loudly at the conversion site rather than silently returning a wrong
+path. See ``_materialise_path`` for the specific error message and
+recovery hint.
+
+Why the ``# type: ignore[arg-type]`` on ``Path(entry)``
+-------------------------------------------------------
+``importlib.resources.files("forge.blueprints")`` returns a
+``Traversable``, and after ``.joinpath(bp_id, "blueprint.yaml")``, the
+result is still a ``Traversable``. On every supported installation
+mode that traversable is *backed by* a real filesystem path (a
+``pathlib.Path`` subclass instance), but the *static type* the stdlib
+stubs declare is the abstract ``Traversable`` — which is not
+``os.PathLike`` in mypy's view, so ``Path(entry)`` fails
+``[arg-type]``.
+
+At runtime, ``Path(entry)`` succeeds whenever the traversable is a
+real ``Path`` (which it is on filesystem-backed installs). On the one
+unsupported mode — a zip on ``sys.path`` — ``entry`` is a
+``zipfile.Path``, and ``Path(zipfile.Path(...))`` raises
+``TypeError``. The code below catches ``TypeError`` and turns it into
+a clear ``DiscoveryError`` naming the unsupported installation mode,
+so the runtime failure is *handled*, not silent.
+
+The ``# type: ignore[arg-type]`` records the intentional gap between
+"mypy sees ``Traversable``" and "the value is really
+``os.PathLike`` on every mode we support." The alternative — casting
+to ``Path`` first, or calling ``str(entry)`` and constructing a
+``Path`` from the string — would either defer the same mypy complaint
+to a different line (a cast is ``Any`` to the checker) or introduce a
+subtle bug (``str(zipfile.Path)`` produces a plausible-looking path
+that does not exist on disk; the ``TypeError`` from ``Path(...)`` is
+exactly the signal we want on that mode).
+
+The same suppression appears in ``_label_to_path_for_status`` for the
+identical reason: both methods convert a ``Traversable`` to a
+``Path`` and both need the runtime ``TypeError`` catch to keep
+zip-mode from silently producing a wrong status.
 
 See ADR-0009 for the source/resolver split this module enforces.
 """
 
 from __future__ import annotations
 
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -365,29 +410,26 @@ class BlueprintDiscoveryService:
         Bundled-source materialisation:
             Bundled blueprints live inside the wheel under
             ``forge/blueprints/<id>/blueprint.yaml`` and are reached
-            via ``importlib.resources``. Because the loader is
-            path-based by design, we stage the manifest to a temp
-            file under a ``TemporaryDirectory`` that removes itself
-            on exit. The returned ``Path`` is a *snapshot* — the
-            caller can read the manifest (and the directory it sits
-            in) immediately, but not later, and the staged directory
-            does not contain the blueprint's *template* files (those
-            live in the package and are read by the loader during
-            template-health checks, not by the caller).
+            via ``importlib.resources``. On every supported
+            installation mode that path is backed by a **real
+            filesystem path**, and it is the manifest of a
+            directory that also contains the blueprint's
+            ``templates/``. The returned path is therefore the
+            correct anchor for template resolution: the caller can
+            read the manifest *and* every template the blueprint
+            references from the manifest's parent directory.
 
-            Why this is correct rather than merely convenient:
-            ``create._blueprint_root`` uses the returned path as a
-            *directory anchor* for template resolution, but only
-            inside a single ``_generate`` call. The generated files
-            are staged and committed before ``_generate`` returns.
-            So the temp directory's lifetime exactly covers its use.
+            An earlier version of this method staged the manifest
+            into a temp directory and returned that. That broke
+            template resolution for `create` — see the module
+            docstring's "Bundled-source materialisation" section
+            for the full history and the reason the current design
+            returns the real path instead.
 
-            A future ``forge generate --deferred`` (hypothetical)
-            that needs the anchor to outlive the call would need to
-            materialise the blueprint's templates too — a different
-            problem with a different solution (a resource-extracting
-            caching layer), not a reason to keep the current
-            materialisation alive beyond the call.
+            Zip imports are unsupported (the engine reads templates
+            from disk); ``_materialise_path`` fails loudly on that
+            installation mode rather than silently returning a
+            path that cannot resolve sources.
 
         Delegation:
             Shares ``_find_resolved`` and ``_not_found`` with
@@ -461,75 +503,82 @@ class BlueprintDiscoveryService:
     # -- helpers ----------------------------------------------------------
 
     def _materialise_path(self, resolved: ResolvedCandidate) -> Path:
-        """Return a filesystem ``Path`` that anchors the candidate's templates.
+        """Return the real filesystem manifest path for a resolved candidate.
 
-        Three cases, one output contract (a ``Path`` whose parent is a
-        directory the caller can read at least the manifest from):
+        Three cases, one output contract: a ``Path`` whose *parent
+        directory* is the blueprint's directory — the directory that
+        contains both ``blueprint.yaml`` and (for blueprints that
+        ship templates) a ``templates/`` subdirectory the caller can
+        read.
 
-        * **Local candidate** — the path is already a filesystem path;
-          return it unchanged.
-        * **Bundled candidate** — stage the packaged manifest to a
-          temporary file (the loader already does this internally when
-          it validates, but we need the *anchor* path to persist for
-          the caller to read). The staging directory is created under
-          a ``tempfile.TemporaryDirectory`` and deleted when the
-          caller is done — see the method docstring's "Bundled-source
-          materialisation" for why the caller's use is bounded.
+        * **Local candidate** — the label already carries the manifest
+          path. Return it unchanged. Local blueprints are the anchor's
+          ideal case: the manifest and its templates both live on disk
+          at a stable path the caller controls.
+
+        * **Bundled candidate** — the manifest and its templates both
+          live inside the installed ``forge.blueprints`` package. On
+          every supported installation mode — source checkout,
+          ``pip install -e .``, ``pip install <wheel>`` —
+          ``importlib.resources.files`` yields a traversable that is
+          backed by a **real filesystem path**, and that path's
+          parent is the direct anchor the caller needs. Return it
+          without staging.
+
+          This is a change from an earlier design that staged the
+          manifest into a ``tempfile.mkdtemp`` directory and returned
+          the staged path. That design worked for callers that only
+          wanted to **read the manifest** (a one-shot read is fine
+          from a temp copy) but broke for callers that wanted to
+          **resolve template paths against the manifest's directory**:
+          the temp directory contains only a copy of the manifest and
+          no ``templates/``, so every source lookup failed. See the
+          module docstring's "Bundled-source materialisation" section.
+
         * **Unknown source label** — a future source type (say, a
           remote registry). Raise ``DiscoveryError`` with a clear
-          "this source cannot be materialised" message, because
-          silently returning a bogus path would be worse than
-          refusing.
+          "this source cannot be materialised" message. Silently
+          returning a bogus path would be worse than refusing. A
+          future remote source that needs to expose a filesystem
+          anchor should materialise its *whole* blueprint directory
+          (manifest + templates) to a stable cache location and
+          return that; the fix shape is the same, but the cache
+          location is the source's responsibility.
 
-        The temp directory is cleaned up by ``TemporaryDirectory`` —
-        but that is only safe because we *copy the manifest bytes*
-        into it rather than returning a handle to the packaged
-        resource. A future reader of the temp path sees the manifest
-        they expect; a future reader of the *package* sees the
-        original, untouched. The temp path is a *snapshot* of the
-        anchor the caller asked for, not a proxy for the whole
-        blueprint directory.
-
-        A note on the leaked-temp-path contract:
-            ``load_with_path`` is documented to return a ``Path``
-            whose lifetime covers the caller's *immediate* use
-            (reading the manifest, resolving template references
-            during a single generate call). It is **not** documented
-            to outlive that use; a caller that stashes the path and
-            re-reads it an hour later will get a ``FileNotFoundError``
-            — which is honest, because the path was always a
-            snapshot, and the underlying blueprint may have changed
-            in the interim. Callers that need a durable path should
-            use a *local* blueprint (which is always a real path) or
-            materialise the entire blueprint directory themselves.
+        Zip-import failure mode
+        -----------------------
+        If the installed package is a ``.zip`` on ``sys.path`` (an
+        installation mode the blueprint engine does not support,
+        because templates are read from disk by the loader, the
+        renderer, and the safety layer),
+        ``importlib.resources.files`` yields a traversable that is
+        not a real ``Path``. We detect that at the ``Path(entry)``
+        conversion and raise a clear ``DiscoveryError`` naming the
+        unsupported mode — rather than silently staging the manifest
+        (which reproduces the bug we are fixing) or attempting to
+        materialise the whole package (which is out of scope for
+        this method and would require a caching layer).
         """
         label = resolved.source_label
+
+        # Local blueprints: the label *is* the manifest path. Return
+        # it directly. The caller's directory anchor is the
+        # manifest's parent, which is exactly where the blueprint's
+        # templates live.
         if label.startswith("local:"):
             return Path(label[len("local:") :])
 
+        # Bundled blueprints: return the real package path. On every
+        # supported install mode this is a filesystem path whose
+        # parent contains the blueprint's templates.
         if label.startswith("bundled:"):
-            # Read the packaged manifest and stage it. The staging
-            # directory is anchored to a caller-supplied
-            # ``TemporaryDirectory`` — but we must *retain* the
-            # directory object until the caller's use completes, which
-            # means creating it outside a ``with`` and letting the
-            # caller's *own* lifetime bound its cleanup. Because we
-            # cannot couple our object's lifetime to the caller's
-            # without state coupling, we accept the leak here: one
-            # small directory per bundled-manifest materialisation.
-            #
-            # This is a bounded leak: (a) only invoked by
-            # ``load_with_path``, which ``create`` calls exactly once
-            # per invocation and tests call once per test; (b) the
-            # directory contents are a single small YAML file. If a
-            # future caller materialises blueprints in a loop over
-            # hundreds of ids, that caller should switch to
-            # ``TemporaryDirectory``-scoped materialisation — which is
-            # exactly the shape this method's docstring warns about.
             from importlib import resources
 
             bp_id = label[len("bundled:") :]
-            entry = resources.files("forge.blueprints").joinpath(bp_id, "blueprint.yaml")
+            entry = resources.files("forge.blueprints").joinpath(
+                bp_id,
+                "blueprint.yaml",
+            )
             if not entry.is_file():
                 raise DiscoveryError(
                     f"Bundled blueprint {bp_id!r} is missing its manifest "
@@ -537,11 +586,50 @@ class BlueprintDiscoveryService:
                     f"This is a packaging bug — reinstall Forge."
                 )
 
-            staging_dir = Path(tempfile.mkdtemp(prefix=".forge-bp-"))
-            manifest = staging_dir / "blueprint.yaml"
-            manifest.write_bytes(entry.read_bytes())
-            return manifest
+            # ``entry`` is a traversable. On every supported install
+            # mode it is backed by a real filesystem path; on an
+            # unsupported mode (a zip on ``sys.path``) it is not, and
+            # ``Path(entry)`` raises ``TypeError`` because the
+            # traversable is not ``os.PathLike``.
+            #
+            # ``# type: ignore[arg-type]`` because the stdlib stubs
+            # declare ``Traversable``, not ``os.PathLike``. See the
+            # module docstring's "Why the ``# type: ignore[arg-type]``
+            # on ``Path(entry)``" section for the reasoning: the value
+            # *is* ``os.PathLike`` on every supported install mode, and
+            # the unsupported mode is caught at runtime by the
+            # ``TypeError`` handler below.
+            try:
+                real_path = Path(entry)  # type: ignore[arg-type]
+            except TypeError as exc:
+                raise DiscoveryError(
+                    f"Bundled blueprint {bp_id!r} is inside a zip "
+                    f"archive (its manifest is not on the filesystem). "
+                    f"The Forge blueprint engine requires templates "
+                    f"to be readable from disk; install Forge from a "
+                    f"wheel or a source checkout instead of a zip."
+                ) from exc
 
+            # Defensive: if a future packaging change ever returns a
+            # traversable that stringifies to something that is not a
+            # real file, fail loudly. This is a check on the *result*
+            # of the conversion, not on the conversion itself — it
+            # catches any path where ``Path(entry)`` succeeds but the
+            # resulting path is not readable.
+            if not real_path.is_file():
+                raise DiscoveryError(
+                    f"Bundled blueprint {bp_id!r} manifest is not "
+                    f"readable at {real_path}. This is a packaging or "
+                    f"permissions bug — reinstall Forge or check file "
+                    f"permissions."
+                )
+
+            return real_path
+
+        # Unknown source type — refuse rather than silently return a
+        # wrong anchor. A future source that needs to materialise
+        # should implement the anchor contract itself: manifest and
+        # templates both present in the returned directory.
         raise DiscoveryError(
             f"Cannot materialise a filesystem path for source "
             f"{label!r}: this source type does not expose its "
@@ -592,29 +680,33 @@ class BlueprintDiscoveryService:
         """Return a filesystem path the loader can validate for status.
 
         * ``local:<path>`` — the user's file; return it directly.
-        * ``bundled:<id>`` — the packaged manifest; stage it to a
-          **temporary** directory (used only for this one status
-          check, then discarded). The staging is scoped to this
-          method's lifetime, because status derivation only needs to
-          *read* the manifest once and then throw it away.
+        * ``bundled:<id>`` — return the real packaged manifest path.
+          Same reasoning as ``_materialise_path``: the loader's
+          ``check_files=True`` resolves template references against
+          the manifest's directory, and the packaged directory is
+          the only one that actually contains the templates. A temp
+          copy would report every bundled blueprint as ``stale``
+          regardless of whether the templates exist — the exact
+          false-negative this method must not produce.
         * Anything else — ``None``; the caller treats it as ``ok``
           (see ``_derive_status``).
 
         This is a *distinct* helper from ``_materialise_path`` on
         purpose:
 
-        * ``_materialise_path`` returns a path the **caller** will
-          keep and read (bounded by the caller's use); the temp
-          directory must outlive this method.
-        * ``_label_to_path_for_status`` returns a path **this
-          method** reads and discards; the temp directory is scoped
-          here and cleaned up on return.
+        * ``_materialise_path`` returns the caller's anchor — its
+          lifetime is bounded by the caller's use, and its correctness
+          is checked by ``create``'s template resolution.
+        * ``_label_to_path_for_status`` returns the status-check
+          anchor — its lifetime is this method's, and its correctness
+          is checked by the CLI's ``forge list`` status column.
 
-        Merging them would force one lifetime contract to serve both
-        use cases — and the "caller keeps it" contract is strictly
-        weaker than "method disposes it", so merging would leak
-        temp directories on every status check. Two helpers, two
-        lifetimes, no shared lifetime confusion.
+        Keeping them separate means a future change to one (say, a
+        new source type that needs different staging) does not
+        silently change the other. They happen to share the same
+        implementation today because both need the *real* directory;
+        if they diverge in the future, they can diverge without
+        coordination.
         """
         if label.startswith("local:"):
             return Path(label[len("local:") :])
@@ -622,31 +714,28 @@ class BlueprintDiscoveryService:
             from importlib import resources
 
             bp_id = label[len("bundled:") :]
-            entry = resources.files("forge.blueprints").joinpath(bp_id, "blueprint.yaml")
+            entry = resources.files("forge.blueprints").joinpath(
+                bp_id,
+                "blueprint.yaml",
+            )
             if not entry.is_file():
                 return None
-            with tempfile.TemporaryDirectory(prefix=".forge-status-") as tmp:
-                manifest = Path(tmp) / "blueprint.yaml"
-                manifest.write_bytes(entry.read_bytes())
-                # Copy the *contents* into the caller's lifetime by
-                # returning the manifest path — but the directory it
-                # lives in is already deleted by the time we return.
-                # ``loader.load`` in ``_derive_status`` is called
-                # *before* this method's ``with`` block exits, so the
-                # manifest is present during the only read that
-                # matters. We return the path anyway because the
-                # caller does not re-read it; the returned value is
-                # only used by the caller to decide the code path
-                # ("path is None means no filesystem representation").
-                #
-                # An alternative — returning ``None`` for bundled
-                # blueprints — would make every bundled blueprint
-                # report ``stale`` or ``ok`` without the loader
-                # actually confirming template health. That defeats
-                # the entire purpose of the status column, so we
-                # materialise the manifest, run the loader, discard
-                # the temp directory. The path is a *token* the
-                # caller uses only as a signal that a loader call is
-                # meaningful; the loader call is already done.
-                return manifest
+            try:
+                # ``# type: ignore[arg-type]`` on the same reasoning as
+                # ``_materialise_path``: the stdlib stubs declare the
+                # traversable as ``Traversable`` (not ``os.PathLike``),
+                # but on every supported install mode it *is* a real
+                # ``Path``. The unsupported mode (zip on ``sys.path``)
+                # raises ``TypeError`` below and is treated as "no path"
+                # — the status is then ``ok`` because we cannot check
+                # it, which is the same honest default the unknown-source
+                # branch uses.
+                real_path = Path(entry)  # type: ignore[arg-type]
+            except TypeError:
+                # Zip import — status derivation cannot confirm
+                # template health; treat as ``ok`` for the same reason
+                # an unknown source is ``ok``: we cannot check, so
+                # reporting ``stale`` would be a false negative.
+                return None
+            return real_path if real_path.is_file() else None
         return None

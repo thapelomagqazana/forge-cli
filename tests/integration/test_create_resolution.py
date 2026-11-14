@@ -132,37 +132,42 @@ of what a user does. Its coverage is irrelevant, and letting it
 participate in the parent's measurement both distorts the metrics
 and breaks the combine.
 
-Which tests need ``@_GENERATION_PENDING``
------------------------------------------
-The ``create`` command's ``_generate`` currently raises
-``NotImplementedError`` with a message pointing at the future task
-that will implement scaffolding. Only tests whose *success path*
-reaches ``_generate`` therefore cannot pass today. Those are marked
-``@pytest.mark.xfail(strict=True)``.
+Stream-separation contract for success
+--------------------------------------
+A successful ``forge create`` writes:
 
-Tests that fail during **resolution** — missing ``--name``, invalid
-project name, insufficient ``--var`` values — never reach
-``_generate``; they raise ``MissingRequiredFlagsError`` or
-``UserInputError`` from ``_resolve_variables``, and the CLI handler
-renders them with exit code 1. Those tests **should pass today**,
-and marking them ``xfail`` would:
+* **stdout**: the success message (names the project).
+* **stderr**: progress lines (``[1/11] copy .gitignore`` etc.),
+  which the pipeline emits per-file for the user's benefit
+  (ADR-0019's "progress is commentary, not product").
 
-* hide the fact that the resolution layer is complete,
-* mask any regression in the resolution layer behind "expected to
-  fail", and
-* trigger ``[XPASS(strict)]`` failures on every run — which is
-  exactly what ``strict=True`` is designed to surface.
+That is *by design*: a script that pipes stdout to a file and treats
+stderr as the user's console sees both the product and the
+commentary, correctly separated. An earlier version of the success
+test asserted ``stderr == ""`` — that assertion was written against
+a pre-pipeline mental model in which the CLI was silent on success.
+Once the pipeline landed, its progress lines (correctly) go to
+stderr, and the assertion had to be relaxed from "stderr is empty"
+to "stderr contains no *error* lines".
 
-The four tests that get the marker are therefore only those whose
-success path requires a working generator:
+The distinction the tests now enforce is:
 
-* ``test_valid_non_interactive_create_succeeds``
-* ``test_no_interactive_overrides_missing_tty``
-* ``test_local_blueprints_are_ignored``
-* ``test_create_does_not_write_outside_output``
+* **Errors** on stderr always begin with ``✗`` (see
+  ``forge.cli.ui.print_error``). A script grepping for ``^✗`` sees
+  exactly the failures.
+* **Progress** lines on stderr begin with ``  [N/M]`` (see
+  ``forge.cli.ui.print_progress``). They are commentary, not
+  failures; a shell script should ignore them.
+* **Success** on stdout names the project. It is the only line a
+  script that wants to confirm success needs to look for.
 
-Every other test in this file exercises code that exists today and
-should be green.
+The tests in this file assert on those three properties, not on
+exact wording. A UX change to the success message (say, from
+"Created 'my-api'" to "Project my-api created") keeps the tests
+green — correctly, because the *contract* ("success output names
+the project") is unchanged. A change that broke the contract (say,
+printing failures to stdout instead of stderr) would fail
+immediately.
 
 Asserting on *what users rely on*, not on copy
 ----------------------------------------------
@@ -207,31 +212,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# xfail marker for tests that require the (not-yet-implemented) generator
-#
-# Applied *only* to tests whose success path reaches ``_generate``.
-# Tests that fail during resolution do not need this marker; they
-# exercise working code and should be green.
-# ---------------------------------------------------------------------------
-
-_GENERATION_PENDING = pytest.mark.xfail(
-    reason=(
-        "Generation pipeline not yet implemented (Task 1.3.1). "
-        "``_generate`` raises ``NotImplementedError``; these tests "
-        "become hard requirements once it calls ``scaffold_project``. "
-        "``strict=True`` ensures the run *fails* when the pipeline "
-        "lands, forcing this marker to be removed in the same commit."
-    ),
-    strict=True,
-    # The tests assert on `result.returncode`; when generation is
-    # missing, the run raises `NotImplementedError`, which surfaces
-    # as a non-zero exit code, which trips an assertion. That is
-    # the failure we are marking as expected.
-    raises=AssertionError,
-)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -314,17 +294,33 @@ def run_create(
     )
 
 
+def _error_lines(stderr: str) -> list[str]:
+    """Return the lines of ``stderr`` that are *error* messages.
+
+    The CLI's error renderer (``forge.cli.ui.print_error``) prefixes
+    every error line with ``✗``. Progress lines (``forge.cli.ui.
+    print_progress``) prefix with ``  [N/M]``. The distinction is the
+    "product vs. commentary" contract the CLI enforces.
+
+    This helper is the *one* place that filters by that prefix, so a
+    future change to the prefix (should it ever need to change) is a
+    one-line fix here, not a scatter of string comparisons in test
+    bodies. It is also the semantic anchor for every test that says
+    "the run failed / succeeded" — the test asserts on the *error
+    lines*, not on the raw stderr, because raw stderr contains
+    commentary that is not part of the success-or-failure contract.
+    """
+    return [line for line in stderr.splitlines() if line.startswith("✗")]
+
+
 # ---------------------------------------------------------------------------
 # AC 1: valid input via flags succeeds with a clean stdout/stderr split
-#
-# Marked xfail: reaches _generate, which raises NotImplementedError.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration()
-@_GENERATION_PENDING
 def test_valid_non_interactive_create_succeeds(tmp_path: Path) -> None:
-    """A well-formed ``forge create`` exits 0 with the plan on stdout.
+    """A well-formed ``forge create`` exits 0 with the project on stdout.
 
     This is the *integration* form of the acceptance criterion "the
     command accepts a valid invocation". The unit test proves the
@@ -334,12 +330,32 @@ def test_valid_non_interactive_create_succeeds(tmp_path: Path) -> None:
     forgot to close a file. Those failure modes are invisible to
     unit tests because unit tests stop at the resolver.
 
-    The assertion on stderr being *empty* is not fussiness: a script
-    that pipes stdout to a file and uses stderr's emptiness as a
-    signal of success depends on this. A warning on stderr with exit
-    code 0 would be "successful but noisy", which is a legitimate
-    state — but the test pins *this* invocation as the baseline: if
-    it starts emitting stderr, that is a change worth knowing about.
+    Stream contract on success
+    --------------------------
+    A successful run writes two things:
+
+    * **stdout** — the success message, which names the project.
+      This is the *product*: the shell script that wants to confirm
+      success needs only look here.
+    * **stderr** — progress lines, emitted per-file as the staging
+      engine renders and commits the plan (see ADR-0019). These are
+      *commentary*: a user watching their terminal sees them; a
+      script grepping for errors ignores them.
+
+    An earlier version of this test asserted ``stderr == ""``. That
+    was correct when the pipeline was a stub; once the pipeline
+    landed, its progress lines (correctly) went to stderr, and the
+    assertion had to be relaxed from "stderr is empty" to "stderr
+    contains no *error* lines". The relaxed form is what a script
+    actually relies on (``grep '^✗'`` sees failures, not commentary),
+    and it is what this test now enforces.
+
+    Why the assertion checks the error-line set is empty rather than
+    the raw stderr: progress lines are not errors, and treating them
+    as errors would make the CLI unable to ever emit progress without
+    also failing its own success test. The correct line between
+    "success with commentary" and "success with errors" is drawn by
+    the ``✗`` prefix, which the CLI's renderers enforce uniformly.
     """
     result = run_create(
         "python.fastapi.api",
@@ -356,20 +372,43 @@ def test_valid_non_interactive_create_succeeds(tmp_path: Path) -> None:
         f"--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}"
     )
-    # stderr is where *errors* go. A successful run must not write
-    # there, so a script that treats "stderr non-empty" as "trouble"
-    # sees the right signal.
-    assert result.stderr == ""
+
+    # stdout is where the *product* goes: success, in a form a script
+    # can confirm without parsing commentary.
+    assert "my-api" in result.stdout, (
+        f"success output does not name the project\n" f"--- stdout ---\n{result.stdout}"
+    )
+
+    # stderr is where commentary (progress) and errors go. Progress
+    # is expected; errors are not. The `_error_lines` helper is the
+    # single place that defines the "error" prefix, so a future
+    # change to how errors are rendered (say, a `✗` prefix becoming
+    # a `[ERROR]` prefix) is a one-line change there, not a scatter
+    # of string comparisons across the test suite.
+    errors = _error_lines(result.stderr)
+    assert not errors, (
+        f"successful run emitted error lines on stderr: {errors!r}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+
+    # Sanity: the project actually landed on disk. A run that exits 0
+    # but writes nothing is a different class of bug — one that a
+    # pure "returncode + streams" assertion would not catch — and it
+    # is worth failing loudly on. This is a *light* assertion; the
+    # full project-content check lives in
+    # ``tests/integration/test_staging_end_to_end.py``. Here we only
+    # verify that the file the blueprint's ``verification:`` block
+    # names as ``required_file`` exists, which is the minimum a
+    # successful create promises.
+    assert (tmp_path / "my-api" / "pyproject.toml").is_file(), (
+        "successful create did not produce pyproject.toml — the "
+        "run reported success but wrote nothing"
+    )
 
 
 # ---------------------------------------------------------------------------
 # AC 2: missing required flag fails with exit 1 and names the flag
-#
-# NOT marked xfail. This test fails during resolution — the missing
-# `--name` check fires in `_require_flags` before `_generate` is
-# reached, so the test does not depend on the generator. An earlier
-# revision marked it, and `[XPASS(strict)]` immediately caught the
-# over-application. Removing the marker is the correct fix.
 # ---------------------------------------------------------------------------
 
 
@@ -392,11 +431,11 @@ def test_missing_name_fails_with_exit_1(tmp_path: Path) -> None:
        check is intentionally on ``--name`` (the flag) rather than
        ``name`` (the field), because the user typed the flag.
 
-    Why this test does not need ``@_GENERATION_PENDING``: the
-    missing-flags check runs in ``_resolve_variables``, which is
-    invoked *before* ``_generate``. A ``MissingRequiredFlagsError``
-    is raised and rendered — the generator is never reached. The
-    test exercises working code and should be green today.
+    Why this test does not need a pipeline marker: the missing-flags
+    check runs in ``_resolve_variables``, which is invoked *before*
+    ``_generate``. A ``MissingRequiredFlagsError`` is raised and
+    rendered — the generator is never reached. The test exercises
+    working code and is green.
     """
     result = run_create(
         "python.fastapi.api",
@@ -421,12 +460,6 @@ def test_missing_name_fails_with_exit_1(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # AC 3: invalid name fails during resolution
-#
-# NOT marked xfail. This test is the integration proof that the
-# resolution layer's validation reaches the shell rendering layer —
-# it should be green on every run, and its failure is a *bug in the
-# command* (the missing project-name validation in `create.py`), not
-# a bug in the test.
 # ---------------------------------------------------------------------------
 
 
@@ -459,11 +492,11 @@ def test_invalid_project_name_fails_with_hint(tmp_path: Path) -> None:
     ``resolution.names.project_name``. That is the *same* named
     validator the wizard uses, so a name rejected interactively is
     also rejected non-interactively — and vice versa. Without that
-    check the command would proceed to ``_generate``, hit
-    ``NotImplementedError``, and produce the wrong exit code and
-    message (exit 5, "unexpected internal error"). The test exists
-    to catch that regression — and did, on the run that motivated
-    this test file's revision.
+    check the command would proceed to ``_generate``, hit the
+    resolver's rejection of the invalid name, and produce the wrong
+    exit code and message (exit 5, "unexpected internal error"). The
+    test exists to catch that regression — and did, on the run that
+    motivated this test file's revision.
 
     Why the assertion on stderr is on *the field name* and *a
     rule-specific phrase*, not on an exact message: the
@@ -520,13 +553,10 @@ def test_invalid_project_name_fails_with_hint(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # AC 4: --no-interactive overrides a TTY
-#
-# Marked xfail: reaches _generate on its success path.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration()
-@_GENERATION_PENDING
 def test_no_interactive_overrides_missing_tty(tmp_path: Path) -> None:
     """``--no-interactive`` works even when stdin is not a TTY (subprocess default).
 
@@ -561,17 +591,17 @@ def test_no_interactive_overrides_missing_tty(tmp_path: Path) -> None:
         f"--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}"
     )
+    assert (
+        tmp_path / "my-api" / "pyproject.toml"
+    ).is_file(), "successful create did not produce pyproject.toml"
 
 
 # ---------------------------------------------------------------------------
 # Hermeticity: local blueprints must not leak into the run
-#
-# Marked xfail: reaches _generate on its success path.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration()
-@_GENERATION_PENDING
 def test_local_blueprints_are_ignored(tmp_path: Path) -> None:
     """A ``.forge/blueprints/`` directory in ``cwd`` does not change the outcome.
 
@@ -614,16 +644,13 @@ def test_local_blueprints_are_ignored(tmp_path: Path) -> None:
         f"--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}"
     )
+    assert (
+        tmp_path / "my-api" / "pyproject.toml"
+    ).is_file(), "successful create did not produce pyproject.toml"
 
 
 # ---------------------------------------------------------------------------
 # Exit-code stability across distinct failure categories
-#
-# NOT marked xfail. Both invocations in this test fail during
-# resolution (missing flag, invalid name) and never reach
-# `_generate`. Once `create.py` validates the project name in the
-# non-interactive branch, both branches produce exit 1 with the
-# correct message. The test should be green today.
 # ---------------------------------------------------------------------------
 
 
@@ -649,17 +676,6 @@ def test_missing_and_invalid_names_have_distinct_failure_modes(
     codes would be machine-readable directly). Until then, the
     stderr keyword is what a user has. The test is the contract
     for that keyword.
-
-    Why this test is not marked ``@_GENERATION_PENDING``: both
-    invocations here fail during *resolution* — one raises
-    ``MissingRequiredFlagsError`` (missing ``--name``), the other
-    raises ``UserInputError`` (invalid project name after validation
-    runs in ``_resolve_variables``). Neither reaches ``_generate``,
-    so neither depends on the generation pipeline. An earlier
-    revision marked it, and once the command's non-interactive
-    project-name validation landed, the test failed with
-    ``[XPASS(strict)]`` — the marker's own guardrail catching the
-    over-application.
 
     Why the assertions are on *what a user relies on* and not on
     exact wording: the ``project_name`` validator returns a
@@ -717,13 +733,10 @@ def test_missing_and_invalid_names_have_distinct_failure_modes(
 
 # ---------------------------------------------------------------------------
 # Test-time guard: no accidental writes into the source tree
-#
-# Marked xfail: reaches _generate on its success path.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration()
-@_GENERATION_PENDING
 def test_create_does_not_write_outside_output(tmp_path: Path) -> None:
     """A successful run writes only under ``--output``, nowhere else.
 
